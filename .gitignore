@@ -1,0 +1,28 @@
+# macOS / editors
+.DS_Store
+.idea/
+*.swp
+
+# A global excludesfile hides CLAUDE.md on this machine; agent guides are tracked here.
+!CLAUDE.md
+
+# Secrets: only .env.example is tracked
+.env*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Engine data (Chroma, BM25, document registry) and eval output
+data/
+eval/out/
