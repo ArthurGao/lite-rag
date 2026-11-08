@@ -28,7 +28,7 @@ from lite_rag.loaders import doc_id_for, file_doc_id, load_file
 from lite_rag.ranking import ranked
 from lite_rag.rerank import Reranker, build_reranker
 from lite_rag.stores.base import IndexedChunk, KbInfo, KbRef, KbStats, Store, StoredChunk
-from lite_rag.stores.pg import PgStore
+from lite_rag.stores.factory import open_store
 from lite_rag.text import build_counter, terms
 from lite_rag.types import Document, Hit
 
@@ -99,12 +99,11 @@ class RagEngine:
     @classmethod
     def from_settings(cls, settings: Settings, namespace: str | None = None) -> "RagEngine":
         ns = check_namespace(namespace or settings.namespace)
-        store = PgStore(
+        store = open_store(
+            settings.store,
             settings.database_url,
-            settings.store.schema_name,
             # one connection per request the server runs at once: none waits on the pool
             max_connections=max(4, settings.server.max_workers),
-            bm25_impl=settings.store.bm25_impl,
         )
         embedder = build_embedder(settings.embedding, cache=store)
         # Built now when enabled, so a misconfigured reranker fails at startup (its model still

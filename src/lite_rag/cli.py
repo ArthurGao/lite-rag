@@ -12,11 +12,11 @@ import typer
 from lite_rag import __version__
 from lite_rag.chunking import chunk_context
 from lite_rag.config import Mode, Settings, load_settings
-from lite_rag.db import check_vector, connect, migrate, redact_conninfo
+from lite_rag.db import redact_conninfo
 from lite_rag.engine import RagEngine
 from lite_rag.errors import LiteRagError
 from lite_rag.loaders import find_files
-from lite_rag.stores.pg import PgStore
+from lite_rag.stores.factory import evaluation_store, location, migrate_store, open_store
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -68,13 +68,12 @@ def show_config(config: ConfigOption = None) -> None:
 
 @app.command("migrate")
 def migrate_command(config: ConfigOption = None) -> None:
-    """Create or upgrade the lite-rag schema in PostgreSQL."""
+    """Create or upgrade the lite-rag schema: in PostgreSQL, or the data directory (chroma)."""
     settings = _settings(config)
-    schema = settings.store.schema_name
-    with _errors(), connect(settings.database_url) as conn:
-        applied = migrate(conn, schema)
-        check_vector(conn)
-    target = f"{_masked(settings.database_url)} schema {schema}"
+    store = settings.store
+    with _errors():
+        applied = migrate_store(store, settings.database_url)
+    target = location(store, settings.database_url)
     typer.echo(f"applied {', '.join(applied)} to {target}" if applied else f"{target}: up to date")
 
 
@@ -289,7 +288,11 @@ def eval_command(
         "eval/golden.jsonl"
     ),
     schema: Annotated[
-        str, typer.Option(help="Schema for the evaluation kbs, apart from application data")
+        str,
+        typer.Option(
+            help="Schema (or, chroma, subdirectory of store.data_dir) for the evaluation kbs,"
+            " apart from application data"
+        ),
     ] = "lite_rag_eval",
     out: Annotated[Path | None, typer.Option(help="Also write the full report as JSON")] = None,
     keep: Annotated[bool, typer.Option(help="Keep the evaluation kbs afterwards")] = False,
@@ -306,7 +309,7 @@ def eval_command(
         ]
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    if len({s.database_url for _, s in loaded}) > 1:
+    if len({location(s.store, s.database_url) for _, s in loaded}) > 1:
         _fail("all configs must use one database: they are compared on one store")
     with _errors():
         # One text per PDF loader the configs use; the golden set must hold in every one.
@@ -315,9 +318,10 @@ def eval_command(
         }
         for docs in corpora.values():
             questions = load_golden(golden, docs)
-        with connect(loaded[0][1].database_url) as conn:
-            migrate(conn, schema)
-        store = PgStore(loaded[0][1].database_url, schema)
+        first = loaded[0][1]
+        apart = evaluation_store(first.store, schema)
+        migrate_store(apart, first.database_url)
+        store = open_store(apart, first.database_url)
         try:
             reports = run_configs(loaded, corpora.__getitem__, questions, store, keep=keep)
         finally:

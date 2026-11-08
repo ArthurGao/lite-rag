@@ -31,8 +31,7 @@ from lite_rag.engine import RagEngine
 from lite_rag.errors import ConfigError, StoreError
 from lite_rag.loaders import PdfLoader, find_files, load_file
 from lite_rag.rerank import Reranker, build_reranker
-from lite_rag.stores.base import KbRef
-from lite_rag.stores.pg import PgStore
+from lite_rag.stores.base import CachedStore, KbRef
 from lite_rag.types import Hit
 
 TOP_K = 10  # MRR@10 needs ten hits
@@ -215,7 +214,7 @@ def run_configs(
     configs: list[tuple[str, Settings]],
     corpus: Corpus | Callable[[PdfLoader], Corpus],
     questions: Iterable[Question],
-    store: PgStore,
+    store: CachedStore,
     *,
     embedder_for: EmbedderFor | None = None,
     keep: bool = False,
@@ -262,7 +261,7 @@ def run_configs(
     return reports
 
 
-def _drop(store: PgStore, kbs: set[str], keep: bool) -> list[str]:
+def _drop(store: CachedStore, kbs: set[str], keep: bool) -> list[str]:
     """Delete each kb independently; returns what failed."""
     if keep:
         return []

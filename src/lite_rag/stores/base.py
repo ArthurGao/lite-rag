@@ -135,7 +135,7 @@ class Store(Protocol):
         """The names of the namespace's kbs, sorted."""
         ...
 
-    def documents(self, kb: KbRef) -> Iterator[StoredDocument]:
+    def documents(self, kb: KbRef, page: int = 100) -> Iterator[StoredDocument]:
         """Every document of `kb`, in doc_id order, read a page at a time."""
         ...
 
@@ -178,3 +178,7 @@ class VectorCache(Protocol):
     def get(self, model_id: str, dim: int, keys: list[str]) -> dict[str, list[float]]: ...
 
     def put(self, model_id: str, dim: int, vectors: dict[str, list[float]]) -> None: ...
+
+
+class CachedStore(Store, VectorCache, Protocol):
+    """A store that is also the vector cache — what every backend implements."""

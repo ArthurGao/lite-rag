@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from lite_rag.config import load_settings
+from lite_rag.stores.factory import evaluation_store, location
 
 
 def test_defaults_are_the_local_free_stack() -> None:
@@ -84,3 +85,43 @@ def test_semantic_threshold_joins_the_identity_only_for_semantic() -> None:
     assert s.chunking.identity()["semantic_threshold"] == 90
     with pytest.raises(ValidationError):
         load_settings(chunking={"strategy": "semantic", "semantic_threshold": 100})
+
+
+def test_the_chroma_backend_scores_bm25_in_python_by_default() -> None:
+    s = load_settings(store={"backend": "chroma"})
+    assert (s.store.bm25_impl, s.store.data_dir) == ("python", Path("lite_rag_data"))
+    assert load_settings().store.bm25_impl == "sql"  # postgres keeps its default
+
+
+def test_the_chroma_backend_refuses_sql_bm25() -> None:
+    with pytest.raises(ValidationError, match="needs the postgres backend"):
+        load_settings(store={"backend": "chroma", "bm25_impl": "sql"})
+
+
+def test_the_backend_and_data_dir_come_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LITERAG_STORE__BACKEND", "chroma")
+    monkeypatch.setenv("LITERAG_STORE__DATA_DIR", "/srv/rag")
+    s = load_settings()
+    assert (s.store.backend, s.store.bm25_impl, s.store.data_dir) == (
+        "chroma",
+        "python",
+        Path("/srv/rag"),
+    )
+
+
+def test_evaluation_kbs_live_apart_from_application_data() -> None:
+    pg = evaluation_store(load_settings().store, "ev")
+    chroma = load_settings(store={"backend": "chroma", "data_dir": "/srv/rag"}).store
+    assert (pg.schema_name, pg.data_dir) == ("ev", Path("lite_rag_data"))
+    assert evaluation_store(chroma, "ev").data_dir == Path("/srv/rag/ev")
+
+
+def test_a_store_location_names_only_what_decides_it_and_masks_the_password() -> None:
+    pg = load_settings(store={"data_dir": "elsewhere"}).store  # data_dir means nothing to pg
+    url = "postgresql://u:secret@h/db"
+    assert location(pg, url) == location(load_settings().store, url)
+    assert "secret" not in location(pg, url) and "schema lite_rag" in location(pg, url)
+    chroma = load_settings(store={"backend": "chroma", "data_dir": "/srv/rag"}).store
+    assert location(chroma, url) == location(chroma, None) == "chroma /srv/rag"

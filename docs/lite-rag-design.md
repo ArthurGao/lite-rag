@@ -140,13 +140,21 @@ engine.stats(kb)
 - **BM25 查询**：先在 SQL 里按 `(kb, term)` 取出 posting，同时拿到 `n(t)`、`N`、`avgdl`，再按第 5 节的公式打分。打分既可以在 Python 里算（`keyword.py`，便于阅读），也可以整段在 SQL 里算（快）。两种算法的结果用同一组测试核对。
 - **向量查询**：`ORDER BY embedding <=> :q LIMIT n`，按 `kb` 过滤。
 
-### Chroma 后端（可选）
+### Chroma 后端（可选，S7）
 
-- 数据目录 `LITERAG_DATA_DIR` 下有两部分：
-  - `chroma/`：每个 kb 一个 collection；
-  - `lite_rag.sqlite`：和 PG 后端同结构的 `kbs`、`documents`、`chunks`、`postings` 表。
-- **写入不在一个事务里**：向量在 Chroma，其余在 SQLite。所以写入顺序固定为"登记 pending → 写 SQLite → 写 Chroma → 标记 ready"。打开引擎时，未完成的文档先清理掉再重写。
-- 适合不想装 PG 的单机学习场景。合约测试对两个后端运行同一套用例。
+- 配置 `store: {backend: chroma, data_dir: ./lite_rag_data}`（环境变量 `LITERAG_STORE__BACKEND`、`LITERAG_STORE__DATA_DIR`），extra `[chroma]`（`chromadb==1.5.9`，Apache-2.0，依赖很重，所以不进核心）。先 `literag migrate` 建好数据目录。数据目录下有两部分：
+  - `chroma/`：`PersistentClient`，关闭遥测（`anonymized_telemetry=False`）；每个 kb 一个 collection（cosine），名字取 kb 键的哈希（Chroma 只允许 `[a-zA-Z0-9._-]`）；
+  - `lite_rag.sqlite`：和 PG 后端同样的 `kbs`、`documents`、`chunks`、`parents`、`postings` 和向量缓存，迁移文件在 `migrations_sqlite/`；JSON 存 TEXT 列。N 和 avgdl 每次查询时从 `chunks` 现算，不在 `kbs` 上维护计数。
+- **BM25** 只用 Python 实现（`keyword.bm25`），默认 `bm25_impl: python`，配 `sql` 会在加载配置时报错。统计量和 PG 一样取整个 kb、在元数据过滤之前计算。
+- **元数据过滤**：文档元数据里的标量值（str、int、float、bool）复制到它每条 Chroma 记录上，过滤按相等比较（Chroma `$eq` / `$and`）；bool 不等于数字，两条检索路径一致。过滤值不是标量会报 `ConfigError`（PG 后端用 JSON 包含，支持任意值）。
+- **写入不在一个事务里**：向量在 Chroma，其余在 SQLite。文档带状态：
+  - upsert：一个 SQLite 事务里删旧版本、写入新行，状态 `pending` → Chroma 删旧向量、分批写新向量（每批不超过 `get_max_batch_size()`）→ 标记 `ready`；
+  - 删除：标记 `deleting` → 删 Chroma 向量 → 删 SQLite 行；
+  - 读只看 `ready` 的文档；
+  - 打开 store 时，把 `pending`、`deleting` 的文档从两边都删掉，再删掉没有对应 kb 的 collection；调用方重新摄取即可（内容哈希保证幂等）。删 kb 时先删行再删 collection；建 kb 前先删同名的残留 collection，避免旧向量混进新 kb。
+  - 和 PG 的差别：写入失败（不是崩溃）时立即清理，所以失败的 upsert 会删掉这篇文档，而不是保留旧版本；PG 是整篇回滚、保留旧版本。
+- **并发**：只支持单进程；一把锁串行化 store 的所有操作，SQLite 开 WAL。多个进程共用一个数据目录不受支持。
+- 适合不想装 PG 的单机学习场景。合约测试（`tests/contract/`）对两个后端运行同一套用例。
 
 ### Namespace（强制）
 
@@ -234,7 +242,7 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 
 ```yaml
 database_url: null        # 一般用环境变量 LITERAG_DATABASE_URL，不写进文件
-store: {backend: postgres, schema: lite_rag}   # 或 {backend: chroma, data_dir: ./data}（S7）
+store: {backend: postgres, schema: lite_rag}   # 或 {backend: chroma, data_dir: ./lite_rag_data}
 embedding: {provider: ollama, model: bge-m3, base_url: http://127.0.0.1:11434, batch_size: 32, max_concurrency: 4, query_prefix: ""}
 chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50, contextual: {enabled: false}}
 retrieval: {mode: hybrid, top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60, bm25: {k1: 1.5, b: 0.75}}
@@ -319,6 +327,13 @@ lite-rag/
   - **Codex review（2026-11-08）**，5 条都成立并已修复，各有先红后绿的回归测试：上传大小上限原先在路由里才检查，而 FastAPI 在路由运行前已经把整个 multipart 请求读完并落盘，现在由 ASGI 中间件在解析前按 `Content-Length` 拒绝、没有长度时边收边数，返回 413（上限另加 8 KiB 给 multipart 边界）；reindex 先查"目标不存在"再写入，中间被别人建了同名 kb 就会写进去、失败时还会删掉它，现在用一条 `INSERT … ON CONFLICT DO NOTHING` 原子地创建目标，没建成就拒绝；上传报错原样带出客户端的文件名，文件类型不支持时甚至带出服务器上的临时路径，现在一律是固定措辞；不返回给客户端的上游错误写日志前去掉 URL 里的凭据和 `password=`；CI 冒烟测试在服务一直没就绪时也会继续往下跑，现在超时即失败，并检查容器仍在运行。Codex 未发现能越过 namespace 或 kb 授权的路径。
   - **提交后安全审查（2026-11-09）**，3 条都成立，单独修复：不配 key 的开放模式只靠绑定回环地址，但浏览器里的网页可以用 DNS rebinding 以自己的域名访问回环地址，现在开放模式只接受 `localhost`、`127.0.0.1`、`[::1]` 这几个 Host（Starlette `TrustedHostMiddleware`）；请求体上限原来只管上传，JSON 请求体没有上限，而 FastAPI 在鉴权之前就会读完请求体，现在所有请求都有上限（`server.max_body_mb`，默认 10，上传仍用 `max_upload_mb`），超过返回 413；`GET /v1/kbs` 原来列出 namespace 下全部 kb，会把 key 的 `kbs` 范围之外的名字也告诉调用方，现在只列 key 能访问的。
   - 端到端（`deploy/compose.yaml`，宿主机 Ollama）发现镜像里没有 `pdf` extra，上传 PDF 会失败；镜像现在带 `server` 和 `pdf`（443 MB）。docling 会带进几 GB 的 torch，不放进镜像，要用就自己构建。
+- S7 实现说明（2026-11-09）：
+  - Store 合约测试 `tests/contract/`：`store` fixture 按 `pg`、`chroma` 参数化，只经过 `Store` / `VectorCache` 接口（kb、文档、chunk、向量与 BM25 查询、向量缓存），另有几条引擎级用例（三种检索模式、过滤、parent_child、reindex）。两个后端共用一个 Protocol `CachedStore`；`stores/factory.py` 按 `store.backend` 打开和迁移。
+  - Chroma 专属测试（`tests/integration/test_chroma.py`）：在每个步骤边界模拟崩溃（不触发 `except Exception` 的清理），确认崩溃后文档不可见、重新打开后两边都清理干净、能重新摄取；还测了失败时立即清理、清理也失败时留到下次打开、分批写入、过滤限制。
+  - `literag eval` 用 chroma 时，评测 kb 放在 `<data_dir>/<--schema>` 子目录，和应用数据分开。
+  - **收尾 /simplify（2026-11-09）**，改了：后端相关的选择（打开、迁移、数据位置 `location()`、评测用的隔离位置 `evaluation_store()`）都收进 `stores/factory.py`，CLI 和配置类里不再按后端分支；eval 判断"同一个 store"只比较决定位置的字段（以前 PG 也比较 `data_dir`）；`bm25_impl` 的默认值和校验合成一个 validator；BM25 过滤时每篇文档的元数据只解析一次；upsert 按 id 删旧向量；合约测试经过 factory 打开 store。没改的：向量查询放到锁外（并发删 kb 时查询会报错，单进程后端串行读可以接受）；N 和 avgdl 缓存在内存（要随每次写入失效，学习规模下现算只需毫秒级）；与 pg.py 共用分页和行转换的 helper（两边 SQL 不同）；与 PG 只测的旧用例重叠的两条测试暂不删除。
+  - **Codex review（2026-11-09）**：没有发现问题。未完成的文档不会被读到，打开时的恢复会清理两边；BM25 统计量和过滤与 PG 一致；store 的锁串行化了服务线程池里的操作。
+  - **Chroma 与 PG 对比**（eval 语料 32 题，同一组配置）：mode-vector、mode-bm25、chunk-markdown 三行的 hit@1、hit@5、MRR@10 完全相同（0.979 / 0.823 / 0.930），说明两个后端的向量与 BM25 排序一致。
 - S5c 实现说明（2026-11-08）：
   - 托管 embedder（voyage、cohere、gemini）直接走 HTTP，和 Ollama、OpenAI 兼容接口共用 `_HTTPEmbedder` 的分批、并发和重试；`_call(batch, role)` 把文档 / 查询的角色交给子类，按各家的参数名发出去。请求和响应的格式按 2026-11-08 的官方 API 参考核对，单测用 MockTransport 回放这些格式，测试从不调用真实服务。
   - `embedding.base_url` 默认不再是 Ollama 的地址，而是 `None`，按 provider 取各家默认（`EMBEDDING_URLS`）。以前 `provider: openai` 不填 base_url 会打到 Ollama，现在默认是 OpenAI。kb 身份里没有 base_url，已有 kb 不受影响。

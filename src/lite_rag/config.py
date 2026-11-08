@@ -6,7 +6,7 @@ Precedence, highest first: explicit arguments, environment, `.env`, the YAML fil
 
 import re
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
@@ -26,11 +26,21 @@ Mode = Literal["vector", "bm25", "hybrid"]
 
 
 class StoreConfig(BaseModel):
-    backend: Literal["postgres"] = "postgres"
+    backend: Literal["postgres", "chroma"] = "postgres"
     # Where BM25 is scored: "sql" (fast, in PostgreSQL) or "python" (keyword.py, readable).
-    # Same formula and statistics; the tests check they agree.
+    # Same formula and statistics; the tests check they agree. Chroma: "python" only.
     bm25_impl: Literal["sql", "python"] = "sql"
-    schema_name: str = Field(default="lite_rag", alias="schema")
+    schema_name: str = Field(default="lite_rag", alias="schema")  # postgres
+    data_dir: Path = Path("lite_rag_data")  # chroma: the SQLite file and the Chroma directory
+
+    @model_validator(mode="after")
+    def _bm25_backend(self) -> Self:
+        if self.backend == "chroma":
+            if "bm25_impl" not in self.model_fields_set:
+                self.bm25_impl = "python"  # chroma's default
+            elif self.bm25_impl == "sql":
+                raise ValueError("store.bm25_impl sql needs the postgres backend (chroma: python)")
+        return self
 
     @field_validator("schema_name")
     @classmethod

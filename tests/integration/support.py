@@ -7,7 +7,7 @@ from lite_rag.embedding import CachingEmbedder, Embedder
 from lite_rag.engine import RagEngine
 from lite_rag.llm import LLM
 from lite_rag.rerank import Reranker
-from lite_rag.stores.pg import PgStore
+from lite_rag.stores.base import CachedStore
 from lite_rag.testing import FakeEmbedder
 
 NS = "proj/tenant_1"
@@ -15,7 +15,7 @@ CHUNKING = {"strategy": "paragraph", "unit": "chars", "size": 40, "overlap": 0, 
 
 
 def make_engine(
-    store: PgStore,
+    store: CachedStore,
     embedder: FakeEmbedder | None = None,
     *,
     namespace: str = NS,

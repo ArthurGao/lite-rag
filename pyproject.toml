@@ -40,6 +40,9 @@ chonkie = [
 sentence-transformers = [
     "sentence-transformers==6.2.0",
 ]
+chroma = [
+    "chromadb==1.5.9",
+]
 server = [
     "fastapi==0.162.2",
     "python-multipart==0.0.33",
@@ -58,6 +61,7 @@ dev = [
     "python-multipart==0.0.33",
     "uvicorn==0.54.0",
     "httpx==0.28.1",
+    "chromadb==1.5.9",
 ]
 
 [build-system]

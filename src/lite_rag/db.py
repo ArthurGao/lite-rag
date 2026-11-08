@@ -45,8 +45,9 @@ def redact_conninfo(value: str) -> str:
     return make_conninfo("", **params)
 
 
-def _migration_files() -> list[tuple[str, str]]:
-    files = resources.files(MIGRATIONS)
+def migration_files(package: str = MIGRATIONS) -> list[tuple[str, str]]:
+    """(version, SQL) of each `NNNN_*.sql` file in `package`, in order."""
+    files = resources.files(package)
     names = sorted(f.name for f in files.iterdir() if f.name.endswith(".sql"))
     return [(name.removesuffix(".sql"), files.joinpath(name).read_text("utf-8")) for name in names]
 
@@ -69,7 +70,7 @@ def migrate(conn: psycopg.Connection, schema: str, until: str | None = None) -> 
             ).format(sql.Identifier(schema))
         )
     applied: list[str] = []
-    for version, script in _migration_files():
+    for version, script in migration_files():
         if until is not None and version > until:
             break
         with conn.transaction():
