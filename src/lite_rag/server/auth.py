@@ -45,10 +45,13 @@ class Authorizer:
         """No keys configured: every request is allowed (the server then binds loopback only)."""
         return not self._by_hash
 
-    def check(self, authorization: str | None, namespace: str, kb: str | None, write: bool) -> None:
-        """Raises `Denied` unless the key allows this; `kb` None: a namespace-level request."""
+    def check(
+        self, authorization: str | None, namespace: str, kb: str | None, write: bool
+    ) -> ApiKeyConfig | None:
+        """The key, when it allows this (None: open mode); raises `Denied` otherwise. `kb` None:
+        a namespace-level request, whose results the caller narrows with `visible`."""
         if self.open:
-            return
+            return None
         scheme, _, token = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not token:
             raise Denied(401, "an API key is required: Authorization: Bearer <key>")
@@ -61,3 +64,11 @@ class Authorizer:
             raise Denied(403, f"key {key.name!r} has no access to knowledge base {kb!r}")
         if write and key.mode != "write":
             raise Denied(403, f"key {key.name!r} is read-only")
+        return key
+
+    @staticmethod
+    def visible(key: ApiKeyConfig | None, kbs: list[str]) -> list[str]:
+        """The kbs `key` may see: a listing never names kbs outside its globs."""
+        if key is None:
+            return kbs
+        return [kb for kb in kbs if any(fnmatchcase(kb, p) for p in key.kbs)]

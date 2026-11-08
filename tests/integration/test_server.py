@@ -159,7 +159,7 @@ def test_ask_answers_through_the_api(store: PgStore, keys: dict[str, str]) -> No
 
     settings = load_settings(chunking=CHUNKING)  # no keys: open (loopback only, see serve)
     engine = make_engine(store, namespace="server", llm=FakeLLM(reply="Seven days [1]."))
-    with TestClient(create_app(settings, engine)) as c:
+    with TestClient(create_app(settings, engine), base_url="http://localhost") as c:  # open mode
         h = {"X-LiteRag-Namespace": NS}
         c.put(
             "/v1/kbs/c-1/documents/refund",
@@ -199,7 +199,9 @@ def test_an_upload_over_the_limit_is_refused_before_it_is_parsed(
     reached: list[str] = []
     monkeypatch.setattr(RagEngine, "ingest", lambda *a, **k: reached.append("ingest"))
     settings = load_settings(chunking=CHUNKING, server={"max_upload_mb": 0.001})  # ~1 KB
-    with TestClient(create_app(settings, make_engine(store, namespace="server"))) as c:
+    with TestClient(
+        create_app(settings, make_engine(store, namespace="server")), base_url="http://localhost"
+    ) as c:
         big = ("big.md", b"# Big\n\n" + b"x " * 2000, "text/markdown")
         r = c.post("/v1/kbs/c-1/files", headers={"X-LiteRag-Namespace": NS}, files={"file": big})
     assert r.status_code == 413 and r.headers["content-type"] == "application/problem+json"
@@ -233,8 +235,40 @@ def test_the_same_file_name_replaces_the_same_document(
 
 def test_the_body_limit_acts_before_any_route_code(store: PgStore) -> None:
     settings = load_settings(chunking=CHUNKING, server={"max_upload_mb": 0.001})  # ~1 KB
-    with TestClient(create_app(settings, make_engine(store, namespace="server"))) as c:
+    with TestClient(
+        create_app(settings, make_engine(store, namespace="server")), base_url="http://localhost"
+    ) as c:
         big = ("big.md", b"x " * 20_000, "text/markdown")  # 40 KB: over limit + overhead
         r = c.post("/v1/kbs/c-1/files", files={"file": big})  # no namespace header at all
     # 413, not the 400 the route's dependency would give: nothing ran, nothing was parsed
     assert r.status_code == 413 and r.json()["title"] == "TooLarge"
+
+
+def test_an_open_server_only_answers_to_localhost_host_names(store: PgStore) -> None:
+    """Open mode (no keys) relies on binding loopback; a DNS-rebinding page reaches loopback
+    with its own host name, so any other Host is refused."""
+    settings = load_settings(chunking=CHUNKING)  # no keys
+    app = create_app(settings, make_engine(store, namespace="server"))
+    with TestClient(app, base_url="http://localhost:8700") as c:
+        assert c.get("/health").status_code == 200
+        assert c.get("/health", headers={"Host": "127.0.0.1:8700"}).status_code == 200
+        assert c.get("/health", headers={"Host": "evil.example:8700"}).status_code == 400
+
+
+def test_a_json_body_over_the_limit_is_refused_before_authentication(
+    store: PgStore,
+) -> None:
+    settings = load_settings(chunking=CHUNKING, server={"max_body_mb": 0.001, "keys": []})
+    with TestClient(
+        create_app(settings, make_engine(store, namespace="server")), base_url="http://localhost"
+    ) as c:
+        r = c.put("/v1/kbs/c-1/documents/big", json={"title": "t", "text": "x" * 50_000})
+    assert r.status_code == 413 and r.json()["title"] == "TooLarge"
+
+
+def test_listing_shows_only_the_kbs_a_key_may_see(client: TestClient, keys: dict[str, str]) -> None:
+    for kb in ("c-1", "faq"):
+        client.put(f"/v1/kbs/{kb}", headers=_h(keys["writer"]))
+    listed = client.get("/v1/kbs", headers=_h(keys["reader"])).json()["kbs"]  # kbs: ["c-*"]
+    assert listed == ["c-1"]
+    assert client.get("/v1/kbs", headers=_h(keys["writer"])).json()["kbs"] == ["c-1", "faq"]

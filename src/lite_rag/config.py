@@ -240,6 +240,7 @@ class ServerConfig(BaseModel):
     port: int = Field(default=8700, gt=0, lt=65536)
     keys: list[ApiKeyConfig] = []  # none: open access, allowed on a loopback address only
     max_upload_mb: float = Field(default=20, gt=0)
+    max_body_mb: float = Field(default=10, gt=0)  # any other request body (JSON)
     max_workers: int = Field(default=8, gt=0)  # requests handled at once (threadpool)
 
 

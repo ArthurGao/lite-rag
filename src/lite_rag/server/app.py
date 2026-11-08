@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from lite_rag.config import Mode, Settings
@@ -33,20 +34,23 @@ def redact(text: str) -> str:
 
 
 class _BodyLimit:
-    """Refuses an upload body over the limit before anything parses it (FastAPI spools a whole
-    multipart body before the route runs): by Content-Length up front, and by counting while it
-    streams when the client sends none."""
+    """Refuses a request body over its limit before anything parses it — FastAPI reads a whole
+    body (a multipart one onto disk) before the route, and before authentication, runs: by
+    Content-Length up front, and by counting while it streams when the client sends none.
+    Uploads (`/files`) have their own, larger limit."""
 
-    def __init__(self, app: ASGIApp, limit: int) -> None:
+    def __init__(self, app: ASGIApp, upload_limit: int, body_limit: int) -> None:
         self._app = app
-        self._limit = limit + MULTIPART_OVERHEAD
+        self._upload = upload_limit + MULTIPART_OVERHEAD
+        self._body = body_limit
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not scope["path"].endswith("/files"):
+        if scope["type"] != "http":
             await self._app(scope, receive, send)
             return
+        limit = self._upload if scope["path"].endswith("/files") else self._body
         length = dict(scope["headers"]).get(b"content-length")
-        if length is not None and length.isdigit() and int(length) > self._limit:
+        if length is not None and length.isdigit() and int(length) > limit:
             await problem(413, "TooLarge", TOO_LARGE)(scope, receive, send)
             return
         seen = 0
@@ -55,14 +59,15 @@ class _BodyLimit:
             nonlocal seen
             message = await receive()
             seen += len(message.get("body", b""))
-            if seen > self._limit:
+            if seen > limit:
                 raise TooLarge(TOO_LARGE)
             return message
 
         await self._app(scope, counted, send)
 
 
-TOO_LARGE = "the upload is larger than server.max_upload_mb"
+TOO_LARGE = "the request body is larger than the server allows (server.max_upload_mb / max_body_mb)"
+LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]"]
 NAMESPACE_HEADER = "X-LiteRag-Namespace"
 PROBLEM = "application/problem+json"
 TITLES = {401: "Unauthorized", 403: "Forbidden"}
@@ -109,7 +114,15 @@ def create_app(settings: Settings, engine: RagEngine) -> FastAPI:
         yield
 
     app = FastAPI(title="lite-rag", lifespan=lifespan)
-    app.add_middleware(_BodyLimit, limit=upload_limit)
+    app.add_middleware(
+        _BodyLimit,
+        upload_limit=upload_limit,
+        body_limit=int(settings.server.max_body_mb * 1024 * 1024),
+    )
+    if auth.open:
+        # Open mode is safe only on loopback; a DNS-rebinding web page reaches loopback under
+        # its own host name, so only local host names are answered.
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=LOCAL_HOSTS)
 
     @app.exception_handler(LiteRagError)
     async def _lite_rag(request: Request, exc: LiteRagError) -> JSONResponse:
@@ -143,7 +156,9 @@ def create_app(settings: Settings, engine: RagEngine) -> FastAPI:
         ) -> RagEngine:
             if not namespace:
                 raise ConfigError(f"the {NAMESPACE_HEADER} header is required")
-            auth.check(authorization, namespace, request.path_params.get("kb"), write)
+            request.state.key = auth.check(
+                authorization, namespace, request.path_params.get("kb"), write
+            )
             # A copy per request: as cheap as a lookup, and no cache that callers can grow.
             return engine.for_namespace(namespace)
 
@@ -162,8 +177,9 @@ def create_app(settings: Settings, engine: RagEngine) -> FastAPI:
     # --- knowledge bases -----------------------------------------------------------------------
 
     @app.get("/v1/kbs")
-    def list_kbs(eng: Read) -> dict[str, Any]:
-        return {"namespace": eng.namespace, "kbs": eng.list_kbs()}
+    def list_kbs(request: Request, eng: Read) -> dict[str, Any]:
+        kbs = Authorizer.visible(request.state.key, eng.list_kbs())
+        return {"namespace": eng.namespace, "kbs": kbs}
 
     @app.put("/v1/kbs/{kb}")
     def create_kb(kb: str, eng: Write) -> dict[str, Any]:
