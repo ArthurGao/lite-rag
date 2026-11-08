@@ -67,7 +67,7 @@ packages = ["lite_rag"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["jieba", "fastembed", "fastembed.*", "tokenizers"]
+module = ["jieba", "fastembed", "fastembed.*", "tokenizers", "docling", "docling.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
