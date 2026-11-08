@@ -246,8 +246,14 @@ def build_chunker(config: ChunkingConfig, counter: TokenCounter) -> Chunker:
     return STRATEGIES[config.strategy](config, counter)
 
 
+def chunk_context(title: str | None, heading_path: tuple[str, ...]) -> str:
+    """Where a chunk sits, as one line: `title > heading > subheading` (parts that exist)."""
+    return " > ".join(part for part in (title, *heading_path) if part)
+
+
 def embedding_text(chunk: Chunk) -> str:
-    """What gets embedded and indexed: the heading path (if any) gives the chunk its context."""
-    if not chunk.heading_path:
-        return chunk.text
-    return " > ".join(chunk.heading_path) + "\n" + chunk.text
+    """What gets embedded and indexed: the heading path (if any) gives the chunk its context.
+    The document title is left out on purpose: it would repeat in every chunk of a document and
+    pull them together in vector space; the reranker and the prompt see it (`chunk_context`)."""
+    context = chunk_context(None, chunk.heading_path)
+    return f"{context}\n{chunk.text}" if context else chunk.text

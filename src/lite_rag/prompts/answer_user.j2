@@ -1,0 +1,8 @@
+Sources:
+{% for hit in hits %}
+<source id="{{ loop.index }}" from="{{ context(hit) | attribute }}">
+{{ hit.text | material }}
+</source>
+{% endfor %}
+
+Question: {{ question }}

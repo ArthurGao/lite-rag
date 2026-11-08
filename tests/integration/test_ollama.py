@@ -90,6 +90,27 @@ def test_real_search_finds_paraphrases_in_both_languages(
             == "returns"
         )
         hybrid = engine.search("faq", "包邮", top_k=2)
-        assert hybrid[0].doc_id == "shipping" and set(hybrid[0].ranks) == {"vector", "bm25"}
+        assert hybrid[0].doc_id == "shipping" and set(hybrid[0].ranks) == {
+            "vector",
+            "bm25",
+            "fused",
+        }
     finally:
         engine.close()
+
+
+def test_real_ask_cites_the_source_it_used(pg: psycopg.Connection, pg_url: str) -> None:
+    migrate(pg, TEST_SCHEMA)
+    settings = load_settings(
+        database_url=pg_url, store={"schema": TEST_SCHEMA}, llm={"reasoning_effort": "none"}
+    )
+    engine = RagEngine.from_settings(settings, namespace="e2e")
+    try:
+        engine.upsert_text("faq", "refund", "退款", "退款会在七天内原路退回到您的支付账户。")
+        engine.upsert_text("faq", "warranty", "Warranty", "Electronics carry a one-year warranty.")
+        answer = engine.ask("faq", "退款多久能到账？", top_k=2)
+    finally:
+        engine.close()
+    assert answer.model_id == "ollama/qwen3:8b"
+    assert "七天" in answer.text or "7" in answer.text
+    assert [c.doc_id for c in answer.citations] == ["refund"] and answer.dropped == []

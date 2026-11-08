@@ -52,10 +52,11 @@ def test_hybrid_fuses_both_lists_with_rrf(store: PgStore) -> None:
     hits = _filled(store).search("kb", "refunds seven days", top_k=3)
     top = hits[0]
     assert top.doc_id == "refunds"
-    assert set(top.ranks) == {"vector", "bm25"}
-    expected = sum(1 / (60 + r) for r in top.ranks.values())
+    assert set(top.ranks) == {"vector", "bm25", "fused"}
+    expected = sum(1 / (60 + top.ranks[path]) for path in ("vector", "bm25"))
     assert top.score == pytest.approx(expected)
-    assert set(top.scores) == {"vector", "bm25"}  # each stage's own score; `score` is the fused one
+    assert set(top.scores) == {"vector", "bm25", "fused"}  # every stage, including fusion
+    assert top.score == top.scores["fused"]
     assert top.title == "Refunds" and top.text == DOCS["refunds"]
 
 
@@ -259,3 +260,25 @@ def test_sql_and_python_bm25_order_tied_chunks_the_same(store: PgStore, pg_url: 
     finally:
         in_python.close()
     assert [c for c, _ in sql_hits] == [c for c, _ in py_hits] == ["d0#0", "d1#0", "d2#0"]
+
+
+def test_hybrid_hits_record_the_fused_stage(store: PgStore) -> None:
+    top = _filled(store).search("kb", "refunds seven days", top_k=3)[0]
+    assert set(top.ranks) == {"vector", "bm25", "fused"} and top.ranks["fused"] == 1
+    assert top.score == top.scores["fused"]
+
+
+def test_chunks_deleted_mid_search_are_replaced_by_the_next_candidates(
+    store: PgStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = _filled(store)
+    first = [h.doc_id for h in engine.search("kb", "refunds seven days", top_k=2)]
+    real = store.chunks
+
+    def without_first_two(ref: KbRef, ids: list[str]) -> dict[str, Any]:  # as if just deleted
+        found = real(ref, ids)
+        return {c: v for c, v in found.items() if v.doc_id not in first}
+
+    monkeypatch.setattr(store, "chunks", without_first_two)
+    hits = engine.search("kb", "refunds seven days", top_k=2)
+    assert len(hits) == 2 and not {h.doc_id for h in hits} & set(first)

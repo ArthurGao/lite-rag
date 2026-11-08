@@ -5,6 +5,7 @@ import hashlib
 import math
 import random
 
+from lite_rag.llm import Completion, Message
 from lite_rag.model_profiles import Prefixes
 from lite_rag.text import ESTIMATE_TOKEN
 
@@ -66,3 +67,31 @@ class SpreadEmbedder(FakeEmbedder):
     def _vector(self, text: str) -> list[float]:
         rng = random.Random(hashlib.sha256(text.encode()).digest())
         return normalise([rng.gauss(0, 1) for _ in range(self.dim)])
+
+
+class FakeLLM:
+    """Replies with `reply` and records every prompt."""
+
+    model_id = "fake/fake-llm"
+
+    def __init__(self, reply: str = "") -> None:
+        self._reply = reply
+        self.calls: list[list[Message]] = []  # every prompt it was sent
+
+    def complete(self, messages: list[Message]) -> Completion:
+        self.calls.append(list(messages))
+        return Completion(self._reply, self.model_id, {"input": 10, "output": 5})
+
+
+class FakeReranker:
+    """Scores a text by how many query words it contains (ties: shorter text first)."""
+
+    model_id = "fake/fake-reranker"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def score(self, query: str, texts: list[str]) -> list[float]:
+        self.calls.append((query, list(texts)))
+        words = set(_tokens(query))
+        return [len(words & set(_tokens(t))) - len(t) / 1e6 for t in texts]

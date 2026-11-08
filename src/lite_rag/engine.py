@@ -15,13 +15,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lite_rag.chunking import build_chunker, embedding_text
+from lite_rag.answer import Answer, check_citations, prompt
+from lite_rag.chunking import build_chunker, chunk_context, embedding_text
 from lite_rag.config import Mode, Settings
 from lite_rag.embedding import Embedder, build_embedder
 from lite_rag.errors import ConfigError, KbNotFound
 from lite_rag.fusion import rrf, weighted
+from lite_rag.llm import LLM, build_llm
 from lite_rag.loaders import file_doc_id, load_file
-from lite_rag.stores.base import IndexedChunk, KbInfo, KbRef, KbStats, Store
+from lite_rag.ranking import ranked
+from lite_rag.rerank import Reranker, build_reranker
+from lite_rag.stores.base import IndexedChunk, KbInfo, KbRef, KbStats, Store, StoredChunk
 from lite_rag.stores.pg import PgStore
 from lite_rag.text import build_counter, terms
 from lite_rag.types import Document, Hit
@@ -55,12 +59,23 @@ def check_namespace(namespace: str | None) -> str:
 
 class RagEngine:
     def __init__(
-        self, settings: Settings, store: Store, embedder: Embedder, *, namespace: str
+        self,
+        settings: Settings,
+        store: Store,
+        embedder: Embedder,
+        *,
+        namespace: str,
+        reranker: Reranker | None = None,
+        llm: LLM | None = None,
     ) -> None:
+        """`reranker` and `llm` are built from `settings` on first use when not given, so a
+        search-only engine never needs an LLM key or the rerank model."""
         self.namespace = check_namespace(namespace)
         self._settings = settings
         self._store = store
         self._embedder = embedder
+        self._reranker = reranker
+        self._llm = llm
         self._counter = build_counter(settings.chunking, settings.embedding)
         self._chunker = build_chunker(settings.chunking, self._counter)
         self._ready: set[KbRef] = set()  # kbs checked against the configuration
@@ -72,7 +87,10 @@ class RagEngine:
             settings.database_url, settings.store.schema_name, bm25_impl=settings.store.bm25_impl
         )
         embedder = build_embedder(settings.embedding, cache=store)
-        return cls(settings, store, embedder, namespace=ns)
+        # Built now when enabled, so a misconfigured reranker fails at startup (its model still
+        # loads on first use). The LLM stays lazy: a search-only engine needs no key.
+        reranker = build_reranker(settings.rerank) if settings.rerank.enabled else None
+        return cls(settings, store, embedder, namespace=ns, reranker=reranker)
 
     def _ref(self, kb: str) -> KbRef:
         if not KB_NAME.match(kb):
@@ -163,14 +181,20 @@ class RagEngine:
         *,
         top_k: int | None = None,
         mode: Mode | None = None,
+        rerank: bool | None = None,
         where: dict[str, Any] | None = None,
     ) -> list[Hit]:
         """The best `top_k` chunks for `query` (design §5). `mode`: `vector`, `bm25` or `hybrid`
-        (both, fused). `where` keeps only documents whose metadata contains those key-values.
-        Each hit carries every stage's score and rank; `score` is the final one."""
+        (both, fused). `rerank` (default: config) re-scores the best `rerank.top_n` candidates
+        with a cross-encoder. `where` keeps only documents whose metadata contains those
+        key-values. Each hit carries every stage's score and rank; `score` is the final one."""
         cfg = self._settings.retrieval
         k, mode = top_k or cfg.top_k, mode or cfg.mode
-        n = k * cfg.candidate_factor if mode == "hybrid" else k  # fusion needs candidates
+        reranking = self._settings.rerank.enabled if rerank is None else rerank
+        # `pool` candidates reach the end (all of them re-scored when reranking); each path
+        # returns `n` — more in hybrid, where fusion needs candidates from both lists.
+        pool = max(self._settings.rerank.top_n, k) if reranking else k
+        n = max(pool, k * cfg.candidate_factor) if mode == "hybrid" else pool
         ref = self._open(kb, create=False)
         rankings: dict[str, list[tuple[str, float]]] = {}
         if mode in ("vector", "hybrid"):
@@ -179,9 +203,14 @@ class RagEngine:
         if mode in ("bm25", "hybrid"):
             bm = cfg.bm25
             rankings["bm25"] = self._store.bm25_query(ref, terms(query), n, bm.k1, bm.b, where)
-        fused = rankings[mode] if mode != "hybrid" else self._fuse(rankings)
-        top = fused[:k]
-        stored = self._store.chunks(ref, [chunk for chunk, _ in top])
+        if mode == "hybrid":
+            rankings["fused"] = self._fuse(rankings)
+        ranking = rankings["fused" if mode == "hybrid" else mode]
+        # Look up every ranked chunk: one deleted since it was ranked makes room for the next.
+        stored = self._store.chunks(ref, [chunk for chunk, _ in ranking])
+        candidates = [(c, s) for c, s in ranking if c in stored][:pool]
+        if reranking and candidates:
+            candidates = rankings["rerank"] = self._rerank(query, candidates, stored)
         ranks = {s: {c: i for i, (c, _) in enumerate(r, start=1)} for s, r in rankings.items()}
         scores = {s: dict(r) for s, r in rankings.items()}
         return [
@@ -191,9 +220,66 @@ class RagEngine:
                 scores={s: m[chunk] for s, m in scores.items() if chunk in m},
                 ranks={s: m[chunk] for s, m in ranks.items() if chunk in m},
             )
-            for chunk, score in top
-            if chunk in stored  # skip one deleted since it was ranked
+            for chunk, score in candidates[:k]
         ]
+
+    def ask(
+        self,
+        kb: str,
+        question: str,
+        *,
+        top_k: int | None = None,
+        mode: Mode | None = None,
+        rerank: bool | None = None,
+        where: dict[str, Any] | None = None,
+    ) -> Answer:
+        """Search, then let the LLM answer from the hits only, citing them as [n] (design §6).
+        Citations to numbers that were not given are removed and reported in `dropped`. With
+        no hits the LLM is not called."""
+        hits = self.search(kb, question, top_k=top_k, mode=mode, rerank=rerank, where=where)
+        if not hits:
+            return Answer(
+                question=question,
+                status="no_sources",
+                text="",
+                citations=[],
+                sources=[],
+                model_id=None,
+            )
+        completion = self._get_llm().complete(prompt(question, hits))
+        text, citations, dropped = check_citations(completion.text, hits)
+        return Answer(
+            question=question,
+            status="answered",
+            text=text,
+            citations=citations,
+            sources=hits,
+            model_id=completion.model_id,
+            usage=completion.usage,
+            dropped=dropped,
+        )
+
+    def _rerank(
+        self, query: str, candidates: list[tuple[str, float]], stored: dict[str, StoredChunk]
+    ) -> list[tuple[str, float]]:
+        """The candidates re-scored by the cross-encoder, which reads each chunk with its
+        title and heading path."""
+        ids = [chunk for chunk, _ in candidates]
+        texts = [
+            f"{chunk_context(stored[c].title, stored[c].heading_path)}\n{stored[c].text}"
+            for c in ids
+        ]
+        return ranked(dict(zip(ids, self._get_reranker().score(query, texts), strict=True)))
+
+    def _get_reranker(self) -> Reranker:
+        if self._reranker is None:
+            self._reranker = build_reranker(self._settings.rerank)
+        return self._reranker
+
+    def _get_llm(self) -> LLM:
+        if self._llm is None:
+            self._llm = build_llm(self._settings.llm)
+        return self._llm
 
     def _fuse(self, rankings: dict[str, list[tuple[str, float]]]) -> list[tuple[str, float]]:
         cfg = self._settings.retrieval

@@ -10,6 +10,7 @@ from typing import Annotated, NoReturn
 import typer
 
 from lite_rag import __version__
+from lite_rag.chunking import chunk_context
 from lite_rag.config import Mode, Settings, load_settings
 from lite_rag.db import check_vector, connect, migrate, redact_conninfo
 from lite_rag.engine import RagEngine
@@ -88,6 +89,10 @@ def _engine(config: Path | None, namespace: str | None) -> Iterator[RagEngine]:
 
 
 KbArg = Annotated[str, typer.Argument(help="Knowledge base name")]
+RerankOption = Annotated[
+    bool | None,
+    typer.Option("--rerank/--no-rerank", help="Re-score candidates with the cross-encoder"),
+]
 NamespaceOption = Annotated[
     str | None,
     typer.Option(
@@ -160,13 +165,14 @@ def search(
     query: Annotated[str, typer.Argument(help="The question or keywords")],
     top_k: Annotated[int | None, typer.Option("--top-k", "-k", help="How many hits")] = None,
     mode: Annotated[Mode | None, typer.Option("--mode", "-m")] = None,
+    rerank: RerankOption = None,
     as_json: Annotated[bool, typer.Option("--json", help="Print the hits as JSON")] = False,
     config: ConfigOption = None,
     namespace: NamespaceOption = None,
 ) -> None:
     """Search a knowledge base; shows each stage's score and rank for every hit."""
     with _engine(config, namespace) as engine:
-        hits = engine.search(kb, query, top_k=top_k, mode=mode)
+        hits = engine.search(kb, query, top_k=top_k, mode=mode, rerank=rerank)
     if as_json:
         typer.echo(json.dumps([asdict(h) for h in hits], indent=2, ensure_ascii=False))
         return
@@ -176,6 +182,37 @@ def search(
         stages = "  ".join(
             f"{stage} #{h.ranks[stage]} {h.scores[stage]:.4f}" for stage in sorted(h.ranks)
         )
-        where = " > ".join(h.heading_path) or h.title
+        where = chunk_context(h.title, h.heading_path)
         typer.echo(f"{i}. {h.score:.4f}  [{stages}]  {where}  ({h.chunk_id})")
         typer.echo("   " + " ".join(h.text.split())[:200])
+
+
+@app.command()
+def ask(
+    kb: KbArg,
+    question: Annotated[str, typer.Argument(help="The question")],
+    top_k: Annotated[int | None, typer.Option("--top-k", "-k", help="Sources to give")] = None,
+    mode: Annotated[Mode | None, typer.Option("--mode", "-m")] = None,
+    rerank: RerankOption = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the answer as JSON")] = False,
+    config: ConfigOption = None,
+    namespace: NamespaceOption = None,
+) -> None:
+    """Answer a question from a knowledge base, citing the sources it used."""
+    with _engine(config, namespace) as engine:
+        answer = engine.ask(kb, question, top_k=top_k, mode=mode, rerank=rerank)
+    if as_json:
+        typer.echo(json.dumps(asdict(answer), indent=2, ensure_ascii=False))
+        return
+    if answer.status == "no_sources":
+        typer.echo("No relevant material was found in the knowledge base.")
+        return
+    typer.echo(answer.text)
+    if answer.citations:
+        typer.echo("")
+    for c in answer.citations:
+        typer.echo(f"[{c.n}] {c.title}  ({c.chunk_id})")
+    if answer.dropped:
+        typer.echo(f"(removed citations to sources that were not given: {answer.dropped})")
+    if answer.model_id:
+        typer.echo(f"— {answer.model_id}, tokens {answer.usage}")

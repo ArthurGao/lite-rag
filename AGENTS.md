@@ -21,7 +21,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S3 — retrieval** (design §12; S0–S2 done 2026-11-08). Next: S4 rerank and answer. llm-steward's P3 (WeKnora) is paused until S9 is done.
+**S4 — rerank and answer** (design §12; S0–S3 done 2026-11-08). Next: S5 evaluation. llm-steward's P3 (WeKnora) is paused until S9 is done.
 
 Decided (2026-11-08): separate public repo; library + optional HTTP service (`literag serve`, Docker image) over one
 `RagEngine`; storage is PostgreSQL + pgvector by default (vectors, own BM25 postings and the document registry in one
@@ -63,6 +63,7 @@ Ollama `/v1`), Anthropic SDK (extra), Jinja2, pytest, ruff, mypy. Ollama on the 
 ```
 uv run pytest                 # unit + integration, fakes only
 uv run pytest -m ollama       # opt-in: real Ollama (bge-m3 / qwen3:8b must be pulled)
+uv run --all-extras pytest -m model   # opt-in: real Hugging Face models (the reranker, ~0.6 GB once)
 uv run ruff check && uv run ruff format --check && uv run mypy
 uv run literag ingest <kb> <path> | search <kb> "<q>" | ask <kb> "<q>" | eval --config a.yaml --config b.yaml
 ```

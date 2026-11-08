@@ -7,7 +7,6 @@ errors) — never an empty or partial result, and never a different model.
 """
 
 import hashlib
-import os
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -19,19 +18,16 @@ import httpx2
 
 from lite_rag.config import EmbeddingConfig
 from lite_rag.errors import ConfigError, LiteRagError
+from lite_rag.extras import api_key, require_extra
 from lite_rag.model_profiles import Prefixes, profile_for
 from lite_rag.stores.base import VectorCache
+from lite_rag.types import model_id
 
 Sleep = Callable[[float], None]
 
 
 class EmbeddingError(LiteRagError):
     """The embedding service failed after its retries."""
-
-
-def model_id(provider: str, model: str) -> str:
-    """What an index is bound to, e.g. `ollama/bge-m3:567m`."""
-    return f"{provider}/{model}"
 
 
 class Embedder(Protocol):
@@ -161,9 +157,8 @@ class OpenAICompatEmbedder(_HTTPEmbedder):
         client: httpx2.Client | None = None,
         sleep: Sleep = time.sleep,
     ) -> None:
-        self._key = os.environ.get(config.api_key_env) if config.api_key_env else None
-        if config.api_key_env and not self._key:
-            raise ConfigError(f"embedding.api_key_env names {config.api_key_env}, which is not set")
+        # Many OpenAI-compatible embedding servers (TEI, vLLM) need no key: none by default.
+        self._key = api_key("embedding (openai)", config.api_key_env, None)
         super().__init__(config, client, sleep)
 
     def _call(self, batch: list[str]) -> list[list[float]]:
@@ -185,13 +180,7 @@ class FastEmbedEmbedder:
     provider = "fastembed"
 
     def __init__(self, config: EmbeddingConfig) -> None:
-        try:
-            from fastembed import TextEmbedding
-        except ImportError as exc:
-            raise ConfigError(
-                "install the fastembed extra: pip install 'lite-rag[fastembed]'"
-            ) from exc
-        known = {m["model"]: m for m in TextEmbedding.list_supported_models()}
+        known = fastembed_models(require_extra("fastembed", "fastembed").TextEmbedding)
         if config.model not in known:
             raise ConfigError(f"fastembed does not support embedding model {config.model!r}")
         self._config = config
@@ -214,6 +203,11 @@ class FastEmbedEmbedder:
     def embed_query(self, text: str) -> list[float]:
         [vector] = self._embed([self.prefixes.query + text])
         return vector
+
+
+def fastembed_models(cls: Any) -> dict[str, dict[str, Any]]:
+    """The models a fastembed class supports, by name (its own catalogue, no download)."""
+    return {m["model"]: m for m in cls.list_supported_models()}
 
 
 class CachingEmbedder:

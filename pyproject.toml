@@ -15,6 +15,7 @@ dependencies = [
     # The default store (design §4). Pinned exactly: an upgrade re-runs `-m ollama` and the eval.
     "psycopg[binary,pool]==3.3.8",
     "tokenizers>=0.21",
+    "openai>=1.60",
 ]
 
 [project.scripts]
@@ -23,6 +24,9 @@ literag = "lite_rag.cli:app"
 [project.optional-dependencies]
 fastembed = [
     "fastembed==0.9.1",
+]
+anthropic = [
+    "anthropic>=0.40",
 ]
 
 [dependency-groups]
@@ -58,7 +62,8 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Opt-in, deselected by default: `-m ollama` (the real Ollama server on the host).
-addopts = "-m 'not ollama'"
+addopts = "-m 'not ollama and not model'"
 markers = [
     "ollama: talks to the real Ollama server (opt-in: uv run pytest -m ollama)",
+    "model: runs a real local model downloaded from Hugging Face, e.g. the reranker (opt-in: uv run --all-extras pytest -m model)",
 ]

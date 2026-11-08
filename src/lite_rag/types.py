@@ -32,6 +32,11 @@ def chunk_id(doc_id: str, n: int) -> str:
     return f"{doc_id}#{n}"
 
 
+def model_id(provider: str, model: str) -> str:
+    """What indexes, rerank scores and answers are recorded against, e.g. `ollama/bge-m3:567m`."""
+    return f"{provider}/{model}"
+
+
 @dataclass(frozen=True)
 class Hit:
     """One search result. `scores` / `ranks` keep each stage's view (`vector`, `bm25`, `fused`,

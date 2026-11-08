@@ -16,6 +16,7 @@ from pydantic_settings import (
     YamlConfigSettingsSource,
 )
 
+OLLAMA_URL = "http://127.0.0.1:11434"  # the local Ollama server (embeddings: /api, LLM: /v1)
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
@@ -43,7 +44,7 @@ class EmbeddingConfig(BaseModel):
     provider: Literal["ollama", "openai", "fastembed"] = "ollama"
     model: str = "bge-m3:567m"
     # ollama: the server root; openai: the API root including /v1 (OpenAI, DashScope, SiliconFlow…)
-    base_url: str | None = "http://127.0.0.1:11434"
+    base_url: str | None = OLLAMA_URL
     api_key_env: str | None = None  # openai-compatible: the env var holding the key
     dimensions: int | None = Field(default=None, gt=0)  # truncate, when the model supports it
     batch_size: int = Field(default=32, gt=0)
@@ -102,12 +103,52 @@ class RetrievalConfig(BaseModel):
     bm25: BM25Config = BM25Config()
 
 
+class RerankConfig(BaseModel):
+    """Design §5: a cross-encoder re-scores the fused candidates (off by default)."""
+
+    enabled: bool = False
+    provider: Literal["fastembed"] = "fastembed"
+    # Apache-2.0, multilingual (bge-m3 family), int8 ONNX ~0.6 GB. Not jina-v2 (CC-BY-NC).
+    model: str = "BAAI/bge-reranker-v2-m3-int8"
+    top_n: int = Field(default=20, gt=0, le=200)  # candidates re-scored
+    cache_dir: str | None = None
+
+
 class LLMConfig(BaseModel):
+    """Design §6. `ollama` and `openai` share the OpenAI-compatible client (Ollama serves /v1,
+    so do llm-gateway, DeepSeek, DashScope…); `anthropic` uses Anthropic's SDK (extra). What
+    each provider accepts is the `PROVIDERS` table in llm.py; a setting a provider cannot honour
+    is refused here rather than silently dropped."""
+
     provider: Literal["ollama", "openai", "anthropic"] = "ollama"
     model: str = "qwen3:8b"
-    base_url: str | None = "http://127.0.0.1:11434/v1"
-    api_key_env: str | None = None
-    temperature: float = 0.0
+    base_url: str | None = None  # None: the provider's own (Ollama: local /v1)
+    api_key_env: str | None = None  # None: the provider's usual variable, e.g. OPENAI_API_KEY
+    temperature: float | None = None  # None: the provider profile's default (Ollama: 0)
+    max_output_tokens: int = Field(default=1024, gt=0)
+    # The request field carrying max_output_tokens, when an OpenAI-compatible endpoint wants the
+    # other one than its provider's default (`max_tokens` for ollama, `max_completion_tokens` for
+    # openai).
+    max_tokens_param: Literal["max_tokens", "max_completion_tokens"] | None = None
+    # "none" turns qwen3's thinking off on Ollama (7 vs ~350 tokens for a one-line answer,
+    # measured 2026-11-08). None: not sent.
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
+    timeout_s: float = Field(default=120.0, gt=0)
+    connect_timeout_s: float = Field(default=5.0, gt=0)  # a stopped server fails fast
+    max_retries: int = Field(default=1, ge=0)  # the same model only; then LLMError
+
+    @model_validator(mode="after")
+    def _supported_by_provider(self) -> "LLMConfig":
+        if self.provider == "anthropic":
+            unsupported = {
+                "temperature": self.temperature,
+                "reasoning_effort": self.reasoning_effort,
+                "max_tokens_param": self.max_tokens_param,
+            }
+            given = [name for name, value in unsupported.items() if value is not None]
+            if given:
+                raise ValueError(f"llm.{', llm.'.join(given)}: not supported by anthropic")
+        return self
 
 
 class Settings(BaseSettings):
@@ -126,6 +167,7 @@ class Settings(BaseSettings):
     embedding: EmbeddingConfig = EmbeddingConfig()
     chunking: ChunkingConfig = ChunkingConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
+    rerank: RerankConfig = RerankConfig()
     llm: LLMConfig = LLMConfig()
 
     yaml_path: ClassVar[Path | None] = None  # set by `load_settings` on a subclass
