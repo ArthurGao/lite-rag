@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -32,13 +32,26 @@ class StoreConfig(BaseModel):
 
 
 class EmbeddingConfig(BaseModel):
-    provider: Literal["ollama"] = "ollama"
+    """One embedding model per knowledge base (design §3.2)."""
+
+    provider: Literal["ollama", "openai", "fastembed"] = "ollama"
     model: str = "bge-m3:567m"
-    base_url: str = "http://127.0.0.1:11434"
+    # ollama: the server root; openai: the API root including /v1 (OpenAI, DashScope, SiliconFlow…)
+    base_url: str | None = "http://127.0.0.1:11434"
+    api_key_env: str | None = None  # openai-compatible: the env var holding the key
+    dimensions: int | None = Field(default=None, gt=0)  # truncate, when the model supports it
     batch_size: int = Field(default=32, gt=0)
     max_concurrency: int = Field(default=4, gt=0)
-    query_prefix: str = ""
+    max_retries: int = Field(default=4, ge=0)
+    # None = what the model needs (model_profiles.py: e5, nomic, bge, qwen3…); "" = no prefix.
+    query_prefix: str | None = None
+    document_prefix: str | None = None
+    cache: bool = True  # reuse vectors by (model, role, prefix, text) hash
+    # Hugging Face tokenizer that sizes chunks in this model's tokens. None = the model profile's
+    # (model_profiles.py); "" = estimate.
+    tokenizer: str | None = None
     timeout_s: float = Field(default=60.0, gt=0)
+    cache_dir: str | None = None  # fastembed model cache
 
 
 class ChunkingConfig(BaseModel):
@@ -47,6 +60,23 @@ class ChunkingConfig(BaseModel):
     size: int = Field(default=800, gt=0)
     overlap: int = Field(default=120, ge=0)
     min_size: int = Field(default=50, ge=0)
+
+    @model_validator(mode="after")
+    def _overlap_below_size(self) -> "ChunkingConfig":
+        if self.overlap >= self.size:
+            raise ValueError(f"chunking.overlap ({self.overlap}) must be below size ({self.size})")
+        return self
+
+    def identity(self) -> dict[str, Any]:
+        """What changes the chunks this config produces — recorded on a kb and compared when it
+        is opened. A new field joins only when it changes output (add it here deliberately)."""
+        return {
+            "strategy": self.strategy,
+            "unit": self.unit,
+            "size": self.size,
+            "overlap": self.overlap,
+            "min_size": self.min_size,
+        }
 
 
 class LLMConfig(BaseModel):
@@ -67,6 +97,8 @@ class Settings(BaseSettings):
     )
 
     database_url: str | None = None
+    # Required by the engine: every knowledge base lives inside one, e.g. "tenderted/tenant_42".
+    namespace: str | None = None
     store: StoreConfig = StoreConfig()
     embedding: EmbeddingConfig = EmbeddingConfig()
     chunking: ChunkingConfig = ChunkingConfig()
@@ -88,15 +120,6 @@ class Settings(BaseSettings):
         if yaml_path is not None:
             sources.append(YamlConfigSettingsSource(settings_cls, yaml_file=yaml_path))
         return tuple(sources)
-
-    @field_validator("chunking")
-    @classmethod
-    def _overlap_below_size(cls, value: ChunkingConfig) -> ChunkingConfig:
-        if value.overlap >= value.size:
-            raise ValueError(
-                f"chunking.overlap ({value.overlap}) must be below size ({value.size})"
-            )
-        return value
 
 
 def load_settings(config_file: str | Path | None = None, **overrides: Any) -> Settings:

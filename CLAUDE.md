@@ -11,3 +11,8 @@
   `kb-maintain`.
 - Ollama runs on the host; check it for free with `curl -s http://127.0.0.1:11434/api/tags` before an
   `-m ollama` run.
+- Stage close-out (`AGENTS.md` Workflow step 4), in this order, for **every** stage: run `/simplify` on the
+  stage's full diff and apply its fixes; then run Codex from the repo root, read-only, on the stage's whole
+  diff: `codex exec -s read-only -o <out.md> "Review \`git diff <commit before the stage>\` (includes
+  uncommitted changes) … focus … report severity, file:line, scenario, fix"`. Fix what holds up, re-run every
+  check, then report and propose the commit. Do not start the next stage before this is done.

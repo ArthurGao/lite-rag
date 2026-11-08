@@ -9,19 +9,40 @@ from importlib import resources
 
 import psycopg
 from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from lite_rag.errors import StoreError
 
 MIGRATIONS = "lite_rag.migrations"
 
 
-def connect(database_url: str | None) -> psycopg.Connection:
+def require_url(database_url: str | None) -> str:
     if not database_url:
         raise StoreError("no database configured: set LITERAG_DATABASE_URL")
+    return database_url
+
+
+def connection_error(exc: psycopg.Error) -> StoreError:
+    return StoreError(f"cannot connect to PostgreSQL: {exc}")
+
+
+def connect(database_url: str | None) -> psycopg.Connection:
     try:
-        return psycopg.connect(database_url)
+        return psycopg.connect(require_url(database_url))
     except psycopg.OperationalError as exc:
-        raise StoreError(f"cannot connect to PostgreSQL: {exc}") from exc
+        raise connection_error(exc) from exc
+
+
+def redact_conninfo(value: str) -> str:
+    """The connection string with its password replaced, in any form libpq accepts (URL or
+    `key=value`). Something that does not parse is never echoed back."""
+    try:
+        params = conninfo_to_dict(value)
+    except psycopg.ProgrammingError:
+        return "<unparseable connection string>"
+    if params.get("password"):
+        params["password"] = "***"
+    return make_conninfo("", **params)
 
 
 def _migration_files() -> list[tuple[str, str]]:

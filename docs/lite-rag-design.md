@@ -19,7 +19,7 @@ lite-rag 是一个**可读、可改、可单独部署**的轻量 RAG 引擎，�
 
 ### 非目标（v1）
 
-- **不做治理**：审核、状态机和用户权限都交给 llm-steward 这类上层系统。lite-rag 只做 `kb` 级别的数据隔离，外加服务端的 API key 鉴权。
+- **不做治理**：审核、状态机和用户权限都交给 llm-steward 这类上层系统。lite-rag 只负责 namespace 隔离（见 §4）和服务端的 API key 鉴权。
 - **不做复杂文档解析**：OCR、版面分析、表格结构交给 RAGFlow 这类引擎。v1 只支持 txt、md；PDF 只抽取纯文本，作为可选 extra。
 - **不做分布式**：一个 PG 实例就够用。目标规模是每个 kb 十万级 chunk。
 
@@ -39,7 +39,7 @@ lite-rag 是一个**可读、可改、可单独部署**的轻量 RAG 引擎，�
 
 | 接口 | 方法 | 默认实现 | 其他实现 |
 | --- | --- | --- | --- |
-| `Loader` | `load(path) -> Document` | txt、md | pdf（extra `[pdf]`，只抽纯文本） |
+| `Loader` | `load(path) -> Document` | txt、md | pdf（extra `[pdf]`，只抽纯文本，S5b） |
 | `Chunker` | `split(doc) -> list[Chunk]` | `recursive` | 见 §3.1：fixed、sentence、paragraph、markdown、semantic、parent-child，另有 contextual 增强 |
 | `Embedder` | `embed_documents(texts)`、`embed_query(text)`、`dim`、`model` | `ollama`（`bge-m3`） | 见 §3.2：openai 兼容、voyage、cohere、gemini、fastembed、sentence-transformers、`FakeEmbedder` |
 | `Store` | `upsert_document`、`delete_document`、`vector_query`、`keyword_query`、`get_document`、`stats` | `PgStore`（pgvector 存向量，PG 表存 BM25 倒排和文档登记） | `ChromaStore`（extra `[chroma]`）：向量放 Chroma，倒排和登记放 SQLite |
@@ -77,6 +77,7 @@ engine.stats(kb)
 
 - **长度单位**：可以选 `chars` 或 `tokens`，默认 `tokens`，并且按 embedding 模型自己的 tokenizer 计数。KB 的教训是按词数切会失真（`rag-production-guide` §3）。拿不到 tokenizer 时用字符数估算，并记录这次是估算。
 - **配置示例**：`chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50}`。800/120 是 KB 里实测用过的起点，最终由 eval 决定。
+- **`size` 是硬上限**（embedding 模型有输入长度上限）：任何一步都不会产出超过 `size` 的块。最后一块小于 `min_size` 时，把最后两块重新均分，两块都不超过 `size`、尾块不小于 `min_size`；找不到这样的切分就保持原样。估算计数时，连续的字母或数字每 6 个算一个 token，所以超长的无空格串也会被切开。（Codex review，2026-11-08）
 - **改切块就要重建这个 kb**：`kbs` 表记录 chunker 配置，配置变了就要求 `literag reindex`。阈值也要重新校准，见 §5。
 - 不在 v1 范围内：late chunking 和 proposition 切块。前者需要专门的长上下文 embedding 模型，后者每块都要一次 LLM 调用；等 eval 证明 S5b 不够用时再考虑。
 
@@ -95,10 +96,25 @@ engine.stats(kb)
 | `gemini` | 官方 SDK（extra） | `gemini-embedding-*`（支持截断维度） | 付费，有免费额度 |
 
 - **"最好"由自己测**：榜单只能用来缩小候选范围。模型的取舍以本项目语料上的 `literag eval` 结果为准（AGENTS 规则 8）。所以 S5b 的验收是一张多模型对比表，列出 hit@k、MRR、延迟和每千 chunk 的费用。
-- **一个 kb 只用一个模型**（`rag-production-guide` §4 规则 2）：`kbs` 表记录 `provider`、`model`、`dim` 和查询前缀；写入或查询时发现与配置不符，就拒绝执行。换模型等于新建一份索引后切换，不会在原地混写。
+- **接口**：每个 `Embedder` 都提供 `model_id`（`provider/model`，例如 `ollama/bge-m3:567m`）、`dim`、`prefixes`、`embed_documents` 和 `embed_query`。具体用哪个实现由配置决定，调用方只依赖这个接口。
+- **文档和查询的差异封装在实现里**（最容易踩的坑）：前缀用错不会报错，只会让检索质量悄悄下降。所以 `model_profiles.py` 维护一张已知模型的前缀表，embedder 自己按模型名加前缀，调用方不需要知道这些细节。下表来源是各模型在 Hugging Face 上的模型卡，2026-11-08 核实：
+
+  | 模型 | 查询 | 文档 |
+  | --- | --- | --- |
+  | e5 系列 | `query: ` | `passage: `（必须加） |
+  | nomic-embed-text | `search_query: ` | `search_document: `（必须加） |
+  | bge-*-v1.5 | 中文 `为这个句子生成表示以用于检索相关文章：`，英文 `Represent this sentence for searching relevant passages:` | 不加 |
+  | bge-m3 | 不加 | 不加 |
+  | qwen3-embedding | `Instruct: <任务>\nQuery:` | 不加 |
+
+  配置里的 `query_prefix` / `document_prefix` 可以覆盖这张表，设为 `""` 表示不加。fastembed 自带 `query_embed` / `passage_embed`，前缀由它自己处理，所以 lite-rag 不再叠加。Voyage、Cohere 这类用 `input_type` 参数区分的模型，在 S5b 实现时同样封装在各自的类里。
+- **索引绑定模型**（最重要；`rag-production-guide` §4 规则 2，也是 RAGFlow 换 embedding 时做的检查）：即使维度相同，不同模型的向量也不能混用，比如 bge-m3 和 voyage-3-large 都是 1024 维。`kbs` 表记录 `provider`、`model`、`dim`、查询前缀、文档前缀和切块配置，每次打开 kb（写入或查询）都会校验，不一致就报错，绝不返回错误的结果。换模型的做法是新建一个 kb、重新 embedding，例如命名为 `docs-voyage3`，不会在原索引上直接改。以后加 `literag reindex` 时，也是"建新 kb → 写入 → 验证 → 切换"这个流程。
+- **向量缓存**：每种维度一张 `embedding_cache_<dim>` 表，主键是 `(model_id, sha256(角色 ‖ 前缀 ‖ 文本))`。同一个模型遇到完全相同的输入就直接复用，跨 kb、跨 namespace 都共享，因为向量只取决于模型和输入，和存它的人无关。key 里包含角色（document / query），所以查询永远拿不到文档的向量。这样重复文本不会重复计算，切到付费模型以后也能省钱。可以用 `embedding.cache: false` 关掉。
+- **统一出口（可选）**：如果 llm-gateway 以后提供 OpenAI 兼容的 `/v1/embeddings`，把 `openai` provider 的 `base_url` 指向它即可。所有模型调用都从一个地方出去，用量统计也就集中了。这是 gateway 仓库的事，lite-rag 不需要改。
 - **批量与限流**：`batch_size`、并发上限（默认 4）以及遇到 429/5xx 时的退避重试（默认 4 次）都可以配置。重试的是同一个模型，这不算回退链；用尽重试后直接抛错，绝不返回空结果。
 - **维度截断**：模型支持截断（OpenAI `dimensions`、Gemini、Matryoshka 模型）时，可以配置 `dimensions`。PG 后端按维度分表（§4）。
 - 付费 provider 的 key 只从环境变量读取。测试里一律用 fake，或者回放录制好的响应，不会真的调用接口。
+- **各层先做什么**：先把 Embedder 和 Store 两层的抽象做好，因为它们决定数据怎么存，以后很难改。这两层已在 S1、S2 完成。Reranker 等真正需要时再加（S4）；LLM 走 llm-gateway 或 Ollama（S4）。默认存储仍然是 pgvector（2026-11-08 已定），Chroma 作为可选后端（S7）。
 
 ## 4. 存储与 id
 
@@ -126,6 +142,12 @@ engine.stats(kb)
 - **写入不在一个事务里**：向量在 Chroma，其余在 SQLite。所以写入顺序固定为"登记 pending → 写 SQLite → 写 Chroma → 标记 ready"。打开引擎时，未完成的文档先清理掉再重写。
 - 适合不想装 PG 的单机学习场景。合约测试对两个后端运行同一套用例。
 
+### Namespace（强制）
+
+- **必须指定 namespace**：每个项目、以及项目里的每个租户，都有自己的 namespace，例如 `tenderted/tenant_42`。创建引擎时必须传入：`RagEngine.from_settings(settings, namespace="tenderted/tenant_42")`；CLI 用 `-n` 或 `LITERAG_NAMESPACE` 指定；以后的 HTTP API 由 API key 绑定 namespace。不传就直接报错。
+- **物理键**：kb 在库里的键是 `<namespace>:<kb>`，`kbs.namespace` 列用于列出某个 namespace 下的 kb。引擎的每一次读写都由它自己拼出这个键，调用方无法越过，kb 名里也不能出现 `:` 或 `/`。隔离在模块这一层强制执行，不依赖调用方自觉，就不会再出现 TenderTED 那种多个项目共用一个索引的问题。
+- **格式**：namespace 由小写字母、数字、`_`、`-`、`.` 组成，最多 4 级，用 `/` 分隔。
+
 ### 通用规则
 
 - **id 规则**：文档 id 由调用方给出（`upsert_text`），或者由文件路径的哈希生成（`ingest`）。chunk id 是 `"{doc_id}#{n}"`。
@@ -142,7 +164,7 @@ engine.stats(kb)
 - **融合**：默认用 RRF，`score = Σ 1/(k + rank)`，`k=60`。也可以选加权融合：两路分数先各自做 min-max 归一化，再按权重相加。
 - **Rerank**（可选）：取融合后的前 n 条，用 cross-encoder 对每个 `(query, chunk)` 对重新打分，再取前 k 条。
 - **模式**：`vector`、`bm25`、`hybrid`。每个 `Hit` 都带各阶段的分数 `scores={vector, bm25, fused, rerank}` 和排名，方便对比和调试。
-- **过滤**：按 `kb` 隔离；`where` 支持对元数据做等值过滤，向量和 BM25 两路都会生效。
+- **过滤**：先按 namespace 和 kb 隔离；`where` 支持对元数据做等值过滤，向量和 BM25 两路都会生效。
 
 ## 6. 生成
 
@@ -192,6 +214,7 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 
 - **语料**：`eval/` 下放一小份语料，中英文各一组，内容是自己写的公开知识。金标问题用 JSONL 存放，每行 `{question, expected_doc_ids[], expected_chunk_ids?[]}`。
 - **对比**：`literag eval --config a.yaml --config b.yaml` 为每个配置建一个临时 kb，再跑全部问题。结果并排列出 hit@1、hit@5、MRR@10，以及检索延迟的 p50 和 p95。
+- **金标集**：每个使用 lite-rag 的项目准备 20–30 个问题，标出正确答案应该来自哪个 chunk。切换任何一层之后都重跑一次，比较 hit rate 和 MRR，用这个回答「换了之后是变好还是变差」。
 - **用法**：这是学习的主循环。每换一种 chunker、加上 BM25、打开 rerank，都跑一次 eval，用数字判断效果有没有变好。
 
 ## 9. 配置
@@ -215,7 +238,7 @@ llm-steward 新增一个 `LiteRagProvider`，实现它的 `KnowledgeProvider` Pr
 
 | llm-steward 调用 | lite-rag 实现 |
 | --- | --- |
-| `ensure_collection(collection)` | 建一个 kb，名为 `steward-<collection_id>`，返回 kb 名 |
+| `ensure_collection(collection)` | namespace 为 `steward/<namespace_id>`（每个 llm-steward namespace 一个），kb 名为 `c-<collection_id>`，返回 kb 名 |
 | `upsert_entry(entry, kb, external_id)` | `upsert_text(kb, doc_id=str(entry_id), title, content)`，返回 `doc_id` |
 | `remove(external_id)` | `delete(kb, doc_id)` |
 | `search(query, kbs, top_k)` | 对每个 kb 调用 `search`，按 `doc_id` 合并结果（取最高分） |
@@ -265,4 +288,13 @@ lite-rag/
 - 各依赖的 license（Ollama、pgvector、Chroma、jieba、bge-m3、bge-reranker、qwen3）：锁定版本时逐个核对，写进 README。
 - rerank 的打包方式：fastembed 的 cross-encoder 还是 sentence-transformers。S4 开始前查文档确认。前者更轻，不需要 torch。
 - PDF 纯文本抽取用哪个库：S2 时确认。
-- ~~PG 驱动与 async~~ → S1 已定（2026-11-08）：sync 核心 + psycopg 3（`psycopg[binary,pool]==3.3.8`、`pgvector==0.5.1`）；S6 的服务层在线程池里调用，并发上限可配置。
+- ~~PG 驱动与 async~~ → S1 已定（2026-11-08）：sync 核心 + psycopg 3（`psycopg[binary,pool]==3.3.8`）；向量以 `float8[]` 传入、在 SQL 里转换为 `vector` / `halfvec`，不需要 `pgvector` Python 包；S6 的服务层在线程池里调用，并发上限可配置。
+- S2 实现说明（2026-11-08）：
+  - 一张 `embeddings_<dim>` 表对应一种维度，HNSW（cosine）索引；维度 ≤ 2000 用 `vector`，2001–4000 用 `halfvec`（pgvector HNSW 的上限），更大则拒绝。
+  - 文档写入在一个事务里完成，并锁住该 kb 的 `kbs` 行，所以同一 kb 的写入是串行的，BM25 统计不会算错。chunk、向量、posting 都用 COPY 批量写入，每张表一次往返；旧版本先删除，再用一条 UPDATE 把统计的增减一次写进 `kbs`。连接池里每个连接的 `search_path` 只设一次。
+  - kb 记录建库时的 embedding（provider、模型、维度、查询前缀、文档前缀）和切块身份；用不同配置打开会被拒绝，并提示沿用原配置或换一个新的 kb 名。比较逻辑在引擎里（`KbInfo.differences`），store 只负责「有就取出，没有就创建」。切块身份由 `ChunkingConfig.identity()` 声明（只列会影响切块结果的字段，以后加字段要显式加进去，避免已有的 kb 因此打不开），再加上计数器的身份：`chars`、`estimate` 或 `hf:<tokenizer>`。`literag reindex` 留到 S5b。
+  - namespace 和 kb 名通过 `KbRef` 传给 store；物理键 `<namespace>:<kb>` 只在 `KbRef.key` 这一处生成，`kbs` 表上的 CHECK 约束保证 `name = namespace || ':' || kb`。
+  - 向量缓存是单独的 `VectorCache` 接口（`PgStore` 同时实现了它），由 `build_embedder(config, cache=store)` 包装上去；缓存表和 embedding 索引表分开建，读缓存不会顺带创建 HNSW 索引。
+  - 切块按 embedding 模型自己的 tokenizer（Hugging Face `tokenizers`，不需要 torch）计数。tokenizer 跟着模型 profile 走：bge-m3 用 `BAAI/bge-m3`，nomic 用 `nomic-ai/nomic-embed-text-v1.5`，`org/name` 形式的模型名直接把自己当作 tokenizer；未知模型用估算。配置 `embedding.tokenizer` 可以覆盖，设为 `""` 表示用估算。fastembed 也走同一张前缀表（用它的普通 `embed`），所以 kb 上记录的前缀就是实际使用的前缀。
+  - `markdown` 策略把标题路径拼在 chunk 前面，再做 embedding 和 BM25；`chunks.text` 保存原文切片，用于引用。
+  - PDF 抽取推迟到 S5b，S2 只支持 txt 和 md。

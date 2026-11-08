@@ -1,4 +1,5 @@
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 from typer.testing import CliRunner
 
 from lite_rag.cli import app
@@ -16,32 +17,36 @@ def _tables(conn: psycopg.Connection) -> set[str]:
 
 
 def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
-    assert migrate(pg, TEST_SCHEMA) == ["0001_initial"]
+    assert migrate(pg, TEST_SCHEMA) == ["0001_initial", "0002_namespace_prefixes"]
     assert _tables(pg) == TABLES
     assert migrate(pg, TEST_SCHEMA) == []  # second run: nothing pending
-    versions = pg.execute(f"SELECT version FROM {TEST_SCHEMA}.schema_migrations").fetchall()
-    assert versions == [("0001_initial",)]
+    versions = pg.execute(
+        f"SELECT version FROM {TEST_SCHEMA}.schema_migrations ORDER BY version"
+    ).fetchall()
+    assert versions == [("0001_initial",), ("0002_namespace_prefixes",)]
 
 
 def test_deleting_a_document_cascades_to_its_chunks_and_postings(pg: psycopg.Connection) -> None:
     migrate(pg, TEST_SCHEMA)
     s = TEST_SCHEMA
     pg.execute(
-        f"INSERT INTO {s}.kbs (name, embedding_provider, embedding_model, dim, chunker) "
-        "VALUES ('kb', 'fake', 'm', 4, '{}')"
+        f"INSERT INTO {s}.kbs (name, namespace, kb, embedding_provider, embedding_model, dim,"
+        " chunker) VALUES ('ns:kb', 'ns', 'kb', 'fake', 'm', 4, '{}')"
     )
     pg.execute(
         f"INSERT INTO {s}.documents (kb, doc_id, title, content_hash, chunk_count) "
-        "VALUES ('kb', 'd1', 't', 'h', 1)"
+        "VALUES ('ns:kb', 'd1', 't', 'h', 1)"
     )
     pg.execute(
         f"INSERT INTO {s}.chunks"
         " (kb, id, doc_id, n, text, start_offset, end_offset, tokens, length)"
-        " VALUES ('kb', 'd1#0', 'd1', 0, 'x', 0, 1, 1, 1)"
+        " VALUES ('ns:kb', 'd1#0', 'd1', 0, 'x', 0, 1, 1, 1)"
     )
-    pg.execute(f"INSERT INTO {s}.postings (kb, term, chunk_id, tf) VALUES ('kb', 'x', 'd1#0', 1)")
+    pg.execute(
+        f"INSERT INTO {s}.postings (kb, term, chunk_id, tf) VALUES ('ns:kb', 'x', 'd1#0', 1)"
+    )
 
-    pg.execute(f"DELETE FROM {s}.documents WHERE kb = 'kb' AND doc_id = 'd1'")
+    pg.execute(f"DELETE FROM {s}.documents WHERE kb = 'ns:kb' AND doc_id = 'd1'")
 
     assert pg.execute(f"SELECT count(*) FROM {s}.chunks").fetchone() == (0,)
     assert pg.execute(f"SELECT count(*) FROM {s}.postings").fetchone() == (0,)
@@ -57,7 +62,8 @@ def test_cli_migrate_reports_then_is_up_to_date(pg: psycopg.Connection, pg_url: 
     first = runner.invoke(app, ["migrate"], env=env)
     assert first.exit_code == 0, first.output
     assert "applied 0001_initial" in first.output
-    assert "***@" in first.output or "@" not in pg_url  # the password is never printed
+    password = conninfo_to_dict(pg_url).get("password")
+    assert not password or password not in first.output  # the password is never printed
     second = runner.invoke(app, ["migrate"], env=env)
     assert second.exit_code == 0 and "up to date" in second.output
 

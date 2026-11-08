@@ -1,16 +1,20 @@
-"""`literag` command line (design §11). Commands are added as their stage lands (design §12)."""
+"""`literag` command line. Commands are added as their stage lands (design §12)."""
 
 import json
-import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import typer
 
 from lite_rag import __version__
 from lite_rag.config import Settings, load_settings
-from lite_rag.db import check_vector, connect, migrate
+from lite_rag.db import check_vector, connect, migrate, redact_conninfo
+from lite_rag.engine import RagEngine
 from lite_rag.errors import LiteRagError
+from lite_rag.loaders import find_files
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -27,8 +31,22 @@ def _settings(config: Path | None) -> Settings:
         raise typer.BadParameter(str(exc)) from exc
 
 
+def _fail(message: str) -> NoReturn:
+    typer.echo(f"error: {message}", err=True)
+    raise typer.Exit(1)
+
+
+@contextmanager
+def _errors() -> Iterator[None]:
+    """A lite-rag error ends the command with its message and exit code 1, not a traceback."""
+    try:
+        yield
+    except LiteRagError as exc:
+        _fail(str(exc))
+
+
 def _masked(url: str | None) -> str | None:
-    return re.sub(r"//([^:/@]+):[^@]+@", r"//\1:***@", url) if url else url
+    return redact_conninfo(url) if url else url
 
 
 @app.command()
@@ -51,12 +69,86 @@ def migrate_command(config: ConfigOption = None) -> None:
     """Create or upgrade the lite-rag schema in PostgreSQL."""
     settings = _settings(config)
     schema = settings.store.schema_name
-    try:
-        with connect(settings.database_url) as conn:
-            applied = migrate(conn, schema)
-            check_vector(conn)
-    except LiteRagError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(1) from exc
+    with _errors(), connect(settings.database_url) as conn:
+        applied = migrate(conn, schema)
+        check_vector(conn)
     target = f"{_masked(settings.database_url)} schema {schema}"
     typer.echo(f"applied {', '.join(applied)} to {target}" if applied else f"{target}: up to date")
+
+
+@contextmanager
+def _engine(config: Path | None, namespace: str | None) -> Iterator[RagEngine]:
+    settings = _settings(config)
+    with _errors():
+        engine = RagEngine.from_settings(settings, namespace)
+        try:
+            yield engine
+        finally:
+            engine.close()
+
+
+KbArg = Annotated[str, typer.Argument(help="Knowledge base name")]
+NamespaceOption = Annotated[
+    str | None,
+    typer.Option(
+        "--namespace", "-n", help="Namespace, e.g. myproject/tenant_42 (or LITERAG_NAMESPACE)"
+    ),
+]
+
+
+@app.command()
+def ingest(
+    kb: KbArg,
+    paths: Annotated[list[Path], typer.Argument(help="Files or directories (.md, .txt)")],
+    config: ConfigOption = None,
+    namespace: NamespaceOption = None,
+) -> None:
+    """Chunk, embed and index files into a knowledge base (unchanged files are skipped)."""
+    files = find_files(paths)
+    if not files:
+        _fail("no supported files found")
+    with _engine(config, namespace) as engine:
+        for path in files:
+            result = engine.ingest(kb, path)
+            state = "unchanged" if result.skipped else f"{result.chunks} chunks"
+            typer.echo(f"{path}: {state} ({result.doc_id})")
+
+
+@app.command()
+def stats(kb: KbArg, config: ConfigOption = None, namespace: NamespaceOption = None) -> None:
+    """Show a knowledge base's size and how it was built."""
+    with _engine(config, namespace) as engine:
+        result = engine.stats(kb)
+    if result is None:
+        _fail(f"knowledge base {kb!r} does not exist")
+    typer.echo(json.dumps(asdict(result), indent=2, ensure_ascii=False))
+
+
+@app.command()
+def delete(
+    kb: KbArg,
+    doc_id: Annotated[str, typer.Argument(help="Document id")],
+    config: ConfigOption = None,
+    namespace: NamespaceOption = None,
+) -> None:
+    """Delete one document from a knowledge base."""
+    with _engine(config, namespace) as engine:
+        found = engine.delete(kb, doc_id)
+    typer.echo("deleted" if found else "not found")
+
+
+@app.command("drop-kb")
+def drop_kb(
+    kb: KbArg,
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Confirm: this deletes every document")
+    ] = False,
+    config: ConfigOption = None,
+    namespace: NamespaceOption = None,
+) -> None:
+    """Delete a knowledge base and everything in it."""
+    if not yes:
+        _fail("pass --yes to delete the knowledge base and all its documents")
+    with _engine(config, namespace) as engine:
+        found = engine.delete_kb(kb)
+    typer.echo("dropped" if found else "not found")

@@ -3,9 +3,9 @@ contract tests). They never touch the network or a model (AGENTS.md rule 6)."""
 
 import hashlib
 import math
-import re
 
-TOKEN = re.compile(r"\w+", re.UNICODE)
+from lite_rag.model_profiles import Prefixes
+from lite_rag.text import ESTIMATE_TOKEN
 
 
 class FakeEmbedder:
@@ -14,10 +14,14 @@ class FakeEmbedder:
 
     provider = "fake"
 
-    def __init__(self, dim: int = 64, model: str = "fake-embedder") -> None:
+    def __init__(
+        self, dim: int = 64, model: str = "fake-embedder", prefixes: Prefixes | None = None
+    ) -> None:
         self._dim = dim
         self._model = model
+        self.prefixes = prefixes or Prefixes()
         self.calls: list[list[str]] = []  # every batch embedded, for assertions
+        self.queries: list[str] = []
 
     @property
     def model(self) -> str:
@@ -32,6 +36,7 @@ class FakeEmbedder:
         return [self._vector(t) for t in texts]
 
     def embed_query(self, text: str) -> list[float]:
+        self.queries.append(text)
         return self._vector(text)
 
     def _vector(self, text: str) -> list[float]:
@@ -44,10 +49,5 @@ class FakeEmbedder:
 
 
 def _tokens(text: str) -> list[str]:
-    out: list[str] = []
-    for word in TOKEN.findall(text.lower()):
-        if any("一" <= ch <= "鿿" for ch in word):
-            out.extend(word)
-        else:
-            out.append(word)
-    return out
+    """The same tokens the estimate counter uses (CJK per character), minus punctuation."""
+    return [t for t in ESTIMATE_TOKEN.findall(text.lower()) if t.isalnum()]

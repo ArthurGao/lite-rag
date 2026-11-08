@@ -21,7 +21,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S1 — skeleton** (design §12; S0 done 2026-11-08: Ollama 0.40.15 with `bge-m3:567m` + `qwen3:8b`, PG database `lite_rag`). Next: S2 ingest. llm-steward's P3 (WeKnora) is paused until S9 is done.
+**S2 — ingest** (design §12; S0, S1 done 2026-11-08). Next: S3 retrieval. llm-steward's P3 (WeKnora) is paused until S9 is done.
 
 Decided (2026-11-08): separate public repo; library + optional HTTP service (`literag serve`, Docker image) over one
 `RagEngine`; storage is PostgreSQL + pgvector by default (vectors, own BM25 postings and the document registry in one
@@ -33,19 +33,24 @@ Ollama for local embedding (`bge-m3`) and chat (`qwen3:8b`); LLM switchable betw
 
 1. **Every component is a Protocol** (`Chunker`, `Embedder`, `Store`, `Reranker`, `LLM`);
    the engine depends on the Protocols, never on a concrete class. Swapping an implementation is config only.
-2. **Ids are stable**: chunk id = `"{doc_id}#{n}"`; `upsert_text` replaces a document's chunks in both indexes;
+2. **Namespaces are mandatory**: an engine is bound to one namespace (`project` or `project/tenant`) and
+   builds every physical key (`<namespace>:<kb>`) itself; no API takes a raw physical key.
+3. **An index is bound to its model**: `kbs` records model, dim, both prefixes and the chunker; any mismatch
+   raises. Switching model = a new kb + re-embedding, never in place. Model-specific prefixes live in
+   `model_profiles.py`, applied by the embedder — callers never add them.
+4. **Ids are stable**: chunk id = `"{doc_id}#{n}"`; `upsert_text` replaces a document's chunks in both indexes;
    `delete` removes them from both. On PostgreSQL a document write is one transaction. An unchanged document (same hash and chunker config) is a no-op.
-3. **No silent fallbacks**: a failed model call raises. No fallback chain between LLMs or embedders. Every answer
+5. **No silent fallbacks**: a failed model call raises. No fallback chain between LLMs or embedders. Every answer
    records `provider:model`; citations are validated against the retrieved chunks.
-4. **Prompts live in `src/lite_rag/prompts/*.j2`**, never inline strings.
-5. **Secrets only from environment variables.** Never commit `.env*` except `.env.example`.
-6. **Tests never call a real model or a paid API.** Unit and integration tests use `FakeEmbedder` / `FakeLLM`.
+6. **Prompts live in `src/lite_rag/prompts/*.j2`**, never inline strings.
+7. **Secrets only from environment variables.** Never commit `.env*` except `.env.example`.
+8. **Tests never call a real model or a paid API.** Unit and integration tests use `FakeEmbedder` / `FakeLLM`.
    Real Ollama runs only under the opt-in marker `-m ollama`. Integration tests use their own PG schema
    (`LITERAG_TEST_DATABASE_URL`, schema `lite_rag_test`), never the app schema. Never call llm-gateway subscription profiles from
    tests or on your own initiative.
-7. **Pinned dependencies** for the engines (`chromadb`, `ollama`, pgvector driver, rerank package): exact versions; an upgrade
+9. **Pinned dependencies** for the engines (`psycopg`, `fastembed`, later `chromadb` and the rerank package): exact versions; an upgrade
    re-runs `-m ollama` and the eval.
-8. **Measure, don't guess**: a change meant to improve retrieval comes with an eval run (`literag eval`) before and
+10. **Measure, don't guess**: a change meant to improve retrieval comes with an eval run (`literag eval`) before and
    after; record the numbers in the commit or the KB.
 
 ## Tech stack
@@ -68,5 +73,11 @@ uv run literag ingest <kb> <path> | search <kb> "<q>" | ask <kb> "<q>" | eval --
 2. Definition of done: ruff, mypy, tests pass; acceptance items covered by tests; design updated if behaviour
    changed.
 3. Conventional Commits (`feat(retrieval): …`). All code-facing text in English.
-4. Close-out at S8 (before S9): simplify the diff, then a read-only Codex review, fix what holds up,
-   re-run all checks, report.
+4. **Stage close-out — after every stage's implementation passes its checks, before its commit and before the
+   next stage starts:**
+   1. Simplify the stage's full diff (reuse, simplification, efficiency, altitude) and apply the fixes.
+   2. Independent read-only Codex review of the same diff (see `CLAUDE.md` for the command).
+   3. Fix every finding that holds up — a bug gets a failing regression test first. A finding you reject is
+      written down with the reason; never silently dropped.
+   4. Re-run all checks (step 2) so they cover the final code, then report the review outcome with the stage.
+   S8 is the final close-out over the whole engine before S9 (llm-steward adapter).

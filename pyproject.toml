@@ -14,11 +14,16 @@ dependencies = [
     "jieba>=0.42.1",
     # The default store (design §4). Pinned exactly: an upgrade re-runs `-m ollama` and the eval.
     "psycopg[binary,pool]==3.3.8",
-    "pgvector==0.5.1",
+    "tokenizers>=0.21",
 ]
 
 [project.scripts]
 literag = "lite_rag.cli:app"
+
+[project.optional-dependencies]
+fastembed = [
+    "fastembed==0.9.1",
+]
 
 [dependency-groups]
 dev = [
@@ -47,7 +52,7 @@ packages = ["lite_rag"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["jieba", "pgvector", "pgvector.*"]
+module = ["jieba", "fastembed", "fastembed.*", "tokenizers"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
