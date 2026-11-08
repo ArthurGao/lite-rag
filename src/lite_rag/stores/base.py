@@ -50,6 +50,17 @@ class IndexedChunk:
 
 
 @dataclass(frozen=True)
+class StoredChunk:
+    chunk_id: str
+    doc_id: str
+    title: str
+    text: str
+    start: int
+    end: int
+    heading_path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class KbStats:
     namespace: str
     kb: str
@@ -65,6 +76,10 @@ class Store(Protocol):
         """The kb as stored — created from `info` if it did not exist. The caller compares."""
         ...
 
+    def get_kb(self, kb: KbRef) -> KbInfo | None:
+        """The kb as stored, or None; never creates one."""
+        ...
+
     def document_hash(self, kb: KbRef, doc_id: str) -> str | None: ...
 
     def upsert_document(
@@ -76,6 +91,29 @@ class Store(Protocol):
     def delete_kb(self, kb: KbRef) -> bool: ...
 
     def stats(self, kb: KbRef) -> KbStats | None: ...
+
+    # --- retrieval (design §5) ---------------------------------------------------------------
+
+    def vector_query(
+        self, kb: KbRef, vector: list[float], n: int, where: dict[str, Any] | None = None
+    ) -> list[tuple[str, float]]:
+        """The `n` nearest chunks as (chunk_id, cosine similarity), best first."""
+        ...
+
+    def bm25_query(
+        self,
+        kb: KbRef,
+        terms: list[str],
+        n: int,
+        k1: float,
+        b: float,
+        where: dict[str, Any] | None = None,
+    ) -> list[tuple[str, float]]:
+        """The `n` best chunks by BM25 (`keyword.py`) as (chunk_id, score), best first. N, n(t)
+        and avgdl are the whole kb's; `where` only narrows which chunks may be returned."""
+        ...
+
+    def chunks(self, kb: KbRef, chunk_ids: list[str]) -> dict[str, StoredChunk]: ...
 
     def close(self) -> None: ...
 

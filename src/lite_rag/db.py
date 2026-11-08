@@ -56,8 +56,9 @@ def use_schema(conn: psycopg.Connection, schema: str) -> None:
     conn.execute(sql.SQL("SET LOCAL search_path TO {}, public").format(sql.Identifier(schema)))
 
 
-def migrate(conn: psycopg.Connection, schema: str) -> list[str]:
-    """Apply pending migrations to `schema`; returns the versions applied (empty: up to date)."""
+def migrate(conn: psycopg.Connection, schema: str, until: str | None = None) -> list[str]:
+    """Apply pending migrations to `schema` — up to and including `until` when given; returns
+    the versions applied (empty: up to date)."""
     with conn.transaction():
         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
@@ -69,6 +70,8 @@ def migrate(conn: psycopg.Connection, schema: str) -> list[str]:
         )
     applied: list[str] = []
     for version, script in _migration_files():
+        if until is not None and version > until:
+            break
         with conn.transaction():
             use_schema(conn, schema)
             # Serialise concurrent migrators on this schema; the check below then sees their work.
@@ -84,10 +87,20 @@ def migrate(conn: psycopg.Connection, schema: str) -> list[str]:
     return applied
 
 
+MIN_PGVECTOR = (0, 8)  # hnsw.iterative_scan, which filtered vector search relies on
+
+
 def check_vector(conn: psycopg.Connection) -> None:
-    """Run a real vector operation: an extension can look installed while its library is missing
-    (KB rag-production-guide §2), so presence alone proves nothing."""
+    """pgvector is new enough, and a real vector operation runs: an extension can look installed
+    while its library is missing (KB rag-production-guide §2), so presence alone proves nothing."""
     try:
+        row = conn.execute(
+            "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+        ).fetchone()
         conn.execute("SELECT '[1,2]'::vector <=> '[1,2]'").fetchone()
     except psycopg.Error as exc:
         raise StoreError(f"pgvector is not usable: {exc}") from exc
+    version = tuple(int(p) for p in row[0].split(".")[:2]) if row else (0, 0)
+    if version < MIN_PGVECTOR:
+        found = row[0] if row else "not installed"
+        raise StoreError(f"pgvector >= 0.8 is required (found {found})")

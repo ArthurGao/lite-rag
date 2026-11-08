@@ -9,5 +9,9 @@ class ConfigError(LiteRagError):
     """The configuration is invalid or does not match what a knowledge base was built with."""
 
 
+class KbNotFound(LiteRagError):
+    """The knowledge base does not exist (in this namespace). Reads never create one."""
+
+
 class StoreError(LiteRagError):
     """The store could not be reached or rejected the operation."""

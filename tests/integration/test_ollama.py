@@ -7,8 +7,10 @@ import pytest
 from typer.testing import CliRunner
 
 from lite_rag.cli import app
-from lite_rag.config import EmbeddingConfig
+from lite_rag.config import EmbeddingConfig, load_settings
+from lite_rag.db import migrate
 from lite_rag.embedding import OllamaEmbedder
+from lite_rag.engine import RagEngine
 from lite_rag.text import HFTokenCounter
 from tests.conftest import TEST_SCHEMA
 
@@ -58,3 +60,36 @@ def test_cli_ingest_end_to_end(pg: psycopg.Connection, pg_url: str, tmp_path: Pa
     assert '"dim": 1024' in stats.output and '"documents": 2' in stats.output
     assert '"embedding": "ollama/bge-m3:567m"' in stats.output
     assert '"namespace": "e2e"' in stats.output
+
+    found = runner.invoke(app, ["search", "demo", "多久能退款", "-k", "1"], env=env)
+    assert found.exit_code == 0, found.output
+    assert found.output.startswith("1. ") and "退款" in found.output and "vector #" in found.output
+    missing = runner.invoke(app, ["search", "nope", "x"], env=env)
+    assert missing.exit_code == 1 and "does not exist" in missing.output
+
+
+def test_real_search_finds_paraphrases_in_both_languages(
+    pg: psycopg.Connection, pg_url: str
+) -> None:
+    migrate(pg, TEST_SCHEMA)
+    settings = load_settings(database_url=pg_url, store={"schema": TEST_SCHEMA})
+    engine = RagEngine.from_settings(settings, namespace="e2e")
+    try:
+        docs = {
+            "refund": "退款会在七天内原路退回到您的支付账户。",
+            "shipping": "订单满五十元包邮，工作日当天发货。",
+            "returns": "Items can be returned within thirty days if unused.",
+            "warranty": "Electronics come with a one-year manufacturer warranty.",
+        }
+        for doc_id, text in docs.items():
+            engine.upsert_text("faq", doc_id, doc_id, text)
+        # no shared keywords with the answer: only the embedding can find these
+        assert engine.search("faq", "钱多久能退给我", mode="vector")[0].doc_id == "refund"
+        assert (
+            engine.search("faq", "how long do I have to send it back", mode="vector")[0].doc_id
+            == "returns"
+        )
+        hybrid = engine.search("faq", "包邮", top_k=2)
+        assert hybrid[0].doc_id == "shipping" and set(hybrid[0].ranks) == {"vector", "bm25"}
+    finally:
+        engine.close()

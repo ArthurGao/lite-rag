@@ -12,16 +12,19 @@
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any, Literal, overload
 
 import psycopg
 from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from lite_rag.config import IDENTIFIER
-from lite_rag.db import connection_error, require_url
-from lite_rag.errors import ConfigError, StoreError
-from lite_rag.stores.base import IndexedChunk, KbInfo, KbRef, KbStats
+from lite_rag.db import check_vector, connection_error, require_url
+from lite_rag.errors import ConfigError, KbNotFound, StoreError
+from lite_rag.keyword import Bm25Inputs, Posting, bm25
+from lite_rag.stores.base import IndexedChunk, KbInfo, KbRef, KbStats, StoredChunk
 from lite_rag.types import Document
 
 MAX_VECTOR_DIM = 2000  # HNSW on `vector`; above it we store `halfvec` (HNSW up to 4000)
@@ -44,17 +47,98 @@ def _vector_text(vector: list[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vector) + "]"
 
 
+def _metadata_filter(
+    kb: sql.Composable, doc_id: sql.Composable, where: dict[str, Any] | None
+) -> tuple[sql.Composable, dict[str, Any]]:
+    """`AND …` keeping rows whose document's metadata contains `where` (JSON containment: every
+    key equals its value), and its parameters. Nothing when there is no filter."""
+    if not where:
+        return sql.SQL(""), {}
+    clause = sql.SQL(
+        " AND EXISTS (SELECT 1 FROM documents d WHERE d.kb = {kb} AND d.doc_id = {doc}"
+        " AND d.metadata @> %(where)s)"
+    ).format(kb=kb, doc=doc_id)
+    return clause, {"where": Jsonb(where)}
+
+
+# BM25 (keyword.py has the formula). One statistics block for both implementations: N and avgdl
+# from `kbs`, n(t) counted over the whole kb BEFORE the metadata filter — a filter narrows which
+# chunks may be returned, never the statistics.
+_BM25_MATCHES = """
+WITH q AS (SELECT DISTINCT unnest(%(terms)s::text[]) AS term),
+stats AS (
+    SELECT n_chunks::float8 AS n,
+           CASE WHEN n_chunks > 0 THEN total_length::float8 / n_chunks ELSE 0 END AS avgdl
+    FROM kbs WHERE name = %(kb)s),
+matches AS (
+    SELECT p.term, p.chunk_id, p.doc_id, p.tf, p.length,
+           count(*) OVER (PARTITION BY p.term) AS df
+    FROM postings p JOIN q USING (term) WHERE p.kb = %(kb)s)
+"""
+_BM25_SCORE = sql.SQL(
+    _BM25_MATCHES
+    + """
+SELECT chunk_id, score FROM (
+    SELECT m.chunk_id,
+           sum(ln(1 + (s.n - m.df + 0.5) / (m.df + 0.5))                   -- idf
+               * m.tf * (%(k1)s + 1)
+               / (m.tf + %(k1)s * CASE WHEN s.avgdl > 0
+                                       THEN 1 - %(b)s + %(b)s * m.length / s.avgdl
+                                       ELSE 1 END)
+               ORDER BY m.term) AS score                   -- fixed order, as keyword.bm25
+    FROM matches m CROSS JOIN stats s
+    WHERE TRUE {filter}
+    GROUP BY m.chunk_id) scored
+ORDER BY round(score::numeric, 9) DESC, chunk_id LIMIT %(n)s  -- ranking.PRECISION
+"""
+)
+_BM25_INPUTS = sql.SQL(
+    _BM25_MATCHES
+    + """
+SELECT m.term, m.chunk_id, m.tf, m.length, m.df, s.n, s.avgdl
+FROM matches m CROSS JOIN stats s
+WHERE TRUE {filter}
+"""
+)
+
+
+def _bm25_inputs(rows: list[tuple[Any, ...]]) -> Bm25Inputs:
+    if not rows:
+        return Bm25Inputs(0, 0.0, {}, [])
+    return Bm25Inputs(
+        int(rows[0][5]),
+        float(rows[0][6]),
+        {term: int(df) for term, _, _, _, df, _, _ in rows},
+        [Posting(term, chunk, tf, length) for term, chunk, tf, length, *_ in rows],
+    )
+
+
 class PgStore:
     """Implements both `Store` and `VectorCache`."""
 
-    def __init__(self, database_url: str | None, schema: str, *, max_connections: int = 4) -> None:
+    def __init__(
+        self,
+        database_url: str | None,
+        schema: str,
+        *,
+        max_connections: int = 4,
+        bm25_impl: Literal["sql", "python"] = "sql",
+    ) -> None:
+        """`bm25_impl`: score BM25 in SQL (fast) or in Python with `keyword.bm25` (readable);
+        both use the same statistics and agree (tested)."""
         if not IDENTIFIER.match(schema):  # it goes into the connection's search_path option
             raise ConfigError(f"invalid schema {schema!r}: must be a lowercase SQL identifier")
+        url = require_url(database_url)
+        try:  # keep any options the caller put in the connection string, add the search_path
+            own = conninfo_to_dict(url).get("options") or ""
+        except psycopg.ProgrammingError as exc:
+            raise StoreError(f"invalid database URL: {exc}") from exc
+        options = f"{own} -c search_path={schema},public".strip()
         self._pool = ConnectionPool(
-            require_url(database_url),
+            url,
             min_size=1,
             max_size=max_connections,
-            kwargs={"options": f"-c search_path={schema},public"},
+            kwargs={"options": options},
             open=False,
             name="lite-rag",
         )
@@ -62,8 +146,11 @@ class PgStore:
             self._pool.open(wait=True, timeout=10)
         except psycopg.Error as exc:
             raise connection_error(exc) from exc
+        self._bm25_impl = bm25_impl
         self._vector_tables: set[int] = set()
         self._cache_tables: set[int] = set()
+        with self._pool.connection() as conn:
+            check_vector(conn)
 
     def close(self) -> None:
         self._pool.close()
@@ -97,13 +184,21 @@ class PgStore:
             if created:
                 self._ensure_vector_table(conn, info.dim)
                 return info
-            row = conn.execute(
-                "SELECT embedding_provider, embedding_model, dim, query_prefix, document_prefix,"
-                " chunker FROM kbs WHERE name = %s",
-                (ref.key,),
-            ).fetchone()
-        assert row is not None  # ON CONFLICT: it exists
-        return KbInfo(ref, *row)
+            stored = self._get_kb(conn, ref)
+        assert stored is not None  # ON CONFLICT: it exists
+        return stored
+
+    def get_kb(self, kb: KbRef) -> KbInfo | None:
+        with self._tx() as conn:
+            return self._get_kb(conn, kb)
+
+    def _get_kb(self, conn: psycopg.Connection, kb: KbRef) -> KbInfo | None:
+        row = conn.execute(
+            "SELECT embedding_provider, embedding_model, dim, query_prefix, document_prefix,"
+            " chunker FROM kbs WHERE name = %s",
+            (kb.key,),
+        ).fetchone()
+        return KbInfo(kb, *row) if row else None
 
     def delete_kb(self, kb: KbRef) -> bool:
         with self._tx() as conn:
@@ -123,6 +218,65 @@ class PgStore:
         n_chunks, total, provider, model, dim, docs = row
         avg = total / n_chunks if n_chunks else 0.0
         return KbStats(kb.namespace, kb.name, docs, n_chunks, avg, f"{provider}/{model}", dim)
+
+    # --- retrieval ---------------------------------------------------------------------------
+    # The engine opens a kb (existence and identity) before any of these; they trust `kb`.
+
+    def vector_query(
+        self, kb: KbRef, vector: list[float], n: int, where: dict[str, Any] | None = None
+    ) -> list[tuple[str, float]]:
+        dim = len(vector)  # the engine checked it is the kb's dimension
+        doc = sql.SQL("(SELECT c.doc_id FROM chunks c WHERE c.kb = e.kb AND c.id = e.chunk_id)")
+        filter_sql, params = _metadata_filter(sql.SQL("e.kb"), doc, where)
+        query = sql.SQL(
+            "SELECT e.chunk_id, 1 - (e.embedding <=> %(q)s::{vt}) AS similarity"
+            " FROM {table} e WHERE e.kb = %(kb)s {filter}"
+            " ORDER BY e.embedding <=> %(q)s::{vt}, e.chunk_id LIMIT %(n)s"
+        ).format(vt=vector_sql(dim), table=_table("embeddings", dim), filter=filter_sql)
+        with self._tx() as conn:
+            # The kb (and metadata) filter is applied after the HNSW scan; iterative scanning
+            # keeps reading the index until `n` rows pass it (pgvector >= 0.8), in exact order.
+            conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")
+            rows = conn.execute(
+                query, {"q": _vector_text(vector), "kb": kb.key, "n": n, **params}
+            ).fetchall()
+        return [(chunk, float(sim)) for chunk, sim in rows]
+
+    def bm25_query(
+        self,
+        kb: KbRef,
+        terms: list[str],
+        n: int,
+        k1: float,
+        b: float,
+        where: dict[str, Any] | None = None,
+    ) -> list[tuple[str, float]]:
+        if not terms:
+            return []
+        filter_sql, filter_params = _metadata_filter(sql.SQL("%(kb)s"), sql.SQL("m.doc_id"), where)
+        params = {"terms": terms, "kb": kb.key, "k1": k1, "b": b, "n": n, **filter_params}
+        with self._tx() as conn:
+            if self._bm25_impl == "python":
+                rows = conn.execute(_BM25_INPUTS.format(filter=filter_sql), params).fetchall()
+                return bm25(_bm25_inputs(rows), n, k1, b)
+            rows = conn.execute(_BM25_SCORE.format(filter=filter_sql), params).fetchall()
+        return [(chunk, float(score)) for chunk, score in rows]
+
+    def chunks(self, kb: KbRef, chunk_ids: list[str]) -> dict[str, StoredChunk]:
+        if not chunk_ids:
+            return {}
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT c.id, c.doc_id, d.title, c.text, c.start_offset, c.end_offset,"
+                " c.heading_path FROM chunks c"
+                " JOIN documents d ON d.kb = c.kb AND d.doc_id = c.doc_id"
+                " WHERE c.kb = %s AND c.id = ANY(%s)",
+                (kb.key, chunk_ids),
+            ).fetchall()
+        return {
+            chunk: StoredChunk(chunk, doc, title, text, start, end, tuple(path))
+            for chunk, doc, title, text, start, end, path in rows
+        }
 
     # --- documents ---------------------------------------------------------------------------
 
@@ -167,8 +321,10 @@ class PgStore:
             )
 
     def delete_document(self, kb: KbRef, doc_id: str) -> bool:
+        """False when the document — or the whole kb — does not exist."""
         with self._tx() as conn:
-            self._lock_kb(conn, kb)
+            if self._lock_kb(conn, kb, missing_ok=True) is None:
+                return False
             existed, removed, removed_length = self._remove(conn, kb, doc_id)
             self._adjust_stats(conn, kb, -removed, -removed_length)
             return existed
@@ -203,10 +359,21 @@ class PgStore:
 
     # --- internals ---------------------------------------------------------------------------
 
-    def _lock_kb(self, conn: psycopg.Connection, kb: KbRef) -> int:
+    @overload
+    def _lock_kb(self, conn: psycopg.Connection, kb: KbRef) -> int: ...
+
+    @overload
+    def _lock_kb(self, conn: psycopg.Connection, kb: KbRef, *, missing_ok: bool) -> int | None: ...
+
+    def _lock_kb(
+        self, conn: psycopg.Connection, kb: KbRef, *, missing_ok: bool = False
+    ) -> int | None:
+        """Lock the kb's row (serialising writers and its BM25 statistics); returns its dim."""
         row = conn.execute("SELECT dim FROM kbs WHERE name = %s FOR UPDATE", (kb.key,)).fetchone()
         if row is None:
-            raise StoreError(f"knowledge base {kb.key!r} does not exist")
+            if missing_ok:
+                return None
+            raise KbNotFound(f"knowledge base {kb.key!r} does not exist")
         dim: int = row[0]
         return dim
 
@@ -265,10 +432,13 @@ class PgStore:
             ) as copy:
                 for c in chunks:
                     copy.write_row((kb.key, c.chunk.chunk_id, _vector_text(c.vector)))
-            with cur.copy("COPY postings (kb, term, chunk_id, tf) FROM STDIN") as copy:
+            with cur.copy(
+                "COPY postings (kb, term, chunk_id, tf, length, doc_id) FROM STDIN"
+            ) as copy:
                 for c in chunks:
+                    length = len(c.terms)
                     for term, tf in Counter(c.terms).items():
-                        copy.write_row((kb.key, term, c.chunk.chunk_id, tf))
+                        copy.write_row((kb.key, term, c.chunk.chunk_id, tf, length, c.chunk.doc_id))
 
     def _ensure_vector_table(self, conn: psycopg.Connection, dim: int) -> None:
         if dim in self._vector_tables:

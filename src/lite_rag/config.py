@@ -19,8 +19,14 @@ from pydantic_settings import (
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
+Mode = Literal["vector", "bm25", "hybrid"]
+
+
 class StoreConfig(BaseModel):
     backend: Literal["postgres"] = "postgres"
+    # Where BM25 is scored: "sql" (fast, in PostgreSQL) or "python" (keyword.py, readable).
+    # Same formula and statistics; the tests check they agree.
+    bm25_impl: Literal["sql", "python"] = "sql"
     schema_name: str = Field(default="lite_rag", alias="schema")
 
     @field_validator("schema_name")
@@ -79,6 +85,23 @@ class ChunkingConfig(BaseModel):
         }
 
 
+class BM25Config(BaseModel):
+    k1: float = Field(default=1.5, ge=0)
+    b: float = Field(default=0.75, ge=0, le=1)
+
+
+class RetrievalConfig(BaseModel):
+    """Design §5."""
+
+    mode: Mode = "hybrid"
+    top_k: int = Field(default=5, gt=0, le=200)
+    candidate_factor: int = Field(default=4, gt=0, le=50)  # each path returns top_k * this
+    fusion: Literal["rrf", "weighted"] = "rrf"
+    rrf_k: int = Field(default=60, gt=0)
+    vector_weight: float = Field(default=0.5, ge=0, le=1)  # weighted fusion; bm25 gets the rest
+    bm25: BM25Config = BM25Config()
+
+
 class LLMConfig(BaseModel):
     provider: Literal["ollama", "openai", "anthropic"] = "ollama"
     model: str = "qwen3:8b"
@@ -102,6 +125,7 @@ class Settings(BaseSettings):
     store: StoreConfig = StoreConfig()
     embedding: EmbeddingConfig = EmbeddingConfig()
     chunking: ChunkingConfig = ChunkingConfig()
+    retrieval: RetrievalConfig = RetrievalConfig()
     llm: LLMConfig = LLMConfig()
 
     yaml_path: ClassVar[Path | None] = None  # set by `load_settings` on a subclass

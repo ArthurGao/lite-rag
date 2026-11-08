@@ -42,11 +42,11 @@ lite-rag 是一个**可读、可改、可单独部署**的轻量 RAG 引擎，�
 | `Loader` | `load(path) -> Document` | txt、md | pdf（extra `[pdf]`，只抽纯文本，S5b） |
 | `Chunker` | `split(doc) -> list[Chunk]` | `recursive` | 见 §3.1：fixed、sentence、paragraph、markdown、semantic、parent-child，另有 contextual 增强 |
 | `Embedder` | `embed_documents(texts)`、`embed_query(text)`、`dim`、`model` | `ollama`（`bge-m3`） | 见 §3.2：openai 兼容、voyage、cohere、gemini、fastembed、sentence-transformers、`FakeEmbedder` |
-| `Store` | `upsert_document`、`delete_document`、`vector_query`、`keyword_query`、`get_document`、`stats` | `PgStore`（pgvector 存向量，PG 表存 BM25 倒排和文档登记） | `ChromaStore`（extra `[chroma]`）：向量放 Chroma，倒排和登记放 SQLite |
+| `Store` | `get_or_create_kb`、`get_kb`、`upsert_document`、`delete_document`、`vector_query`、`bm25_query`、`chunks`、`stats` | `PgStore`（pgvector 存向量，PG 表存 BM25 倒排和文档登记） | `ChromaStore`（extra `[chroma]`）：向量放 Chroma，倒排和登记放 SQLite |
 | `Reranker` | `rerank(query, hits) -> hits` | `NoRerank` | 本地 cross-encoder `bge-reranker`（extra `[rerank]`） |
 | `LLM` | `complete(messages) -> Completion` | `OpenAICompatLLM`（Ollama `/v1`、OpenAI、llm-gateway） | `AnthropicLLM`（extra `[anthropic]`）、`FakeLLM` |
 
-`Store` 把向量和倒排放在同一个接口里，这样 PG 后端能在一个事务里完成一篇文档的所有写入。BM25 的打分公式写在 `keyword.py` 里，两个后端共用，后端只负责存取倒排数据。
+`Store` 把向量和倒排放在同一个接口里，这样 PG 后端能在一个事务里完成一篇文档的所有写入。BM25 的公式写在 `keyword.py` 里；store 只提供一个 `bm25_query`，内部决定在哪里打分：PgStore 可以在 SQL 里打分（`store.bm25_impl: sql`，默认），也可以取回 posting 后交给 `keyword.bm25` 打分（`python`）。两种方式共用同一段统计量 SQL。Chroma 后端只用 Python 方式。
 
 `RagEngine` 是库的入口，HTTP 服务调用的也是它：
 
@@ -298,3 +298,15 @@ lite-rag/
   - 切块按 embedding 模型自己的 tokenizer（Hugging Face `tokenizers`，不需要 torch）计数。tokenizer 跟着模型 profile 走：bge-m3 用 `BAAI/bge-m3`，nomic 用 `nomic-ai/nomic-embed-text-v1.5`，`org/name` 形式的模型名直接把自己当作 tokenizer；未知模型用估算。配置 `embedding.tokenizer` 可以覆盖，设为 `""` 表示用估算。fastembed 也走同一张前缀表（用它的普通 `embed`），所以 kb 上记录的前缀就是实际使用的前缀。
   - `markdown` 策略把标题路径拼在 chunk 前面，再做 embedding 和 BM25；`chunks.text` 保存原文切片，用于引用。
   - PDF 抽取推迟到 S5b，S2 只支持 txt 和 md。
+- S3 实现说明（2026-11-08）：
+  - **BM25 有两种实现**：`keyword.py`（Python，便于阅读）和 SQL（更快），由 `store.bm25_impl` 选择。两者共用同一个统计量 CTE：N 和 avgdl 取自 `kbs`，n(t) 用窗口函数在元数据过滤**之前**统计，所以过滤只缩小候选，不改变分数，有测试按两种实现分别检查。posting 表里直接存了 chunk 的 `length` 和 `doc_id`（迁移 0003），打分时只读 posting 表，不用再逐行回查 `chunks`。
+  - **向量检索**的事务里会设置 `hnsw.iterative_scan = strict_order`（pgvector 0.8）。多个 kb 共用同一张 `embeddings_<dim>` 表和同一个 HNSW 索引，kb 过滤发生在索引扫描之后；不开这个参数，规划器一旦选择 HNSW，候选（`ef_search`=40）可能全部属于其他 kb，结果就会不足 top_k。kb 很小时，规划器通常会先用主键按 kb 过滤再精确排序，这样本来就是正确的。实测：同表另有 2000 条向量时，关闭该参数只返回 1 条，`strict_order` 返回 5 条。
+  - **只读操作不会创建 kb**：在不存在的 kb 上搜索会抛出 `KbNotFound`，因为拼错的名字应该报错，而不是返回空结果；删除操作则返回 False，保持幂等。写入操作会在 kb 不存在时创建它。
+  - 用户写在连接串里的 `options` 会被保留，`search_path` 追加在它后面。
+  - 打开 store 和执行 `literag migrate` 时都会检查 pgvector 版本，要求不低于 0.8（`iterative_scan` 需要）。
+  - 只有 hybrid 模式才按 `top_k × candidate_factor` 向两条路径取候选；单一模式只取 `top_k`。`Hit.scores` 里只放各阶段自己的分数，最终分数是 `Hit.score`。
+  - **平局与浮点误差**（Codex review，2026-11-08）：每个 chunk 的各项分数按词的固定顺序相加，Python 版先排序再求和，SQL 版用 `sum(... ORDER BY term)`。这样一个 chunk 的分数不会因为数据库返回行的顺序不同而在最后一位产生差异。排序时分数先舍入到 9 位小数（`ranking.PRECISION`，SQL 用 `round(score::numeric, 9)`）再比较，只差浮点噪声的两个分数视为平局，平局按 chunk_id 排。
+  - **读操作每次都检查 kb**：kb 是否存在、身份是否一致，读操作每次都会重新确认，代价是多一次很轻的查询。这样另一个进程删掉 kb 后，下一次搜索会报 `KbNotFound`，而不是返回空结果。写操作每个引擎只检查一次；kb 若在之后被删除，加锁写入时会报 `KbNotFound`。
+  - `stats()` 不做身份校验，这是有意为之：它的用途正是查看一个 kb 是用什么模型和配置建的，配置不一致时也必须能看到；kb 不存在时返回 None（CLI 会显示 "does not exist"）。Codex 建议它也走读操作的检查，未采纳，理由同上。
+  - 暂不实现（S3 simplify 评估过，2026-11-08）：向量和 BM25 两条路径并行执行，留到 S6 服务层；读操作改用 autocommit、缓存写入移出请求路径，等有实测数据再定；向量距离只算一次，需要先用 EXPLAIN 确认不影响 HNSW。
+  - 测试里 HNSW 召回不全的数据要用分布均匀的随机向量构造。bag-of-words 的 fake embedder 生成的 8 维向量大量重复，会让 HNSW 图里有些节点永远搜不到，真实模型不会出现这种情况。

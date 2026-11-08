@@ -10,7 +10,7 @@ from typing import Annotated, NoReturn
 import typer
 
 from lite_rag import __version__
-from lite_rag.config import Settings, load_settings
+from lite_rag.config import Mode, Settings, load_settings
 from lite_rag.db import check_vector, connect, migrate, redact_conninfo
 from lite_rag.engine import RagEngine
 from lite_rag.errors import LiteRagError
@@ -152,3 +152,30 @@ def drop_kb(
     with _engine(config, namespace) as engine:
         found = engine.delete_kb(kb)
     typer.echo("dropped" if found else "not found")
+
+
+@app.command()
+def search(
+    kb: KbArg,
+    query: Annotated[str, typer.Argument(help="The question or keywords")],
+    top_k: Annotated[int | None, typer.Option("--top-k", "-k", help="How many hits")] = None,
+    mode: Annotated[Mode | None, typer.Option("--mode", "-m")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the hits as JSON")] = False,
+    config: ConfigOption = None,
+    namespace: NamespaceOption = None,
+) -> None:
+    """Search a knowledge base; shows each stage's score and rank for every hit."""
+    with _engine(config, namespace) as engine:
+        hits = engine.search(kb, query, top_k=top_k, mode=mode)
+    if as_json:
+        typer.echo(json.dumps([asdict(h) for h in hits], indent=2, ensure_ascii=False))
+        return
+    if not hits:
+        typer.echo("no hits")
+    for i, h in enumerate(hits, start=1):
+        stages = "  ".join(
+            f"{stage} #{h.ranks[stage]} {h.scores[stage]:.4f}" for stage in sorted(h.ranks)
+        )
+        where = " > ".join(h.heading_path) or h.title
+        typer.echo(f"{i}. {h.score:.4f}  [{stages}]  {where}  ({h.chunk_id})")
+        typer.echo("   " + " ".join(h.text.split())[:200])

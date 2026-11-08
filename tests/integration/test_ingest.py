@@ -1,52 +1,24 @@
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import psycopg
 import pytest
 
-from lite_rag.config import load_settings
-from lite_rag.db import migrate
-from lite_rag.embedding import CachingEmbedder, Embedder
-from lite_rag.engine import RagEngine
+from lite_rag.embedding import CachingEmbedder
 from lite_rag.errors import ConfigError
 from lite_rag.model_profiles import Prefixes
 from lite_rag.stores.base import KbRef
 from lite_rag.stores.pg import PgStore
 from lite_rag.testing import FakeEmbedder
 from tests.conftest import TEST_SCHEMA
+from tests.integration.support import NS, make_engine
 
-NS = "proj/tenant_1"
 KB = KbRef(NS, "kb")
-CHUNKING = {"strategy": "paragraph", "unit": "chars", "size": 40, "overlap": 0, "min_size": 0}
 
 DOC_V1 = "Refunds take seven days.\n\nShipping is free above fifty dollars."
 DOC_V2 = (
     "Refunds now take three days.\n\nShipping is free above fifty dollars.\n\nReturns: 30 days."
 )
-
-
-@pytest.fixture
-def store(pg: psycopg.Connection, pg_url: str) -> Iterator[PgStore]:
-    migrate(pg, TEST_SCHEMA)
-    s = PgStore(pg_url, TEST_SCHEMA)
-    yield s
-    s.close()
-
-
-def _engine(
-    store: PgStore,
-    embedder: FakeEmbedder | None = None,
-    *,
-    namespace: str = NS,
-    cache: bool = True,
-    **chunking: Any,
-) -> RagEngine:
-    """An engine as `from_settings` builds one, with a fake embedder (cached unless cache=False)."""
-    settings = load_settings(chunking={**CHUNKING, **chunking}, embedding={"cache": cache})
-    inner = embedder or FakeEmbedder(dim=8)
-    wrapped: Embedder = CachingEmbedder(inner, store) if cache else inner
-    return RagEngine(settings, store, wrapped, namespace=namespace)
 
 
 def _count(pg: psycopg.Connection, table: str, kb: KbRef = KB, column: str = "kb") -> int:
@@ -67,7 +39,7 @@ def _chunk_ids(pg: psycopg.Connection) -> list[str]:
 def test_upsert_writes_chunks_vectors_postings_and_stats(
     store: PgStore, pg: psycopg.Connection
 ) -> None:
-    result = _engine(store).upsert_text("kb", "d1", "Policy", DOC_V1)
+    result = make_engine(store).upsert_text("kb", "d1", "Policy", DOC_V1)
 
     assert (result.chunks, result.skipped) == (2, False)
     assert _chunk_ids(pg) == ["d1#0", "d1#1"]
@@ -83,7 +55,7 @@ def test_upsert_writes_chunks_vectors_postings_and_stats(
 
 
 def test_the_kb_row_records_namespace_name_and_key(store: PgStore, pg: psycopg.Connection) -> None:
-    _engine(store).upsert_text("kb", "d1", "Policy", DOC_V1)
+    make_engine(store).upsert_text("kb", "d1", "Policy", DOC_V1)
     row = pg.execute(f"SELECT name, namespace, kb FROM {TEST_SCHEMA}.kbs").fetchone()
     assert row == ("proj/tenant_1:kb", "proj/tenant_1", "kb")
 
@@ -100,7 +72,7 @@ def test_the_database_refuses_a_key_that_disagrees_with_its_parts(
 
 def test_unchanged_content_is_not_re_embedded(store: PgStore, pg: psycopg.Connection) -> None:
     embedder = FakeEmbedder(dim=8)
-    engine = _engine(store, embedder)
+    engine = make_engine(store, embedder)
     engine.upsert_text("kb", "d1", "Policy", DOC_V1)
     calls = len(embedder.calls)
 
@@ -113,7 +85,7 @@ def test_unchanged_content_is_not_re_embedded(store: PgStore, pg: psycopg.Connec
 def test_a_changed_document_replaces_every_old_chunk(
     store: PgStore, pg: psycopg.Connection
 ) -> None:
-    engine = _engine(store)
+    engine = make_engine(store)
     engine.upsert_text("kb", "d1", "Policy", DOC_V1)
     engine.upsert_text("kb", "d2", "Other", "Unrelated text here.")
 
@@ -138,7 +110,7 @@ def test_a_changed_document_replaces_every_old_chunk(
 
 
 def test_delete_leaves_nothing_behind(store: PgStore, pg: psycopg.Connection) -> None:
-    engine = _engine(store)
+    engine = make_engine(store)
     engine.upsert_text("kb", "d1", "Policy", DOC_V1)
 
     assert engine.delete("kb", "d1") is True
@@ -153,7 +125,7 @@ def test_delete_leaves_nothing_behind(store: PgStore, pg: psycopg.Connection) ->
 def test_a_failure_mid_write_keeps_the_old_version(
     store: PgStore, pg: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    engine = _engine(store)
+    engine = make_engine(store)
     engine.upsert_text("kb", "d1", "Policy", DOC_V1)
 
     def boom(*args: Any, **kwargs: Any) -> None:
@@ -170,36 +142,36 @@ def test_a_failure_mid_write_keeps_the_old_version(
 
 
 def test_a_kb_refuses_another_embedding_model(store: PgStore) -> None:
-    _engine(store, FakeEmbedder(dim=8)).upsert_text("kb", "d1", "t", DOC_V1)
-    other = _engine(store, FakeEmbedder(dim=8, model="another-model"))
+    make_engine(store, FakeEmbedder(dim=8)).upsert_text("kb", "d1", "t", DOC_V1)
+    other = make_engine(store, FakeEmbedder(dim=8, model="another-model"))
     with pytest.raises(ConfigError, match="embedding_model: built with 'fake-embedder'"):
         other.upsert_text("kb", "d2", "t", "x")
 
 
 def test_a_kb_refuses_another_chunker(store: PgStore) -> None:
-    _engine(store).upsert_text("kb", "d1", "t", DOC_V1)
+    make_engine(store).upsert_text("kb", "d1", "t", DOC_V1)
     with pytest.raises(ConfigError, match="chunker: built with"):
-        _engine(store, size=80).upsert_text("kb", "d2", "t", "x")
+        make_engine(store, size=80).upsert_text("kb", "d2", "t", "x")
 
 
 def test_a_kb_refuses_another_document_prefix(store: PgStore) -> None:
-    _engine(store, FakeEmbedder(dim=8)).upsert_text("kb", "d1", "t", DOC_V1)
+    make_engine(store, FakeEmbedder(dim=8)).upsert_text("kb", "d1", "t", DOC_V1)
     prefixed = FakeEmbedder(dim=8, prefixes=Prefixes(document="passage: "))
     with pytest.raises(ConfigError, match="document_prefix: built with ''"):
-        _engine(store, prefixed).upsert_text("kb", "d2", "t", "x")
+        make_engine(store, prefixed).upsert_text("kb", "d2", "t", "x")
 
 
 def test_kbs_with_different_dimensions_live_side_by_side(
     store: PgStore, pg: psycopg.Connection
 ) -> None:
-    _engine(store, FakeEmbedder(dim=8)).upsert_text("small", "d", "t", DOC_V1)
-    _engine(store, FakeEmbedder(dim=16)).upsert_text("large", "d", "t", DOC_V1)
+    make_engine(store, FakeEmbedder(dim=8)).upsert_text("small", "d", "t", DOC_V1)
+    make_engine(store, FakeEmbedder(dim=16)).upsert_text("large", "d", "t", DOC_V1)
     assert _count(pg, "embeddings_8", KbRef(NS, "small")) == 2
     assert _count(pg, "embeddings_16", KbRef(NS, "large")) == 2
 
 
 def test_delete_kb_removes_everything(store: PgStore, pg: psycopg.Connection) -> None:
-    engine = _engine(store)
+    engine = make_engine(store)
     engine.upsert_text("kb", "d1", "Policy", DOC_V1)
     assert engine.delete_kb("kb") is True
     assert _count(pg, "kbs", column="name") == 0
@@ -212,7 +184,7 @@ def test_ingest_a_markdown_file_by_path(
 ) -> None:
     f = tmp_path / "policy.md"
     f.write_text("# Refund policy\n\nRefunds take seven days.\n", encoding="utf-8")
-    engine = _engine(store)
+    engine = make_engine(store)
 
     first = engine.ingest("kb", f)
     second = engine.ingest("kb", f)
@@ -223,8 +195,8 @@ def test_ingest_a_markdown_file_by_path(
 
 
 def test_namespaces_never_see_each_other(store: PgStore) -> None:
-    a = _engine(store, namespace="proj/a")
-    b = _engine(store, namespace="proj/b")
+    a = make_engine(store, namespace="proj/a")
+    b = make_engine(store, namespace="proj/b")
     a.upsert_text("kb", "d1", "t", DOC_V1)
 
     assert b.stats("kb") is None  # same kb name, other namespace: nothing there
@@ -236,28 +208,28 @@ def test_namespaces_never_see_each_other(store: PgStore) -> None:
 @pytest.mark.parametrize("bad", ["", "Proj", "a b", "../x", "a:b", "a/b/c/d/e"])
 def test_an_invalid_namespace_is_refused(store: PgStore, bad: str) -> None:
     with pytest.raises(ConfigError, match="namespace"):
-        _engine(store, namespace=bad)
+        make_engine(store, namespace=bad)
 
 
 def test_a_kb_name_cannot_smuggle_a_namespace(store: PgStore) -> None:
     with pytest.raises(ConfigError, match="invalid knowledge base name"):
-        _engine(store).upsert_text("other:kb", "d", "t", "x")
+        make_engine(store).upsert_text("other:kb", "d", "t", "x")
 
 
 def test_cached_vectors_are_reused_across_kbs_and_namespaces(store: PgStore) -> None:
     first, second = FakeEmbedder(dim=8), FakeEmbedder(dim=8)
-    _engine(store, first).upsert_text("kb", "d1", "Policy", DOC_V1)
+    make_engine(store, first).upsert_text("kb", "d1", "Policy", DOC_V1)
 
-    _engine(store, second, namespace="another").upsert_text("copy", "d1", "Policy", DOC_V1)
+    make_engine(store, second, namespace="another").upsert_text("copy", "d1", "Policy", DOC_V1)
 
     assert first.calls and second.calls == []  # same model, same inputs: nothing re-embedded
 
 
 def test_the_cache_is_per_model_and_never_mixes_queries_with_documents(store: PgStore) -> None:
     e = FakeEmbedder(dim=8)
-    _engine(store, e).upsert_text("kb", "d1", "Policy", "Refunds take seven days.")
+    make_engine(store, e).upsert_text("kb", "d1", "Policy", "Refunds take seven days.")
     other_model = FakeEmbedder(dim=8, model="other-model")
-    _engine(store, other_model).upsert_text("kb2", "d1", "Policy", "Refunds take seven days.")
+    make_engine(store, other_model).upsert_text("kb2", "d1", "Policy", "Refunds take seven days.")
     assert other_model.calls == [["Refunds take seven days."]]  # another model: a miss
 
     cached = CachingEmbedder(e, store)
@@ -268,13 +240,13 @@ def test_the_cache_is_per_model_and_never_mixes_queries_with_documents(store: Pg
 
 def test_disabling_the_cache_embeds_every_time(store: PgStore) -> None:
     e1, e2 = FakeEmbedder(dim=8), FakeEmbedder(dim=8)
-    _engine(store, e1, namespace="n1", cache=False).upsert_text("kb", "d", "t", DOC_V1)
-    _engine(store, e2, namespace="n2", cache=False).upsert_text("kb", "d", "t", DOC_V1)
+    make_engine(store, e1, namespace="n1", cache=False).upsert_text("kb", "d", "t", DOC_V1)
+    make_engine(store, e2, namespace="n2", cache=False).upsert_text("kb", "d", "t", DOC_V1)
     assert e1.calls and e2.calls
 
 
 def test_a_chars_kb_does_not_record_a_tokenizer(store: PgStore, pg: psycopg.Connection) -> None:
-    _engine(store).upsert_text("kb", "d1", "t", DOC_V1)
+    make_engine(store).upsert_text("kb", "d1", "t", DOC_V1)
     row = pg.execute(f"SELECT chunker FROM {TEST_SCHEMA}.kbs").fetchone()
     assert row is not None and row[0]["counter"] == "chars"
 
