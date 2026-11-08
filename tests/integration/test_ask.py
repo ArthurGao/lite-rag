@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 import pytest
@@ -33,14 +34,14 @@ def test_ask_answers_from_the_hits_and_maps_citations_to_chunks(store: PgStore) 
     assert answer.sources[0].doc_id == "refunds"
     assert (answer.model_id, answer.dropped) == ("fake/fake-llm", [])
     [messages] = llm.calls
-    assert (
-        '<source id="1" from="Refunds">\nRefunds are processed within seven days'
-        in messages[1].content
+    assert re.search(
+        r'<source-[0-9a-f]{12} id="1" from="Refunds">\nRefunds are processed within seven days',
+        messages[1].content,
     )
     assert (
         len(answer.sources) == 3
-        and '<source id="3"' in messages[1].content
-        and '<source id="4"' not in messages[1].content
+        and ' id="3" from=' in messages[1].content
+        and ' id="4" from=' not in messages[1].content
     )
 
 
@@ -85,7 +86,7 @@ def test_the_prompt_carries_every_source_and_the_question(store: PgStore) -> Non
     llm = FakeLLM("ok")
     _engine(store, llm=llm).ask("kb", "warranty?", top_k=4)
     user = llm.calls[0][1].content
-    assert all(f'<source id="{i}"' in user for i in range(1, 5))
+    assert all(f' id="{i}" from=' in user for i in range(1, 5))
     assert user.rstrip().endswith("Question: warranty?")
 
 

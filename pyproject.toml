@@ -63,6 +63,8 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 # Opt-in, deselected by default: `-m ollama` (the real Ollama server on the host).
 addopts = "-m 'not ollama and not model'"
+# jieba 0.42.1 (unmaintained upstream) has invalid escapes in its own regexes; nothing else.
+filterwarnings = ["ignore::SyntaxWarning:jieba.*"]
 markers = [
     "ollama: talks to the real Ollama server (opt-in: uv run pytest -m ollama)",
     "model: runs a real local model downloaded from Hugging Face, e.g. the reranker (opt-in: uv run --all-extras pytest -m model)",

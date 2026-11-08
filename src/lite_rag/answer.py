@@ -1,13 +1,15 @@
 """Answers with validated citations (design §6).
 
-The model sees the hits as <source id="1">..<source id="k"> blocks (document text cannot open or
-close a block of its own) and must cite them as [n]. Code then checks every citation:
+The model sees the hits as <source-NONCE id="1">..<source-NONCE id="k"> blocks — the nonce is new
+per prompt, so document text cannot open or close a block — and must cite them as [n]. Code then
+checks every citation:
 a number that was not given (the model invented a source) is removed from the text and reported in
 `dropped`, never passed on (KB rag-production-guide §4 rule 4). With no hits at all the model is
 not called: there is nothing to answer from (`status="no_sources"`).
 """
 
 import re
+import secrets
 from dataclasses import dataclass, field
 from functools import cache
 from typing import Literal
@@ -63,13 +65,12 @@ def _templates() -> Environment:
     return env
 
 
-_SOURCE_TAG = re.compile(r"<(/?)(source)", re.IGNORECASE)
-
-
-def _material(text: str) -> str:
-    """Document text inside a <source> block: it may not open or close a source block of its
-    own (a document could otherwise forge a source, or step outside its block)."""
-    return _SOURCE_TAG.sub(r"&lt;\1\2", text)
+def _material(text: str, tag: str) -> str:
+    """Document text inside a source block. The block's tag carries a random nonce chosen per
+    prompt, so a document cannot know it, let alone open or close a block with it; `<source`
+    and the tag itself are escaped as well, as a second line of defence."""
+    escaped = re.sub(r"<(/?)(source)", r"&lt;\1\2", text, flags=re.IGNORECASE)
+    return escaped.replace(f"<{tag}", f"&lt;{tag}").replace(f"</{tag}", f"&lt;/{tag}")
 
 
 def _attribute(text: str) -> str:
@@ -79,10 +80,10 @@ def _attribute(text: str) -> str:
 
 def prompt(question: str, hits: list[Hit]) -> list[Message]:
     env = _templates()
-    return [
-        Message("system", env.get_template("answer_system.j2").render().strip()),
-        Message("user", env.get_template("answer_user.j2").render(question=question, hits=hits)),
-    ]
+    tag = f"source-{secrets.token_hex(6)}"  # new per prompt: document text cannot predict it
+    system = env.get_template("answer_system.j2").render(tag=tag).strip()
+    user = env.get_template("answer_user.j2").render(question=question, hits=hits, tag=tag)
+    return [Message("system", system), Message("user", user)]
 
 
 def check_citations(text: str, hits: list[Hit]) -> tuple[str, list[Citation], list[int]]:

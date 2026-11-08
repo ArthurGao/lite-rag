@@ -72,7 +72,8 @@ def test_cli_migrate_reports_then_is_up_to_date(pg: psycopg.Connection, pg_url: 
     assert first.exit_code == 0, first.output
     assert "applied 0001_initial" in first.output
     password = conninfo_to_dict(pg_url).get("password")
-    assert not password or password not in first.output  # the password is never printed
+    if password:  # the value may equal the user name (CI: postgres/postgres): check the field
+        assert f"password={password}" not in first.output and "password=***" in first.output
     second = runner.invoke(app, ["migrate"], env=env)
     assert second.exit_code == 0 and "up to date" in second.output
 
