@@ -1,18 +1,259 @@
 # lite-rag
 
-A small, fully local RAG engine built for learning — every step is plain code you can read and swap:
+A small, fully local RAG engine built for learning: every step is plain code you can read, swap and
+measure.
 
-- **Chunking**, configurable per knowledge base: fixed, recursive, sentence, paragraph, Markdown, semantic,
-  parent-child, plus optional LLM-written chunk context (contextual retrieval)
-- **Embedding**: local (Ollama, fastembed, sentence-transformers) or API (OpenAI-compatible, Voyage, Cohere, Gemini),
-  one model per knowledge base, chosen by measuring on your own data
-- **Storage**: PostgreSQL + pgvector (one transaction per document), or Chroma + SQLite for a dependency-free setup
-- **Retrieval**: vector search + an own BM25 (jieba), fused with RRF; optional cross-encoder rerank
-- **Generation**: answers with validated citations, through a switchable LLM — Ollama, any OpenAI-compatible
-  endpoint, or Anthropic
-- **Evaluation**: `literag eval` compares configurations side by side (hit@k, MRR, latency)
+- **Chunking**: configurable per knowledge base: `fixed`, `recursive` (default), `sentence`,
+  `paragraph`, `markdown`, `semantic` (own, or chonkie), `parent_child`, plus an optional
+  LLM-written context per chunk (`contextual`). Lengths are counted with the embedding model's own
+  tokenizer, and `size` is a hard limit.
+- **Embedding**: local (Ollama, fastembed, sentence-transformers) or API (any OpenAI-compatible
+  endpoint, Voyage, Cohere, Gemini). Each knowledge base is bound to one model; model-specific
+  query and document prefixes are applied for you.
+- **Storage**: PostgreSQL + pgvector (vectors, BM25 postings and the document registry written in
+  one transaction), or Chroma + SQLite when you don't want a database server.
+- **Retrieval**: vector search plus an own BM25 (jieba for Chinese), fused with RRF; an optional
+  cross-encoder rerank. Every hit carries each stage's score and rank.
+- **Generation**: answers with validated citations through a switchable LLM (Ollama, any
+  OpenAI-compatible endpoint, or Anthropic). No fallback chain; every answer records
+  `provider/model`.
+- **Evaluation**: `literag eval` compares configurations side by side (hit@1, hit@5, MRR@10,
+  latency) on a bundled Chinese and English corpus, or your own.
 
-Use it as a Python library or run it as a service (`literag serve`, Docker image, HTTP API). The default stack
-(Ollama + PostgreSQL/pgvector + jieba + bge models) runs locally and costs nothing.
+Use it as a Python library or as a service (`literag serve`, Docker image, HTTP API with API keys).
+The default stack (Ollama `bge-m3` + `qwen3:8b`, PostgreSQL/pgvector, jieba) runs locally and costs
+nothing. [llm-steward](https://github.com/ArthurGao/llm-steward) uses it as its knowledge-base
+engine.
 
-Status: design stage. See [docs/lite-rag-design.md](docs/lite-rag-design.md).
+Status: v0.1, stages S0–S8 of the [design](docs/lite-rag-design.md) are done; S9 (llm-steward
+integration) is in progress.
+
+## How it works
+
+```
+ingest:  file / text → loader → chunker → chunks → embedder ─┐
+                                             └→ tokenize (jieba) ┴→ store (one transaction: registry + vectors + postings)
+search:  query → embedder → vector top-n ┐
+         query → tokenize → BM25 top-n   ┴→ RRF → [rerank] → top-k hits
+ask:     hits → prompt (prompts/*.j2) → LLM → answer (status, text, citations, provenance)
+```
+
+A few rules the engine enforces:
+
+- **Namespaces are mandatory.** An engine is bound to one namespace (`project` or
+  `project/tenant`), and every kb is stored as `<namespace>:<kb>`. No API takes a raw key.
+- **An index is bound to its model.** A kb records its embedding provider, model, dimension,
+  prefixes and chunker; opening it with a different config raises. To switch, build a new kb
+  (`literag reindex <kb> --into <new>`).
+- **Stable ids and idempotent writes.** Chunk id = `{doc_id}#{n}`; re-upserting a document replaces
+  its chunks in both indexes, and an unchanged document is a no-op.
+- **No silent fallbacks.** A failed model call raises; citations outside the retrieved sources are
+  removed and reported.
+
+## Quick start
+
+Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), [Ollama](https://ollama.com) on the
+host, and PostgreSQL with pgvector ≥ 0.8 (or use the Chroma backend, below).
+
+```bash
+ollama pull bge-m3 && ollama pull qwen3:8b
+uv sync
+cp .env.example .env              # set LITERAG_DATABASE_URL
+uv run literag migrate            # create the schema (lite_rag by default)
+
+export LITERAG_NAMESPACE=demo
+uv run literag ingest docs eval/corpus
+uv run literag search docs "How long should coffee steep in a French press?"
+uv run literag ask docs "垃圾分类有哪几类？"
+```
+
+No PostgreSQL? Use the embedded backend:
+
+```bash
+uv sync --extra chroma
+export LITERAG_STORE__BACKEND=chroma LITERAG_STORE__DATA_DIR=./lite_rag_data
+uv run literag migrate
+```
+
+For a faster `qwen3` on Ollama, turn off its thinking: `LITERAG_LLM__REASONING_EFFORT=none`.
+
+## CLI
+
+Every command takes `-c/--config <file.yaml>` and `-n/--namespace` (or `LITERAG_NAMESPACE`).
+
+| Command | What it does |
+| --- | --- |
+| `literag migrate` | Create or upgrade the store (PG schema or the Chroma data directory) |
+| `literag config` | Show the effective settings (secrets masked) |
+| `literag ingest <kb> <paths…>` | Load, chunk, embed and index files or directories (`.md`, `.txt`, `.pdf`, `.docx`); unchanged files are skipped |
+| `literag search <kb> "<q>" [-k 5] [-m vector\|bm25\|hybrid] [--rerank] [--json]` | Hits with each stage's score and rank |
+| `literag ask <kb> "<q>" [--json]` | Answer with citations, model and token usage |
+| `literag stats <kb>` | Size of a kb and how it was built |
+| `literag delete <kb> <doc_id>` · `literag drop-kb <kb> --yes` | Remove a document or a whole kb |
+| `literag reindex <kb> --into <new-kb>` | Rebuild under the current settings (another model or chunker) from the stored text |
+| `literag eval -c a.yaml -c b.yaml` | Compare configurations on a corpus and golden questions |
+| `literag key create --name <who> --namespace '<glob>' [--kb '<glob>'] --mode read\|write` | Create an API key for the service |
+| `literag serve [--host] [--port]` | Run the HTTP API (extra `server`) |
+
+## Library
+
+```python
+from lite_rag.config import load_settings
+from lite_rag.engine import RagEngine, RagRuntime
+
+settings = load_settings("rag.yaml")          # or load_settings() for environment only
+
+engine = RagEngine.from_settings(settings, namespace="myproject/tenant_42")
+engine.upsert_text("handbook", "leave-policy", "Leave policy", text, metadata={"team": "hr"})
+hits = engine.search("handbook", "how many days of annual leave?", top_k=5,
+                     mode="hybrid", rerank=False, where={"team": "hr"})
+answer = engine.ask("handbook", "How many days of annual leave do I get?")
+print(answer.text, [c.chunk_id for c in answer.citations], answer.model_id)
+engine.close()
+
+# Several namespaces in one process (what the HTTP service does): build the runtime once,
+# take a light per-namespace engine per request.
+runtime = RagRuntime.from_settings(settings)
+engine = runtime.engine("myproject/tenant_7")
+```
+
+`where` filters are equality on scalar metadata values (str, int, float, bool). Errors are typed
+(`lite_rag.errors`): `KbNotFound`, `DocumentNotFound`, `KbMismatch`, `InvalidRequest`,
+`ConfigError`, `StoreError`. The package ships `py.typed`.
+
+Install from git: `pip install "lite-rag[server] @ git+https://github.com/ArthurGao/lite-rag"`.
+
+## HTTP service
+
+```bash
+uv run literag key create --name me --namespace 'demo/*' --mode write   # prints the key once
+export LITERAG_SERVER__KEYS='[ ...the JSON line it printed... ]'
+uv run --extra server literag serve                                     # 127.0.0.1:8700
+```
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` (`?deep=true`) | Store and embedding service reachable; no auth |
+| `GET /v1/kbs` · `PUT/GET/DELETE /v1/kbs/{kb}` | List, create, stats, delete |
+| `PUT /v1/kbs/{kb}/documents/{doc_id}` | Upsert a text document (`title`, `text`, `metadata`) |
+| `POST /v1/kbs/{kb}/files` | Upload a file (multipart `file`, optional `doc_id`) |
+| `DELETE /v1/kbs/{kb}/documents/{doc_id}` | Delete a document |
+| `POST /v1/kbs/{kb}/search` | `{query, top_k, mode, rerank, where}` → hits |
+| `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer with citations |
+
+```bash
+curl -s http://127.0.0.1:8700/v1/kbs/docs/search \
+  -H "Authorization: Bearer $KEY" -H "X-LiteRag-Namespace: demo/app" \
+  -H 'content-type: application/json' -d '{"query": "french press", "top_k": 3}'
+```
+
+- **Auth**: `Authorization: Bearer lrk_…`. The server stores only each key's sha256; a key has
+  namespace and kb globs and a `read` or `write` mode. No route creates keys.
+- **Namespace** comes from the `X-LiteRag-Namespace` header. 401 without a valid key, 403 outside
+  the key's scope.
+- **Errors** are RFC 9457 Problem Details. Upstream and configuration error details are logged, not
+  returned.
+- **Without keys** the service is open, so it may only bind a loopback address and accepts only
+  local `Host` headers. Request bodies are size-limited (`server.max_body_mb`,
+  `server.max_upload_mb`).
+
+### Docker
+
+```bash
+uv run literag key create --name me --namespace 'demo/*' --mode write
+cp deploy/.env.example deploy/.env       # DB password and the key entry
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d --build
+```
+
+The compose file runs lite-rag and PostgreSQL (pgvector); Ollama stays on the host
+(`host.docker.internal`). The image includes the `server` and `pdf` extras and runs
+`literag migrate` on start.
+
+## Configuration
+
+Settings come from `LITERAG_*` environment variables (nested with `__`, e.g.
+`LITERAG_LLM__PROVIDER`), `.env`, or a YAML file passed with `-c`:
+
+```yaml
+store: {backend: postgres, schema: lite_rag}          # or {backend: chroma, data_dir: ./lite_rag_data}
+embedding: {provider: ollama, model: bge-m3}           # ollama | openai | voyage | cohere | gemini | fastembed | sentence_transformers
+chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50}
+retrieval: {mode: hybrid, top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60}
+rerank: {enabled: false, model: BAAI/bge-reranker-v2-m3-int8, top_n: 20}
+llm: {provider: ollama, model: qwen3:8b}               # ollama | openai | anthropic
+server: {host: 127.0.0.1, port: 8700}
+loader: {pdf: pypdf}                                   # or docling
+```
+
+Keep `LITERAG_DATABASE_URL` and API keys in the environment; a provider's key is read from
+`api_key_env` or its usual variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`,
+`CO_API_KEY`, `GEMINI_API_KEY`). See [.env.example](.env.example).
+
+### Extras
+
+| Extra | Adds |
+| --- | --- |
+| `server` | FastAPI service (`literag serve`) |
+| `chroma` | Chroma + SQLite store |
+| `fastembed` | In-process ONNX embedders and the cross-encoder reranker |
+| `sentence-transformers` | Any Hugging Face embedding model via PyTorch |
+| `anthropic` | Anthropic LLM |
+| `pdf` | PDF text extraction with pypdf |
+| `docling` | PDF / DOCX to Markdown with docling (large: pulls in torch) |
+| `chonkie` | chonkie's semantic chunker, for comparison |
+
+## Evaluation
+
+Retrieval changes are measured, not guessed. `eval/` holds 8 documents (Chinese and English) with
+32 golden questions, and a small PDF corpus. Golden answers are marked by evidence text, not chunk
+ids, so the same questions compare different chunkers.
+
+```bash
+uv run --all-extras literag eval -c eval/configs/chunk-markdown.yaml -c eval/configs/mode-vector.yaml
+```
+
+See [eval/configs/README.md](eval/configs/README.md) for the bundled configs. Results so far
+(bge-m3, 120-token chunks; details in design §13):
+
+| Config | hit@1 | hit@5 | MRR@10 | p50 ms |
+| --- | --- | --- | --- | --- |
+| markdown + hybrid | 0.91 | 0.94 | 0.930 | 5 |
+| markdown + vector only | 0.97 | 1.00 | 0.979 | 3 |
+| markdown + BM25 only | 0.75 | 0.91 | 0.823 | 2 |
+| markdown + hybrid + rerank | 0.97 | 1.00 | 0.979 | 1061 |
+
+On this small corpus vector search alone matches hybrid + rerank; 32 questions are too few to
+separate close configurations, so the defaults are unchanged until the corpus grows.
+
+## Development
+
+```bash
+uv sync --all-extras
+uv run ruff check && uv run ruff format --check && uv run mypy
+uv run pytest                          # unit, contract and integration tests, fake models only
+uv run pytest -m ollama                # opt-in: real Ollama (bge-m3 and qwen3:8b pulled)
+uv run --all-extras pytest -m model    # opt-in: real Hugging Face models (the reranker)
+```
+
+Integration and contract tests need `LITERAG_TEST_DATABASE_URL`; they use (and drop) the schema
+`lite_rag_test` only. Tests never call a real model or paid API unless you opt in with a marker.
+
+```
+src/lite_rag/
+  engine.py              RagRuntime + per-namespace RagEngine
+  chunking.py            chunkers (contextual.py, chunking_chonkie.py)
+  embedding.py           embedders; model_profiles.py holds prefixes and tokenizers
+  keyword.py fusion.py   BM25 and RRF / weighted fusion
+  rerank.py llm.py answer.py prompts/*.j2
+  stores/                Store protocol, pg.py, chroma.py, factory.py
+  migrations/            PostgreSQL schema; migrations_sqlite/ for Chroma
+  server/                FastAPI app and API-key auth
+  eval.py cli.py config.py loaders.py testing.py (fakes)
+tests/   unit/  contract/ (same cases on both stores)  integration/
+eval/    corpus, golden questions, configs
+docs/lite-rag-design.md   the design (in Chinese); AGENTS.md for contributors and coding agents
+```
+
+## License
+
+Apache-2.0.
