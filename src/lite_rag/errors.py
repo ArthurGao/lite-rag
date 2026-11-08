@@ -4,7 +4,16 @@ Each class says what it means to an HTTP client (`status`) and whether its messa
 (`expose`): upstream failures can carry endpoints or provider messages, so they are logged, not
 returned (design §7)."""
 
+import re
 from typing import ClassVar
+
+_CREDENTIALS = re.compile(r"(?<=://)[^\s/@]+@|(?<=password=)\S+", re.IGNORECASE)
+
+
+def redact(text: str) -> str:
+    """`text` with credentials removed — a URL's user:password, a conninfo's password — for
+    logging an error whose message is not shown (the server, and in-process callers)."""
+    return _CREDENTIALS.sub(lambda m: "***@" if m.group().endswith("@") else "***", text)
 
 
 class LiteRagError(Exception):

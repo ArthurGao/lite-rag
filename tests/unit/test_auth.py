@@ -81,7 +81,7 @@ def test_a_valid_key_under_another_scheme_is_401() -> None:
 
 
 def test_logged_errors_have_their_credentials_removed() -> None:
-    from lite_rag.server.app import redact
+    from lite_rag.errors import redact
 
     msg = "connection to postgresql://lite_rag:s3cret@db:5432/x failed; password=hunter2 host=db"
     out = redact(msg)

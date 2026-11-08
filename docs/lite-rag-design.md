@@ -328,6 +328,10 @@ lite-rag/
   - **Codex review（2026-11-08）**，5 条都成立并已修复，各有先红后绿的回归测试：上传大小上限原先在路由里才检查，而 FastAPI 在路由运行前已经把整个 multipart 请求读完并落盘，现在由 ASGI 中间件在解析前按 `Content-Length` 拒绝、没有长度时边收边数，返回 413（上限另加 8 KiB 给 multipart 边界）；reindex 先查"目标不存在"再写入，中间被别人建了同名 kb 就会写进去、失败时还会删掉它，现在用一条 `INSERT … ON CONFLICT DO NOTHING` 原子地创建目标，没建成就拒绝；上传报错原样带出客户端的文件名，文件类型不支持时甚至带出服务器上的临时路径，现在一律是固定措辞；不返回给客户端的上游错误写日志前去掉 URL 里的凭据和 `password=`；CI 冒烟测试在服务一直没就绪时也会继续往下跑，现在超时即失败，并检查容器仍在运行。Codex 未发现能越过 namespace 或 kb 授权的路径。
   - **提交后安全审查（2026-11-09）**，3 条都成立，单独修复：不配 key 的开放模式只靠绑定回环地址，但浏览器里的网页可以用 DNS rebinding 以自己的域名访问回环地址，现在开放模式只接受 `localhost`、`127.0.0.1`、`[::1]` 这几个 Host（Starlette `TrustedHostMiddleware`）；请求体上限原来只管上传，JSON 请求体没有上限，而 FastAPI 在鉴权之前就会读完请求体，现在所有请求都有上限（`server.max_body_mb`，默认 10，上传仍用 `max_upload_mb`），超过返回 413；`GET /v1/kbs` 原来列出 namespace 下全部 kb，会把 key 的 `kbs` 范围之外的名字也告诉调用方，现在只列 key 能访问的。
   - 端到端（`deploy/compose.yaml`，宿主机 Ollama）发现镜像里没有 `pdf` extra，上传 PDF 会失败；镜像现在带 `server` 和 `pdf`（443 MB）。docling 会带进几 GB 的 torch，不放进镜像，要用就自己构建。
+- S9 实现说明（2026-11-09）：
+  - llm-steward 的 `LiteRagProvider`（`backend/src/llm_steward/providers/literag.py`）把 llm-steward 的 namespace 映射为 `steward/<namespace_id>`，collection 映射为 kb `c-<collection_id>`，条目映射为 `doc_id = entry_id` 的文档。默认走 HTTP（用户 2026-11-09 选定），进程内是可选的 extra，依赖 lite-rag 锁定到一个 git commit（用户选定）。
+  - lite-rag 这边的改动：加 `py.typed`，让 llm-steward 的 mypy strict 能检查对 lite-rag 的调用；`redact`（去掉错误信息里的凭据）从 `server/app.py` 移到 `errors.py`，llm-steward 进程内调用时写日志也要用它（llm-steward 的 Codex review 发现日志里可能有数据库密码）。
+  - 验收：llm-steward 的 KB 合约测试在进程内和 HTTP（真实 `create_app`，经 ASGI，开启 API key）两种方式下都通过，另有一条经 llm-steward 治理层的端到端测试；手动端到端用真实的 `literag serve`（Ollama `bge-m3`）和 `steward serve`：active 条目能检索到，废弃后检索不到并在约 2 秒内从 lite-rag 删除，停掉 lite-rag 后 llm-steward 的 `/health` 报 degraded。
 - S8 收尾（2026-11-09）：
   - 删掉两条只跑 PG、与合约测试重复的旧用例（`test_delete_kb_removes_everything`、`test_documents_are_read_page_by_page`），用户 2026-11-09 决定。
   - **用户决定的三处改动**：

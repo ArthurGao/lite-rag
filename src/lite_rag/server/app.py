@@ -26,18 +26,13 @@ from lite_rag.errors import (
     KbNotFound,
     LiteRagError,
     TooLarge,
+    redact,
 )
 from lite_rag.loaders import SUFFIXES
 from lite_rag.server.auth import Authorizer
 
 log = logging.getLogger("lite_rag.server")
-_CREDENTIALS = re.compile(r"(?<=://)[^\s/@]+@|(?<=password=)\S+", re.IGNORECASE)
 MULTIPART_OVERHEAD = 8 * 1024  # boundaries and part headers on top of the file itself
-
-
-def redact(text: str) -> str:
-    """`text` with credentials removed: a URL's user:password, a conninfo's password."""
-    return _CREDENTIALS.sub(lambda m: "***@" if m.group().endswith("@") else "***", text)
 
 
 class _BodyLimit:
