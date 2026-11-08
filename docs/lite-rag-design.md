@@ -108,14 +108,13 @@ engine.stats(kb)
 
 | 表 | 内容 |
 | --- | --- |
-| `kbs` | `name`（主键）、`embedding_model`、`dim`、`chunker`（JSON）、`created_at` |
+| `kbs` | `name`（主键）、`embedding_provider`、`embedding_model`、`dim`、`query_prefix`、`chunker`（JSON）、`n_chunks` 与 `total_length`（BM25 的 N 和 avgdl）、`created_at` |
 | `documents` | `kb`、`doc_id`、`title`、`source`、`content_hash`、`chunk_count`、`metadata` JSONB、`updated_at`；主键 `(kb, doc_id)` |
 | `chunks` | `id`（`"{doc_id}#{n}"`）、`kb`、`doc_id`、`n`、`text`、`length`（词数）、`metadata` JSONB |
 | `embeddings_<dim>` | `chunk_id`、`kb`、`embedding vector(<dim>)`，HNSW 索引（cosine）。每个维度一张表，首次使用时创建 |
 | `postings` | `kb`、`term`、`chunk_id`、`tf`；索引 `(kb, term)` |
-| `kb_stats` | `kb`、`n_chunks`、`total_length`（用来算 `avgdl`） |
 
-- **一个事务**：`upsert_document` 在同一个事务里删掉旧的 chunk、embedding 和 posting，写入新的，再更新 `documents` 和 `kb_stats`。没有中间状态，也不需要恢复逻辑。
+- **一个事务**：`upsert_document` 在同一个事务里删掉旧的 chunk、embedding 和 posting，写入新的，再更新 `documents` 和 `kbs` 里的统计。没有中间状态，也不需要恢复逻辑。
 - **BM25 查询**：先在 SQL 里按 `(kb, term)` 取出 posting，同时拿到 `n(t)`、`N`、`avgdl`，再按第 5 节的公式打分。打分既可以在 Python 里算（`keyword.py`，便于阅读），也可以整段在 SQL 里算（快）。两种算法的结果用同一组测试核对。
 - **向量查询**：`ORDER BY embedding <=> :q LIMIT n`，按 `kb` 过滤。
 
@@ -123,7 +122,7 @@ engine.stats(kb)
 
 - 数据目录 `LITERAG_DATA_DIR` 下有两部分：
   - `chroma/`：每个 kb 一个 collection；
-  - `lite_rag.sqlite`：和 PG 后端同结构的 `kbs`、`documents`、`chunks`、`postings`、`kb_stats` 表。
+  - `lite_rag.sqlite`：和 PG 后端同结构的 `kbs`、`documents`、`chunks`、`postings` 表。
 - **写入不在一个事务里**：向量在 Chroma，其余在 SQLite。所以写入顺序固定为"登记 pending → 写 SQLite → 写 Chroma → 标记 ready"。打开引擎时，未完成的文档先清理掉再重写。
 - 适合不想装 PG 的单机学习场景。合约测试对两个后端运行同一套用例。
 
@@ -200,7 +199,8 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 用 pydantic-settings 读取，环境变量前缀为 `LITERAG_`，也可以用 `--config file.yaml` 指定配置文件：
 
 ```yaml
-store: {backend: postgres, database_url_env: LITERAG_DATABASE_URL, schema: lite_rag}   # 或 {backend: chroma, data_dir: ./data}
+database_url: null        # 一般用环境变量 LITERAG_DATABASE_URL，不写进文件
+store: {backend: postgres, schema: lite_rag}   # 或 {backend: chroma, data_dir: ./data}（S7）
 embedding: {provider: ollama, model: bge-m3, base_url: http://127.0.0.1:11434, batch_size: 32, max_concurrency: 4, query_prefix: ""}
 chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50, contextual: {enabled: false}}
 retrieval: {mode: hybrid, top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60, bm25: {k1: 1.5, b: 0.75}}
@@ -265,4 +265,4 @@ lite-rag/
 - 各依赖的 license（Ollama、pgvector、Chroma、jieba、bge-m3、bge-reranker、qwen3）：锁定版本时逐个核对，写进 README。
 - rerank 的打包方式：fastembed 的 cross-encoder 还是 sentence-transformers。S4 开始前查文档确认。前者更轻，不需要 torch。
 - PDF 纯文本抽取用哪个库：S2 时确认。
-- PG 驱动用 psycopg 3 还是 asyncpg，库是否提供 async API：S1 时决定。倾向于 sync 核心加 psycopg 3，服务层用线程池；这一点需要先评估吞吐。
+- ~~PG 驱动与 async~~ → S1 已定（2026-11-08）：sync 核心 + psycopg 3（`psycopg[binary,pool]==3.3.8`、`pgvector==0.5.1`）；S6 的服务层在线程池里调用，并发上限可配置。

@@ -21,7 +21,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S0 — environment** (design §12). Next: S1 skeleton. llm-steward's P3 (WeKnora) is paused until S9 is done.
+**S1 — skeleton** (design §12; S0 done 2026-11-08: Ollama 0.40.15 with `bge-m3:567m` + `qwen3:8b`, PG database `lite_rag`). Next: S2 ingest. llm-steward's P3 (WeKnora) is paused until S9 is done.
 
 Decided (2026-11-08): separate public repo; library + optional HTTP service (`literag serve`, Docker image) over one
 `RagEngine`; storage is PostgreSQL + pgvector by default (vectors, own BM25 postings and the document registry in one

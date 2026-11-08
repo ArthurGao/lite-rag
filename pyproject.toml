@@ -1,0 +1,59 @@
+[project]
+name = "lite-rag"
+version = "0.1.0"
+description = "A small, fully local RAG engine for learning: own chunking, BM25 + vector hybrid, rerank, switchable LLM"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-settings[yaml]>=2.6",
+    "typer>=0.15",
+    "httpx2>=2.16",
+    "jinja2>=3.1",
+    "jieba>=0.42.1",
+    # The default store (design §4). Pinned exactly: an upgrade re-runs `-m ollama` and the eval.
+    "psycopg[binary,pool]==3.3.8",
+    "pgvector==0.5.1",
+]
+
+[project.scripts]
+literag = "lite_rag.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.10,<0.11"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "RUF"]
+# Full-width punctuation is intentional: Chinese text, prompts and sentence splitting.
+allowed-confusables = ["：", "（", "）", "！", "？", "，", "；"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["lite_rag"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["jieba", "pgvector", "pgvector.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Opt-in, deselected by default: `-m ollama` (the real Ollama server on the host).
+addopts = "-m 'not ollama'"
+markers = [
+    "ollama: talks to the real Ollama server (opt-in: uv run pytest -m ollama)",
+]
