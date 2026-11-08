@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, Any, Literal, NoReturn
 
 import typer
 
@@ -141,6 +141,65 @@ def delete(
     with _engine(config, namespace) as engine:
         found = engine.delete(kb, doc_id)
     typer.echo("deleted" if found else "not found")
+
+
+@app.command()
+def serve(
+    host: Annotated[str | None, typer.Option(help="Address to bind (default: server.host)")] = None,
+    port: Annotated[int | None, typer.Option(help="Port (default: server.port, 8700)")] = None,
+    config: ConfigOption = None,
+) -> None:
+    """Serve the HTTP API (design §7; extra `server`). Without API keys only a loopback address
+    may be bound: an open server must not be reachable from other machines."""
+    from lite_rag.server import check_bind, run
+
+    settings = _settings(config)
+    host = host or settings.server.host
+    with _errors():
+        check_bind(settings, host)  # before connecting to anything
+    # The engine's own namespace is never used: every request names one.
+    with _engine(config, settings.namespace or "server") as engine, _errors():
+        run(settings, engine, host, port or settings.server.port)
+
+
+key_app = typer.Typer(help="API keys for the HTTP service", no_args_is_help=True)
+app.add_typer(key_app, name="key")
+
+
+@key_app.command("create")
+def key_create(
+    name: Annotated[str, typer.Option(help="Who uses it, e.g. llm-steward")],
+    namespace: Annotated[
+        list[str], typer.Option("--namespace", help="Namespace glob it may use; repeatable")
+    ],
+    kb: Annotated[list[str] | None, typer.Option("--kb", help="kb glob; repeatable")] = None,
+    mode: Annotated[Literal["read", "write"], typer.Option(help="read or write")] = "read",
+) -> None:
+    """Print a new API key (shown once) and the entry to add to `server.keys`. Only its sha256
+    goes into the config; the key itself is not stored anywhere."""
+    from lite_rag.config import ApiKeyConfig
+    from lite_rag.server.auth import new_key
+
+    key, digest = new_key()
+    scope: dict[str, Any] = {"namespaces": namespace, "mode": mode} | ({"kbs": kb} if kb else {})
+    entry = ApiKeyConfig(name=name, sha256=digest, **scope)
+    typer.echo(f"key (shown once, give it to {name}): {key}")
+    typer.echo("add to server.keys (YAML) or LITERAG_SERVER__KEYS (a JSON list):")
+    typer.echo(json.dumps(entry.model_dump(), ensure_ascii=False))
+
+
+@app.command()
+def reindex(
+    kb: KbArg,
+    into: Annotated[str, typer.Option("--into", help="The new knowledge base to build")],
+    config: ConfigOption = None,
+    namespace: NamespaceOption = None,
+) -> None:
+    """Rebuild a knowledge base under the current settings (another model or chunker) into a new
+    one, from the documents' stored text. The old kb stays; switch clients to the new name."""
+    with _engine(config, namespace) as engine:
+        n = engine.reindex(kb, into)
+    typer.echo(f"{n} documents reindexed into {into}")
 
 
 @app.command("drop-kb")

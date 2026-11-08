@@ -1,0 +1,36 @@
+# Example: lite-rag + PostgreSQL with pgvector; Ollama runs on the host (design §7).
+#   cp deploy/.env.example deploy/.env    # then fill in the two values
+#   docker compose -f deploy/compose.yaml --env-file deploy/.env up -d --build
+name: lite-rag
+services:
+  db:
+    image: pgvector/pgvector:0.8.6-pg18
+    environment:
+      POSTGRES_USER: lite_rag
+      POSTGRES_PASSWORD: "${LITERAG_DB_PASSWORD:?set LITERAG_DB_PASSWORD in deploy/.env}"
+      POSTGRES_DB: lite_rag
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "lite_rag"]
+      interval: 5s
+      retries: 20
+
+  lite-rag:
+    build: ..
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      LITERAG_DATABASE_URL: postgresql://lite_rag:${LITERAG_DB_PASSWORD}@db:5432/lite_rag
+      LITERAG_SERVER__KEYS: "${LITERAG_SERVER__KEYS:?create one with literag key create}"
+      LITERAG_EMBEDDING__BASE_URL: http://host.docker.internal:11434
+      LITERAG_LLM__BASE_URL: http://host.docker.internal:11434/v1
+      LITERAG_LLM__REASONING_EFFORT: none
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:${LITERAG_PORT:-8700}:8700
+
+volumes:
+  pgdata:

@@ -30,6 +30,8 @@ Role = Literal["document", "query"]  # APIs with an input type get it per call
 class EmbeddingError(LiteRagError):
     """The embedding service failed after its retries."""
 
+    status = 502
+
 
 class Embedder(Protocol):
     """`prefixes` are what this embedder adds by itself; they are part of the index identity,

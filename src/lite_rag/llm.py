@@ -17,6 +17,8 @@ from lite_rag.types import model_id
 class LLMError(LiteRagError):
     """The model call failed."""
 
+    status = 502
+
 
 @dataclass(frozen=True)
 class Message:

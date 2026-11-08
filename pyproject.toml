@@ -40,6 +40,11 @@ chonkie = [
 sentence-transformers = [
     "sentence-transformers==6.2.0",
 ]
+server = [
+    "fastapi==0.162.2",
+    "python-multipart==0.0.33",
+    "uvicorn==0.54.0",
+]
 
 [dependency-groups]
 dev = [
@@ -49,6 +54,10 @@ dev = [
     "types-pyyaml>=6.0",
     "pypdf==7.0.0",
     "chonkie==1.7.0",
+    "fastapi==0.162.2",
+    "python-multipart==0.0.33",
+    "uvicorn==0.54.0",
+    "httpx==0.28.1",
 ]
 
 [build-system]

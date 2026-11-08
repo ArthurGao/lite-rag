@@ -22,6 +22,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         "0002_namespace_prefixes",
         "0003_postings_length_doc",
         "0004_pages_parents_context",
+        "0005_documents_text",
     ]
     assert _tables(pg) == TABLES
     assert migrate(pg, TEST_SCHEMA) == []  # second run: nothing pending
@@ -33,6 +34,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         ("0002_namespace_prefixes",),
         ("0003_postings_length_doc",),
         ("0004_pages_parents_context",),
+        ("0005_documents_text",),
     ]
 
 

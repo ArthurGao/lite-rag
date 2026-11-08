@@ -32,9 +32,14 @@ class Loaded:
     pages: tuple[int, ...] = ()  # where each page starts in `text`; empty: no pages
 
 
+def doc_id_for(source: str) -> str:
+    """A stable document id for a source (a path, an upload's file name): the same source
+    replaces the same document."""
+    return "file:" + hashlib.sha256(source.encode()).hexdigest()[:16]
+
+
 def file_doc_id(path: Path) -> str:
-    """A stable id for a file: re-ingesting the same path replaces the same document."""
-    return "file:" + hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
+    return doc_id_for(str(path.resolve()))
 
 
 def join_pages(pages: list[str]) -> tuple[str, tuple[int, ...]]:
@@ -47,10 +52,11 @@ def join_pages(pages: list[str]) -> tuple[str, tuple[int, ...]]:
     return PAGE_SEPARATOR.join(parts), tuple(starts)
 
 
-def load_file(path: Path, pdf: PdfLoader = "pypdf") -> Loaded:
+def load_file(path: Path, pdf: PdfLoader = "pypdf", name: str | None = None) -> Loaded:
     """The text of a supported file. The title is the PDF's own title, else the first heading
-    (`# ` in Markdown, any level from docling), else the file name. `.docx` always goes through
-    docling (pypdf reads PDFs only)."""
+    (`# ` in Markdown, any level from docling), else the file name — `name`'s, when the file
+    sits at a temporary path (an upload). `.docx` always goes through docling."""
+    stem = Path(name).stem if name else path.stem
     suffix = path.suffix.lower()
     if suffix not in SUFFIXES:
         raise ConfigError(
@@ -59,14 +65,14 @@ def load_file(path: Path, pdf: PdfLoader = "pypdf") -> Loaded:
     if suffix in TEXT_SUFFIXES:
         text = path.read_text(encoding="utf-8")
         title = _title(text, max_level=1) if suffix != ".txt" else None
-        return Loaded(title or path.stem, text)
+        return Loaded(title or stem, text)
     if suffix == ".pdf" and pdf == "pypdf":
         title, pages = _pypdf_pages(path)
     else:
         pages = docling_markdown(path).split(_PAGE_BREAK)
         title = None
     text, starts = join_pages(pages)
-    return Loaded(title or _title(text, max_level=6) or path.stem, text, starts)
+    return Loaded(title or _title(text, max_level=6) or stem, text, starts)
 
 
 def _title(markdown: str, max_level: int) -> str | None:

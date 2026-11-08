@@ -30,6 +30,7 @@ from lite_rag.stores.base import (
     KbRef,
     KbStats,
     StoredChunk,
+    StoredDocument,
     StoredParent,
 )
 from lite_rag.types import Chunk, Document
@@ -170,30 +171,38 @@ class PgStore:
     # --- knowledge bases ---------------------------------------------------------------------
 
     def get_or_create_kb(self, info: KbInfo) -> KbInfo:
-        ref = info.ref
         with self._tx() as conn:
-            created = conn.execute(
-                "INSERT INTO kbs (name, namespace, kb, embedding_provider, embedding_model, dim,"
-                " query_prefix, document_prefix, chunker)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (name) DO NOTHING",
-                (
-                    ref.key,
-                    ref.namespace,
-                    ref.name,
-                    info.embedding_provider,
-                    info.embedding_model,
-                    info.dim,
-                    info.query_prefix,
-                    info.document_prefix,
-                    Jsonb(info.chunker),
-                ),
-            ).rowcount
-            if created:
-                self._ensure_vector_table(conn, info.dim)
+            if self._insert_kb(conn, info):
                 return info
-            stored = self._get_kb(conn, ref)
+            stored = self._get_kb(conn, info.ref)
         assert stored is not None  # ON CONFLICT: it exists
         return stored
+
+    def create_kb(self, info: KbInfo) -> bool:
+        with self._tx() as conn:
+            return self._insert_kb(conn, info)
+
+    def _insert_kb(self, conn: psycopg.Connection, info: KbInfo) -> bool:
+        ref = info.ref
+        created = conn.execute(
+            "INSERT INTO kbs (name, namespace, kb, embedding_provider, embedding_model, dim,"
+            " query_prefix, document_prefix, chunker)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (name) DO NOTHING",
+            (
+                ref.key,
+                ref.namespace,
+                ref.name,
+                info.embedding_provider,
+                info.embedding_model,
+                info.dim,
+                info.query_prefix,
+                info.document_prefix,
+                Jsonb(info.chunker),
+            ),
+        ).rowcount
+        if created:
+            self._ensure_vector_table(conn, info.dim)
+        return bool(created)
 
     def get_kb(self, kb: KbRef) -> KbInfo | None:
         with self._tx() as conn:
@@ -211,6 +220,35 @@ class PgStore:
         with self._tx() as conn:
             # documents → chunks → postings and embeddings_<dim> all cascade from here
             return conn.execute("DELETE FROM kbs WHERE name = %s", (kb.key,)).rowcount > 0
+
+    def list_kbs(self, namespace: str) -> list[str]:
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT kb FROM kbs WHERE namespace = %s ORDER BY kb", (namespace,)
+            ).fetchall()
+        return [kb for (kb,) in rows]
+
+    def documents(self, kb: KbRef, page: int = 100) -> Iterator[StoredDocument]:
+        after = ""  # keyset paging: no connection is held between pages
+        while True:
+            with self._tx() as conn:
+                rows = conn.execute(
+                    "SELECT doc_id, title, text, metadata, source, pages FROM documents"
+                    " WHERE kb = %s AND doc_id > %s ORDER BY doc_id LIMIT %s",
+                    (kb.key, after, page),
+                ).fetchall()
+            for doc_id, title, text, metadata, source, pages in rows:
+                yield StoredDocument(doc_id, title, text, metadata, source, tuple(pages or ()))
+            if len(rows) < page:
+                return
+            after = rows[-1][0]
+
+    def count_missing_text(self, kb: KbRef) -> int:
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT count(*) FROM documents WHERE kb = %s AND text IS NULL", (kb.key,)
+            ).fetchone()
+        return int(row[0]) if row else 0
 
     def stats(self, kb: KbRef) -> KbStats | None:
         with self._tx() as conn:
@@ -317,7 +355,7 @@ class PgStore:
             _, removed, removed_length = self._remove(conn, kb, doc.doc_id)
             conn.execute(
                 "INSERT INTO documents (kb, doc_id, title, source, content_hash, chunk_count,"
-                " metadata) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                " metadata, text, pages) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     kb.key,
                     doc.doc_id,
@@ -326,6 +364,8 @@ class PgStore:
                     content_hash,
                     len(chunks),
                     Jsonb(doc.metadata),
+                    doc.text,
+                    Jsonb(list(doc.pages)) if doc.pages else None,
                 ),
             )
             self._copy_parents(conn, kb, parents or [])  # first: chunks reference them

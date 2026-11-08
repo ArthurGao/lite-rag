@@ -3,6 +3,7 @@ interface, so a backend that can (PostgreSQL) writes a whole document in one tra
 separate vector cache, which a backend may or may not offer."""
 
 import dataclasses
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -76,6 +77,19 @@ class StoredChunk:
 
 
 @dataclass(frozen=True)
+class StoredDocument:
+    """A document as it was upserted. `text` is None for documents stored before lite-rag kept
+    the original text (migration 0005)."""
+
+    doc_id: str
+    title: str
+    text: str | None
+    metadata: dict[str, Any]
+    source: str | None
+    pages: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class KbStats:
     namespace: str
     kb: str
@@ -89,6 +103,10 @@ class KbStats:
 class Store(Protocol):
     def get_or_create_kb(self, info: KbInfo) -> KbInfo:
         """The kb as stored — created from `info` if it did not exist. The caller compares."""
+        ...
+
+    def create_kb(self, info: KbInfo) -> bool:
+        """Create the kb only if it does not exist, atomically; False: it already did."""
         ...
 
     def get_kb(self, kb: KbRef) -> KbInfo | None:
@@ -112,6 +130,18 @@ class Store(Protocol):
     def delete_document(self, kb: KbRef, doc_id: str) -> bool: ...
 
     def delete_kb(self, kb: KbRef) -> bool: ...
+
+    def list_kbs(self, namespace: str) -> list[str]:
+        """The names of the namespace's kbs, sorted."""
+        ...
+
+    def documents(self, kb: KbRef) -> Iterator[StoredDocument]:
+        """Every document of `kb`, in doc_id order, read a page at a time."""
+        ...
+
+    def count_missing_text(self, kb: KbRef) -> int:
+        """Documents stored without their text (before migration 0005)."""
+        ...
 
     def stats(self, kb: KbRef) -> KbStats | None: ...
 

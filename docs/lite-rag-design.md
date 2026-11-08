@@ -211,9 +211,13 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 | `POST /v1/kbs/{kb}/search` | `{query, top_k, mode, rerank, where}` → hits（带各阶段分数） |
 | `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer（带引用和出处） |
 
-- **鉴权**：`Authorization: Bearer <key>`。服务端只保存 key 的 `sha256`，配置为 `LITERAG_API_KEYS`（逗号分隔的哈希值）。每个 key 可以限定只能访问某些 kb，以及只读或读写。不配 key 时，服务只允许监听 `127.0.0.1`。
-- **错误格式**：RFC 9457 Problem Details。
-- **部署**：仓库自带 `Dockerfile`，CI 构建镜像（`ghcr.io/arthurgao/lite-rag`），用环境变量指向 PG 和 Ollama。仓库附带的 `docker compose` 示例包含 lite-rag + PG（pgvector）；Ollama 默认跑在宿主机上。
+- **鉴权**（S6，KB web-authz：默认拒绝）：`Authorization: Bearer lrk_<prefix>_<secret>`。服务端只保存 key 的 `sha256`，配置在 `server.keys`（YAML，或 `LITERAG_SERVER__KEYS` 设为 JSON 列表）。每个 key 有 `namespaces`、`kbs` 两组 glob（`*` 可以跨 `/`，例如 `steward/*`）和 `mode`（`read` / `write`）；没有默认 namespace，不写就没有访问权限。`literag key create` 生成新 key，只打印一次，同时给出要加进配置的那一条；**没有任何 HTTP 路由能创建 key**。不配 key 时服务完全开放，所以 `serve` 只允许绑定回环地址。
+- **namespace**：每个请求用 `X-LiteRag-Namespace` 头指定（namespace 本身含 `/`，放进路径不干净）。缺这个头返回 400；key 不覆盖这个 namespace 或这个 kb 返回 403，只读 key 写入也是 403；没有 key 或 key 不认识返回 401，带 `WWW-Authenticate: Bearer`。服务端为每个 namespace 建一个引擎副本，共用 store、embedder、chunker 和模型（`RagEngine.for_namespace`）。
+- **有意不加鉴权的路径**只有 `GET /health`（`?deep=true` 时还会 embed 一条缓存过的探测查询）。
+- **错误格式**：RFC 9457 Problem Details（`application/problem+json`）：`KbNotFound` 404、kb 配置不一致（`KbMismatch`）409、其他 `ConfigError` 400、请求校验失败 422、embedding / LLM 失败 502、存储失败 503。上游失败的细节只写日志，不返回给客户端（里面可能有地址或供应商的报错原文）。
+- **并发**：处理函数都是同步的，FastAPI 放进线程池执行，线程数由 `server.max_workers`（默认 8）限制；启用 rerank 时启动阶段先加载模型。
+- **上传**：`POST /v1/kbs/{kb}/files`（multipart，`file` 加可选的 `doc_id`；默认 `file:<sha256(文件名)>`，同名文件再传就是替换），大小上限 `server.max_upload_mb`（默认 20）。
+- **部署**：仓库自带 `Dockerfile`（python:3.12-slim、非 root、`HEALTHCHECK`；启动时先 `literag migrate`），用环境变量指向 PG 和 Ollama。CI 每次构建镜像并做冒烟测试（/health、401、403、200），**不推送**到任何 registry（2026-11-08 决定）。`deploy/compose.yaml` 示例包含 lite-rag + PG（pgvector）；Ollama 跑在宿主机上（`host.docker.internal`）。
 - **安装**：`pip install "lite-rag[server] @ git+https://github.com/ArthurGao/lite-rag"`。以后再发布到 PyPI。
 
 ## 8. 评测
@@ -306,6 +310,13 @@ lite-rag/
   - 切块按 embedding 模型自己的 tokenizer（Hugging Face `tokenizers`，不需要 torch）计数。tokenizer 跟着模型 profile 走：bge-m3 用 `BAAI/bge-m3`，nomic 用 `nomic-ai/nomic-embed-text-v1.5`，`org/name` 形式的模型名直接把自己当作 tokenizer；未知模型用估算。配置 `embedding.tokenizer` 可以覆盖，设为 `""` 表示用估算。fastembed 也走同一张前缀表（用它的普通 `embed`），所以 kb 上记录的前缀就是实际使用的前缀。
   - `markdown` 策略把标题路径拼在 chunk 前面，再做 embedding 和 BM25；`chunks.text` 保存原文切片，用于引用。
   - PDF 抽取推迟到 S5b，S2 只支持 txt 和 md。
+- S6 实现说明（2026-11-08）：
+  - 决定（用户 2026-11-08 选定）：namespace 放在请求头，key 按 glob 限定范围；documents 表存原文以支持 reindex；镜像只构建不推送；所有 kb 沿用服务自己的配置（按 kb 单独配置留到以后）。
+  - **reindex**：迁移 0005 给 `documents` 加 `text`、`pages`。`literag reindex <kb> --into <新 kb>` 用当前配置从原文重建到一个新名字，原 kb 不动，切换就是让客户端改用新名字（就地替换要给所有 kb 外键加 `ON UPDATE CASCADE`，暂不做）。目标已存在、或有文档没有原文（0005 之前写入）都直接拒绝，一条也不写；中途失败会删掉建了一半的目标。
+  - 不在 S6 做：按 kb 单独配置；就地 reindex；向量与 BM25 两路并行（检索现在约 4 ms）；发布镜像。
+  - **收尾 /simplify（2026-11-08）**，改了：错误类自己带 HTTP 状态和"能否把信息返回给客户端"（`status` / `expose`），服务端只剩一个处理函数，不再依赖按顺序排列的映射表；`KbNotFound.of()` 统一"kb 不存在"的措辞；上传走 `RagEngine.ingest(doc_id=, source=)`，文档 id 规则只在 `loaders.doc_id_for` 一处，上传边写临时文件边计数，超过上限立即停；检索参数只定义一次；鉴权依赖改为 async、只返回引擎，每个请求现建一个 namespace 副本（浅拷贝，代价与查字典相当），不再有调用方能撑大的缓存；"没有 key 只能绑回环地址"由 `server.check_bind` 负责（`run()` 和 CLI 都经过它）；连接池大小与 `server.max_workers` 一致；reindex 先用一条 SQL 数缺原文的文档，再按 `doc_id` 分页读取，不把整个 kb 的原文读进内存。没改的：把引擎拆成"不绑 namespace 的运行时 + 按 namespace 的视图"（改动超出本阶段；`for_namespace` 的注释写明新增按 namespace 的状态时必须同样重置）；`create_kb` 多查一次 kb 行（低频操作）。
+  - **Codex review（2026-11-08）**，5 条都成立并已修复，各有先红后绿的回归测试：上传大小上限原先在路由里才检查，而 FastAPI 在路由运行前已经把整个 multipart 请求读完并落盘，现在由 ASGI 中间件在解析前按 `Content-Length` 拒绝、没有长度时边收边数，返回 413（上限另加 8 KiB 给 multipart 边界）；reindex 先查"目标不存在"再写入，中间被别人建了同名 kb 就会写进去、失败时还会删掉它，现在用一条 `INSERT … ON CONFLICT DO NOTHING` 原子地创建目标，没建成就拒绝；上传报错原样带出客户端的文件名，文件类型不支持时甚至带出服务器上的临时路径，现在一律是固定措辞；不返回给客户端的上游错误写日志前去掉 URL 里的凭据和 `password=`；CI 冒烟测试在服务一直没就绪时也会继续往下跑，现在超时即失败，并检查容器仍在运行。Codex 未发现能越过 namespace 或 kb 授权的路径。
+  - 端到端（`deploy/compose.yaml`，宿主机 Ollama）发现镜像里没有 `pdf` extra，上传 PDF 会失败；镜像现在带 `server` 和 `pdf`（443 MB）。docling 会带进几 GB 的 torch，不放进镜像，要用就自己构建。
 - S5c 实现说明（2026-11-08）：
   - 托管 embedder（voyage、cohere、gemini）直接走 HTTP，和 Ollama、OpenAI 兼容接口共用 `_HTTPEmbedder` 的分批、并发和重试；`_call(batch, role)` 把文档 / 查询的角色交给子类，按各家的参数名发出去。请求和响应的格式按 2026-11-08 的官方 API 参考核对，单测用 MockTransport 回放这些格式，测试从不调用真实服务。
   - `embedding.base_url` 默认不再是 Ollama 的地址，而是 `None`，按 provider 取各家默认（`EMBEDDING_URLS`）。以前 `provider: openai` 不填 base_url 会打到 Ollama，现在默认是 OpenAI。kb 身份里没有 base_url，已有 kb 不受影响。

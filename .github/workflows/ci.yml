@@ -25,3 +25,43 @@ jobs:
       - run: uv run ruff check && uv run ruff format --check
       - run: uv run mypy
       - run: uv run pytest
+
+  image:
+    # Build the service image and smoke-test it: migrate, /health, 401 / 403 / 200 (design §7).
+    # Nothing is pushed. Search needs an embedding service, which CI does not run.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.6-pg18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lite_rag
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t lite-rag:ci .
+      - name: smoke test
+        run: |
+          out=$(docker run --rm lite-rag:ci literag key create --name ci --namespace 'ci/*' --mode write)
+          key=$(printf '%s\n' "$out" | sed -n 's/^key (shown once[^)]*): //p')
+          entry=$(printf '%s\n' "$out" | tail -n 1)
+          docker run -d --name lite-rag --network host \
+            -e LITERAG_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/lite_rag \
+            -e LITERAG_SERVER__KEYS="[$entry]" lite-rag:ci
+          ready=
+          for i in $(seq 1 30); do
+            test "$(docker inspect -f '{{.State.Running}}' lite-rag)" = true || { echo "container exited"; exit 1; }
+            curl -sf http://127.0.0.1:8700/health && { ready=1; break; }
+            sleep 1
+          done
+          test -n "$ready" || { echo "never became ready"; exit 1; }
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+          test "$(code http://127.0.0.1:8700/health)" = 200
+          test "$(code -H 'X-LiteRag-Namespace: ci/x' http://127.0.0.1:8700/v1/kbs)" = 401
+          test "$(code -H "Authorization: Bearer $key" -H 'X-LiteRag-Namespace: other/x' http://127.0.0.1:8700/v1/kbs)" = 403
+          test "$(code -H "Authorization: Bearer $key" -H 'X-LiteRag-Namespace: ci/x' http://127.0.0.1:8700/v1/kbs)" = 200
+      - if: failure()
+        run: docker logs lite-rag || true
+

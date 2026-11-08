@@ -21,7 +21,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S5c — more embedders** (design §12; S0–S5b done 2026-11-08). Next: S6 HTTP service. llm-steward's P3 (WeKnora) is paused until S9 is done.
+**S6 — HTTP service** (design §12; S0–S5c done 2026-11-08). Next: S7 Chroma backend. llm-steward's P3 (WeKnora) is paused until S9 is done.
 
 Decided (2026-11-08): separate public repo; library + optional HTTP service (`literag serve`, Docker image) over one
 `RagEngine`; storage is PostgreSQL + pgvector by default (vectors, own BM25 postings and the document registry in one
@@ -67,6 +67,10 @@ uv run --all-extras pytest -m model   # opt-in: real Hugging Face models (the re
 uv run --all-extras literag eval -c eval/configs/chunk-markdown.yaml -c eval/configs/mode-vector.yaml   # compare configs
 uv run ruff check && uv run ruff format --check && uv run mypy
 uv run literag ingest <kb> <path> | search <kb> "<q>" | ask <kb> "<q>" | eval --config a.yaml --config b.yaml
+uv run literag reindex <kb> --into <new-kb>      # rebuild under the current settings (model / chunker)
+uv run literag key create --name <who> --namespace '<glob>' [--kb '<glob>'] --mode read|write
+uv run --extra server literag serve              # HTTP API on 127.0.0.1:8700 (design §7)
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d --build   # service + PG (Ollama on host)
 ```
 
 ## Workflow

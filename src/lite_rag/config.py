@@ -221,6 +221,28 @@ ChunkingConfig.model_rebuild()
 ContextualConfig.model_rebuild()
 
 
+class ApiKeyConfig(BaseModel):
+    """One API key of the HTTP service (design §7). Only the key's sha256 is configured;
+    `literag key create` prints a new key once, with this entry. Access is the intersection of
+    `namespaces` and `kbs` (glob patterns, `*` matches across `/`) and `mode`."""
+
+    name: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    namespaces: list[str] = Field(min_length=1)  # e.g. ["steward/*"]; no default: no access
+    kbs: list[str] = ["*"]
+    mode: Literal["read", "write"] = "read"
+
+
+class ServerConfig(BaseModel):
+    """`literag serve` (design §7). Keys come from YAML or `LITERAG_SERVER__KEYS` (JSON)."""
+
+    host: str = "127.0.0.1"
+    port: int = Field(default=8700, gt=0, lt=65536)
+    keys: list[ApiKeyConfig] = []  # none: open access, allowed on a loopback address only
+    max_upload_mb: float = Field(default=20, gt=0)
+    max_workers: int = Field(default=8, gt=0)  # requests handled at once (threadpool)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="LITERAG_",
@@ -240,6 +262,7 @@ class Settings(BaseSettings):
     retrieval: RetrievalConfig = RetrievalConfig()
     rerank: RerankConfig = RerankConfig()
     llm: LLMConfig = LLMConfig()
+    server: ServerConfig = ServerConfig()
 
     yaml_path: ClassVar[Path | None] = None  # set by `load_settings` on a subclass
     yaml_first: ClassVar[bool] = False  # the file outranks the environment (evaluation)
