@@ -24,8 +24,15 @@ from lite_rag.config import IDENTIFIER
 from lite_rag.db import check_vector, connection_error, require_url
 from lite_rag.errors import ConfigError, KbNotFound, StoreError
 from lite_rag.keyword import Bm25Inputs, Posting, bm25
-from lite_rag.stores.base import IndexedChunk, KbInfo, KbRef, KbStats, StoredChunk
-from lite_rag.types import Document
+from lite_rag.stores.base import (
+    IndexedChunk,
+    KbInfo,
+    KbRef,
+    KbStats,
+    StoredChunk,
+    StoredParent,
+)
+from lite_rag.types import Chunk, Document
 
 MAX_VECTOR_DIM = 2000  # HNSW on `vector`; above it we store `halfvec` (HNSW up to 4000)
 MAX_HALFVEC_DIM = 4000
@@ -268,15 +275,19 @@ class PgStore:
         with self._tx() as conn:
             rows = conn.execute(
                 "SELECT c.id, c.doc_id, d.title, c.text, c.start_offset, c.end_offset,"
-                " c.heading_path FROM chunks c"
+                " c.heading_path, c.page,"
+                " p.n, p.text, p.start_offset, p.end_offset, p.heading_path, p.page"
+                " FROM chunks c"
                 " JOIN documents d ON d.kb = c.kb AND d.doc_id = c.doc_id"
+                " LEFT JOIN parents p ON p.kb = c.kb AND p.doc_id = c.doc_id AND p.n = c.parent_n"
                 " WHERE c.kb = %s AND c.id = ANY(%s)",
                 (kb.key, chunk_ids),
             ).fetchall()
-        return {
-            chunk: StoredChunk(chunk, doc, title, text, start, end, tuple(path))
-            for chunk, doc, title, text, start, end, path in rows
-        }
+        out = {}
+        for chunk, doc, title, text, start, end, path, page, pn, pt, ps, pe, pp, ppage in rows:
+            parent = StoredParent(pn, pt, ps, pe, tuple(pp), ppage) if pn is not None else None
+            out[chunk] = StoredChunk(chunk, doc, title, text, start, end, tuple(path), page, parent)
+        return out
 
     # --- documents ---------------------------------------------------------------------------
 
@@ -289,7 +300,12 @@ class PgStore:
         return row[0] if row else None
 
     def upsert_document(
-        self, kb: KbRef, doc: Document, content_hash: str, chunks: list[IndexedChunk]
+        self,
+        kb: KbRef,
+        doc: Document,
+        content_hash: str,
+        chunks: list[IndexedChunk],
+        parents: list[Chunk] | None = None,
     ) -> None:
         with self._tx() as conn:
             dim = self._lock_kb(conn, kb)
@@ -312,6 +328,7 @@ class PgStore:
                     Jsonb(doc.metadata),
                 ),
             )
+            self._copy_parents(conn, kb, parents or [])  # first: chunks reference them
             self._copy_chunks(conn, kb, dim, chunks)
             self._adjust_stats(
                 conn,
@@ -399,6 +416,30 @@ class PgStore:
                 (chunks, length, kb.key),
             )
 
+    def _copy_parents(self, conn: psycopg.Connection, kb: KbRef, parents: list[Chunk]) -> None:
+        if not parents:
+            return
+        with (
+            conn.cursor() as cur,
+            cur.copy(
+                "COPY parents (kb, doc_id, n, text, start_offset, end_offset, heading_path, page)"
+                " FROM STDIN"
+            ) as copy,
+        ):
+            for p in parents:
+                copy.write_row(
+                    (
+                        kb.key,
+                        p.doc_id,
+                        p.n,
+                        p.text,
+                        p.start,
+                        p.end,
+                        Jsonb(list(p.heading_path)),
+                        p.page,
+                    )
+                )
+
     def _copy_chunks(
         self, conn: psycopg.Connection, kb: KbRef, dim: int, chunks: list[IndexedChunk]
     ) -> None:
@@ -407,7 +448,7 @@ class PgStore:
         with conn.cursor() as cur:
             with cur.copy(
                 "COPY chunks (kb, id, doc_id, n, text, start_offset, end_offset, tokens, length,"
-                " heading_path) FROM STDIN"
+                " heading_path, page, parent_n, context) FROM STDIN"
             ) as copy:
                 for c in chunks:
                     ch = c.chunk
@@ -423,6 +464,9 @@ class PgStore:
                             ch.tokens,
                             len(c.terms),
                             Jsonb(list(ch.heading_path)),
+                            ch.page,
+                            ch.parent,
+                            c.context,
                         )
                     )
             with cur.copy(

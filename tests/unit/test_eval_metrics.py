@@ -73,3 +73,18 @@ def test_p95_is_an_observed_latency() -> None:
     assert metrics(outcomes).p95_ms == 3.0  # nearest rank: never beyond the largest sample
     many = [Outcome(Q, 1, 1, float(ms)) for ms in range(1, 21)]
     assert metrics(many).p95_ms == 19.0  # ceil(0.95 * 20) = 19th smallest
+
+
+def test_quotes_match_through_markdown_markup_and_pdf_line_breaks() -> None:
+    q = Question("q", "?", "d", "机票退款期限为七天")
+    docling = _hit("d", "## 机票\n\n**机票**退款期限为\n七天。")  # a line break inside the quote
+    assert judge(q, [docling], 1.0).answer_rank == 1
+    q_en = Question("q", "?", "d", "refund within 14 days")
+    assert judge(q_en, [_hit("d", "Hotels: refund\nwithin **14** days.")], 1.0).answer_rank == 1
+    assert judge(q_en, [_hit("d", "refund within 41 days")], 1.0).answer_rank is None
+
+
+def test_the_loader_is_part_of_the_index() -> None:
+    a = load_settings(loader={"pdf": "pypdf"})
+    b = load_settings(loader={"pdf": "docling"})
+    assert kb_for(index_identity(a)) != kb_for(index_identity(b))

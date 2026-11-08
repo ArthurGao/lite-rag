@@ -194,6 +194,21 @@ def test_ingest_a_markdown_file_by_path(
     assert row == ("Refund policy", str(f))
 
 
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+
+
+def test_an_ingested_pdf_cites_the_page_of_each_hit(store: PgStore) -> None:
+    engine = make_engine(store, size=60)
+    engine.ingest("kb", FIXTURES / "pages.pdf")
+    hits = engine.search("kb", "anything", top_k=10, mode="vector")  # every chunk
+    by_text = {h.text: h.page for h in hits}
+    pages = {
+        word: next(page for text, page in by_text.items() if word in text)
+        for word in ("seven days", "十五天", "fifty dollars")
+    }
+    assert pages == {"seven days": 1, "十五天": 2, "fifty dollars": 3}
+
+
 def test_namespaces_never_see_each_other(store: PgStore) -> None:
     a = make_engine(store, namespace="proj/a")
     b = make_engine(store, namespace="proj/b")
@@ -255,3 +270,15 @@ def test_a_chars_kb_does_not_record_a_tokenizer(store: PgStore, pg: psycopg.Conn
 def test_the_store_refuses_an_unsafe_schema_name(pg_url: str, schema: str) -> None:
     with pytest.raises(ConfigError, match="schema"):
         PgStore(pg_url, schema)
+
+
+def test_semantic_chunking_embeds_sentences_through_the_kb_cache(store: PgStore) -> None:
+    inner = FakeEmbedder(dim=8)
+    engine = make_engine(store, inner, strategy="semantic", size=400)
+    text = "Refunds take seven days. Contact support if late. Shipping is free above fifty."
+    engine.upsert_text("kb", "d", "Policy", text)
+    first = sum(len(batch) for batch in inner.calls)
+    engine.upsert_text("kb", "d", "Policy", text + " New.")
+    # the second version re-embeds only what is new: the three old sentences come from the cache
+    assert sum(len(batch) for batch in inner.calls) - first <= 2
+    assert engine.search("kb", "refunds", mode="bm25")[0].doc_id == "d"

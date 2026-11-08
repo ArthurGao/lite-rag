@@ -28,6 +28,15 @@ fastembed = [
 anthropic = [
     "anthropic>=0.40",
 ]
+pdf = [
+    "pypdf==7.0.0",
+]
+docling = [
+    "docling==2.148.0",
+]
+chonkie = [
+    "chonkie==1.7.0",
+]
 
 [dependency-groups]
 dev = [
@@ -35,6 +44,8 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "types-pyyaml>=6.0",
+    "pypdf==7.0.0",
+    "chonkie==1.7.0",
 ]
 
 [build-system]

@@ -11,16 +11,21 @@
 Offsets are kept throughout, so `doc.text[chunk.start:chunk.end] == chunk.text` always holds.
 """
 
+import math
 import re
+from bisect import bisect_right
 from collections.abc import Callable
 from itertools import pairwise
 from typing import Protocol
 
 from lite_rag.config import ChunkingConfig
+from lite_rag.errors import ConfigError
+from lite_rag.loaders import ATX
 from lite_rag.text import TokenCounter
 from lite_rag.types import Chunk, Document, chunk_id
 
 Region = tuple[int, int]
+Embed = Callable[[list[str]], list[list[float]]]
 
 # Cut points, coarse to fine. Each separator stays with the piece before it.
 HEADING = re.compile(r"\n(?=#{1,6}[ \t])")
@@ -30,11 +35,21 @@ SENTENCE = re.compile(r"(?<=[。！？!?])|(?<=[.;；])(?=\s)")
 CLAUSE = re.compile(r"(?<=[，,、：:；;])")
 SPACE = re.compile(r"(?<= )")
 RECURSIVE = (HEADING, BLANK_LINE, LINE, SENTENCE, CLAUSE, SPACE)
-ATX = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t#]*$", re.MULTILINE)
 
 
 class Chunker(Protocol):
-    def split(self, doc: Document) -> list[Chunk]: ...
+    # Indexed chunks per parent, at most (1: no parents): how much deeper a search must look
+    # to find k distinct parents.
+    children_per_parent: int
+
+    def split(self, doc: Document) -> list[Chunk]:
+        """The chunks that are embedded and indexed."""
+        ...
+
+    def split_parents(self, doc: Document) -> tuple[list[Chunk], list[Chunk]]:
+        """(parents, chunks): the larger parents a hit returns — `parent_child` only, otherwise
+        none — and the indexed chunks, each naming its parent's `n`."""
+        ...
 
 
 Piece = tuple[Region, int]  # a region and its size in units, counted once
@@ -50,6 +65,8 @@ def split_at(text: str, region: Region, sep: re.Pattern[str]) -> list[Region]:
 
 
 class _Base:
+    children_per_parent = 1
+
     def __init__(self, config: ChunkingConfig, counter: TokenCounter) -> None:
         self._config = config
         self._counter = counter
@@ -61,6 +78,9 @@ class _Base:
             for r in self._chunk_region(doc.text, section)
         ]
         return self._to_chunks(doc, regions)
+
+    def split_parents(self, doc: Document) -> tuple[list[Chunk], list[Chunk]]:
+        return [], self.split(doc)
 
     # --- hooks -------------------------------------------------------------------------------
 
@@ -154,9 +174,12 @@ class _Base:
             total += counts[j]
         return tail
 
-    def _to_chunks(self, doc: Document, regions: list[Section]) -> list[Chunk]:
+    def _to_chunks(
+        self, doc: Document, regions: list[Section], parents: list[int] | None = None
+    ) -> list[Chunk]:
+        """Chunks from regions; `parents[i]`, when given, is the parent of region i."""
         out: list[Chunk] = []
-        for (start, end), path in regions:
+        for i, ((start, end), path) in enumerate(regions):
             raw = doc.text[start:end]
             body = raw.strip()
             if not body:
@@ -164,8 +187,22 @@ class _Base:
             s = start + len(raw) - len(raw.lstrip())
             n = len(out)
             tokens = self._counter.count(body)  # exact for the final chunk text
+            page = bisect_right(doc.pages, s) if doc.pages else None
+            stop = s + len(body)
+            parent = parents[i] if parents is not None else None
             out.append(
-                Chunk(chunk_id(doc.doc_id, n), doc.doc_id, n, body, s, s + len(body), tokens, path)
+                Chunk(
+                    chunk_id(doc.doc_id, n),
+                    doc.doc_id,
+                    n,
+                    body,
+                    s,
+                    stop,
+                    tokens,
+                    path,
+                    page,
+                    parent,
+                )
             )
         return out
 
@@ -233,16 +270,126 @@ class MarkdownChunker(RecursiveChunker):
         return sections
 
 
+class ParentChildChunker(RecursiveChunker):
+    """Small chunks for precise matching, each inside one larger parent that a hit returns for
+    context. Parents: the markdown strategy (never across a heading) at `parent_size`, no
+    overlap. Children: the recursive strategy at `size` / `overlap`, cut inside each parent, so
+    a child never crosses its parent and inherits its heading path."""
+
+    def __init__(self, config: ChunkingConfig, counter: TokenCounter) -> None:
+        super().__init__(config, counter)
+        size = config.effective_parent_size
+        parent_config = config.model_copy(update={"size": size, "overlap": 0})
+        step = max(1, config.size - config.overlap)  # overlapping children: more per parent
+        self.children_per_parent = math.ceil(size / step)
+        self._parent_chunker = MarkdownChunker(parent_config, counter)
+
+    def split(self, doc: Document) -> list[Chunk]:
+        return self.split_parents(doc)[1]
+
+    def split_parents(self, doc: Document) -> tuple[list[Chunk], list[Chunk]]:
+        parents = self._parent_chunker.split(doc)
+        regions: list[Section] = []
+        owners: list[int] = []
+        for p in parents:
+            for region in self._chunk_region(doc.text, (p.start, p.end)):
+                regions.append((region, p.heading_path))
+                owners.append(p.n)
+        return parents, self._to_chunks(doc, regions, owners)
+
+
+class SemanticChunker(MarkdownChunker):
+    """Cut where the meaning shifts: sentences are embedded, and a cut goes between two adjacent
+    sentences whose cosine distance is above the `semantic_threshold` percentile of all adjacent
+    distances in the document. Groups between cuts are then packed like any other strategy, so
+    `size` stays a hard limit; headings still cut (sections are never crossed). One embedding
+    call per document, through the kb's embedder (and its cache)."""
+
+    def __init__(self, config: ChunkingConfig, counter: TokenCounter, embed: Embed) -> None:
+        super().__init__(config, counter)
+        self._embed = embed
+
+    def split(self, doc: Document) -> list[Chunk]:
+        text = doc.text
+        sections = [
+            (path, [p for s in self._sentences(text, section) for p in self._fit(text, s, 0)])
+            for section, path in self._sections(text)
+        ]
+        flat = [p for _, pieces in sections for p in pieces]
+        vectors = self._embed([text[a:b].strip() for (a, b), _ in flat]) if flat else []
+        vector_of = {region: _unit(v) for ((region, _), v) in zip(flat, vectors, strict=True)}
+        gaps = [
+            [_distance(vector_of[a[0]], vector_of[b[0]]) for a, b in pairwise(pieces)]
+            for _, pieces in sections
+        ]
+        all_gaps = [g for section_gaps in gaps for g in section_gaps]
+        threshold = _percentile(all_gaps, self._config.semantic_threshold) if all_gaps else 0.0
+        regions: list[Section] = []
+        for (path, pieces), section_gaps in zip(sections, gaps, strict=True):
+            group: list[Piece] = []
+            for piece, gap in zip(pieces, [0.0, *section_gaps], strict=True):
+                if group and gap > threshold:
+                    regions.extend((r, path) for r in self._pack(group))
+                    group = []
+                group.append(piece)
+            if group:
+                regions.extend((r, path) for r in self._pack(group))
+        return self._to_chunks(doc, regions)
+
+    def _sentences(self, text: str, region: Region) -> list[Region]:
+        """Sentence pieces with some text (whitespace-only pieces carry no meaning to embed)."""
+        return [
+            s
+            for line in split_at(text, region, LINE)
+            for s in split_at(text, line, SENTENCE)
+            if text[s[0] : s[1]].strip()
+        ]
+
+
+def _unit(v: list[float]) -> list[float]:
+    """`v` scaled to length 1 (a zero vector stays zero: as far from anything as it gets)."""
+    norm = math.sqrt(sum(x * x for x in v))
+    return [x / norm for x in v] if norm else v
+
+
+def _distance(a: list[float], b: list[float]) -> float:
+    """Cosine distance of two unit vectors."""
+    return 1.0 - sum(x * y for x, y in zip(a, b, strict=True))
+
+
+def _percentile(values: list[float], p: float) -> float:
+    """Linear interpolation between the closest ranks: equal values give that value, so a
+    document with one topic throughout (all gaps equal) gets no cut."""
+    ordered = sorted(values)
+    k = (len(ordered) - 1) * p / 100
+    low = math.floor(k)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (k - low)
+
+
 STRATEGIES: dict[str, Callable[[ChunkingConfig, TokenCounter], Chunker]] = {
     "fixed": FixedChunker,
     "recursive": RecursiveChunker,
     "sentence": SentenceChunker,
     "paragraph": ParagraphChunker,
     "markdown": MarkdownChunker,
+    "parent_child": ParentChildChunker,
 }
 
 
-def build_chunker(config: ChunkingConfig, counter: TokenCounter) -> Chunker:
+def build_chunker(
+    config: ChunkingConfig, counter: TokenCounter, embed: Embed | None = None
+) -> Chunker:
+    """The configured chunker. `semantic` also needs `embed` (the kb's document embedder), so it
+    is not in `STRATEGIES`, the strategies that need no model."""
+    if config.strategy == "semantic":
+        if embed is None:
+            raise ConfigError("chunking strategy semantic needs an embedder to embed sentences")
+        if config.semantic_impl == "chonkie":
+            from lite_rag.chunking_chonkie import ChonkieSemanticChunker
+
+            return ChonkieSemanticChunker(config, counter, embed)
+        return SemanticChunker(config, counter, embed)
     return STRATEGIES[config.strategy](config, counter)
 
 
@@ -251,9 +398,10 @@ def chunk_context(title: str | None, heading_path: tuple[str, ...]) -> str:
     return " > ".join(part for part in (title, *heading_path) if part)
 
 
-def embedding_text(chunk: Chunk) -> str:
-    """What gets embedded and indexed: the heading path (if any) gives the chunk its context.
-    The document title is left out on purpose: it would repeat in every chunk of a document and
-    pull them together in vector space; the reranker and the prompt see it (`chunk_context`)."""
-    context = chunk_context(None, chunk.heading_path)
-    return f"{context}\n{chunk.text}" if context else chunk.text
+def embedding_text(chunk: Chunk, header: str | None = None) -> str:
+    """What gets embedded and indexed: a contextual header (if any), the heading path (if any),
+    then the chunk. The document title is left out on purpose: it would repeat in every chunk of
+    a document and pull them together in vector space; the reranker and the prompt see it
+    (`chunk_context`)."""
+    path = chunk_context(None, chunk.heading_path)
+    return "\n".join(part for part in (header, path, chunk.text) if part)

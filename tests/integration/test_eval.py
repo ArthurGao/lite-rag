@@ -119,3 +119,30 @@ def test_the_cli_refuses_configs_on_different_databases(tmp_path: Path) -> None:
     b.write_text("database_url: postgresql://u@h2/db\n")
     result = CliRunner().invoke(app, ["eval", "-c", str(a), "-c", str(b)])
     assert result.exit_code != 0 and "one database" in result.output
+
+
+def test_each_pdf_loader_gets_its_own_text_and_kb(store: PgStore) -> None:
+    corpus = {"doc": ("Doc", "Refunds take seven days.")}
+    questions = [load_golden_line("Refunds take seven days")]
+    asked: list[str] = []
+
+    def corpus_for(pdf: str) -> dict[str, tuple[str, str]]:
+        asked.append(pdf)
+        return corpus
+
+    chunking = {"unit": "chars", "size": 300, "overlap": 30}
+    configs = [
+        ("pypdf", load_settings(chunking=chunking, loader={"pdf": "pypdf"})),
+        ("docling", load_settings(chunking=chunking, loader={"pdf": "docling"})),
+    ]
+    reports = run_configs(
+        configs, corpus_for, questions, store, embedder_for=lambda c: FakeEmbedder(dim=16)
+    )
+    assert asked == ["pypdf", "docling"]  # one build per loader
+    assert [r.settings["loader"]["pdf"] for r in reports] == ["pypdf", "docling"]
+
+
+def load_golden_line(evidence: str):  # type: ignore[no-untyped-def]
+    from lite_rag.eval import Question
+
+    return Question("q", "How long do refunds take?", "doc", evidence)

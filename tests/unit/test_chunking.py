@@ -153,3 +153,143 @@ def test_rebalancing_never_produces_an_oversize_chunk() -> None:
     chunks = _split(text, size=10, min_size=4)
     assert [c.text for c in chunks] == ["a bbbbbbb", "ccc"]
     assert all(c.tokens <= 10 for c in chunks)
+
+
+@pytest.mark.parametrize("strategy", sorted(STRATEGIES))
+def test_each_chunk_records_the_page_it_starts_on(strategy: str) -> None:
+    text = "Page one text.\n\nPage two text.\n\nPage three text."
+    pages = (0, text.index("Page two"), text.index("Page three"))
+    config = ChunkingConfig(strategy=strategy, unit="chars", size=16, overlap=0, min_size=0)
+    chunks = build_chunker(config, CharCounter()).split(Document("d", "t", text, pages=pages))
+    assert [(c.text, c.page) for c in chunks] == [
+        ("Page one text.", 1),
+        ("Page two text.", 2),
+        ("Page three text.", 3),
+    ]
+    no_pages = build_chunker(config, CharCounter()).split(Document("d", "t", text))
+    assert {c.page for c in no_pages} == {None}  # never an invented page
+
+
+def _parent_child(text: str, **cfg: object) -> tuple[list[Chunk], list[Chunk]]:
+    config = ChunkingConfig(
+        **{
+            "strategy": "parent_child",
+            "unit": "chars",
+            "size": 20,
+            "overlap": 0,
+            "min_size": 0,
+            "parent_size": 60,
+            **cfg,
+        }
+    )
+    return build_chunker(config, CharCounter()).split_parents(Document("d", "t", text))
+
+
+def test_parent_child_children_sit_inside_their_parent() -> None:
+    parents, children = _parent_child(EN)
+    assert len(parents) > 1 and len(children) > len(parents)
+    for p in parents:
+        assert EN[p.start : p.end] == p.text and p.tokens <= 60 and p.parent is None
+    for c in children:
+        p = parents[c.parent]  # type: ignore[index]
+        assert p.start <= c.start and c.end <= p.end  # a child never crosses its parent
+        assert EN[c.start : c.end] == c.text and c.tokens <= 20
+    assert [c.n for c in children] == list(range(len(children)))
+    assert {c.parent for c in children} == set(range(len(parents)))  # every parent has children
+
+
+def test_parent_child_parents_keep_heading_paths() -> None:
+    parents, children = _parent_child(MD, parent_size=40)
+    refunds = next(c for c in children if "seven days" in c.text)
+    assert refunds.heading_path == ("Policies", "Refunds")
+    assert parents[refunds.parent].heading_path == ("Policies", "Refunds")  # type: ignore[index]
+
+
+def test_other_strategies_have_no_parents() -> None:
+    config = ChunkingConfig(strategy="recursive", unit="chars", size=40, overlap=0, min_size=0)
+    chunker = build_chunker(config, CharCounter())
+    parents, children = chunker.split_parents(Document("d", "t", EN))
+    assert parents == [] and children == chunker.split(Document("d", "t", EN))
+
+
+TOPICS = (
+    "Coffee needs fresh beans. Grind the coffee just before brewing. Brew coffee at 93 degrees. "
+    "Taxes are due in April. File your tax return online. Late tax filing costs a fee."
+)
+
+
+def _topic_vectors(texts: list[str]) -> list[list[float]]:
+    """Coffee sentences point one way, tax sentences another."""
+    return [[1.0, 0.0] if "offee" in t else [0.0, 1.0] for t in texts]
+
+
+def _semantic(text: str, **cfg: object) -> list[Chunk]:
+    config = ChunkingConfig(
+        **{"strategy": "semantic", "unit": "chars", "size": 400, "overlap": 0, "min_size": 0, **cfg}
+    )
+    return build_chunker(config, CharCounter(), embed=_topic_vectors).split(
+        Document("d", "t", text)
+    )
+
+
+def test_semantic_cuts_where_the_topic_changes() -> None:
+    chunks = _semantic(TOPICS)
+    assert [c.text for c in chunks] == [
+        "Coffee needs fresh beans. Grind the coffee just before brewing. "
+        "Brew coffee at 93 degrees.",
+        "Taxes are due in April. File your tax return online. Late tax filing costs a fee.",
+    ]
+
+
+def test_semantic_does_not_cut_a_single_topic() -> None:
+    one_topic = TOPICS.split(" Taxes")[0]
+    assert len(_semantic(one_topic)) == 1  # all distances equal: no break
+
+
+def test_semantic_still_respects_size() -> None:
+    chunks = _semantic(TOPICS, size=60)
+    assert all(c.tokens <= 60 for c in chunks)
+    assert not any("offee" in c.text and "ax" in c.text for c in chunks)  # never mixes topics
+    assert all(TOPICS[c.start : c.end] == c.text for c in chunks)
+
+
+def test_semantic_needs_an_embedder() -> None:
+    from lite_rag.errors import ConfigError
+
+    config = ChunkingConfig(strategy="semantic", unit="chars", size=400, overlap=0)
+    with pytest.raises(ConfigError, match="embed"):
+        build_chunker(config, CharCounter())
+
+
+def test_chonkie_semantic_keeps_lite_rags_contract() -> None:
+    """Exact offsets, `size` as a hard limit, never across a heading. Where chonkie cuts is its
+    own method (it needs ~8 sentences before it cuts by meaning at all): judged by the eval."""
+    coffee = " ".join(f"Coffee fact number {i} is worth knowing well." for i in range(10))
+    tax = " ".join(f"Tax rule number {i} is worth knowing well too." for i in range(10))
+    long_sentence = "Tax law " + "word " * 60  # one sentence over size: chonkie keeps it whole
+    text = f"# Coffee\n\n{coffee}\n\n# Tax\n\n{tax} {long_sentence}"
+    chunks = _semantic(text, semantic_impl="chonkie", size=120)
+    assert len(chunks) > 2 and all(text[c.start : c.end] == c.text for c in chunks)
+    assert all(c.tokens <= 120 for c in chunks)
+    assert {c.heading_path for c in chunks} == {("Coffee",), ("Tax",)}
+    assert not any("offee" in c.text and "Tax" in c.text for c in chunks)  # the heading cuts
+
+
+def test_semantic_distance_ignores_vector_length() -> None:
+    def scaled(texts: list[str]) -> list[list[float]]:
+        # short coffee vectors, long tax vectors 53 degrees away: a raw dot product would put
+        # the largest "distance" between two coffee sentences, not at the topic change
+        return [[0.1, 0.0] if "offee" in t else [1.8, 2.4] for t in texts]
+
+    config = ChunkingConfig(strategy="semantic", unit="chars", size=400, overlap=0, min_size=0)
+    doc = Document("d", "t", TOPICS)
+    by_length = build_chunker(config, CharCounter(), embed=scaled).split(doc)
+    assert [c.text for c in by_length] == [c.text for c in _semantic(TOPICS)]
+
+
+def test_chonkie_keeps_the_size_limit_in_characters_and_for_unbroken_runs() -> None:
+    coffee = " ".join(f"Coffee fact number {i} is worth knowing well." for i in range(10))
+    text = coffee + " " + "x" * 300  # one run with no break at all
+    chunks = _semantic(text, semantic_impl="chonkie", unit="chars", size=80)
+    assert all(len(c.text) <= 80 for c in chunks)
+    assert all(text[c.start : c.end] == c.text for c in chunks)

@@ -1,0 +1,2 @@
+chunking: {strategy: parent_child, unit: tokens, size: 40, overlap: 0, min_size: 10, parent_size: 120}
+retrieval: {mode: hybrid}

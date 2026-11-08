@@ -6,7 +6,7 @@ from lite_rag.cli import app
 from lite_rag.db import check_vector, migrate
 from tests.conftest import TEST_SCHEMA
 
-TABLES = {"schema_migrations", "kbs", "documents", "chunks", "postings"}
+TABLES = {"schema_migrations", "kbs", "documents", "chunks", "postings", "parents"}
 
 
 def _tables(conn: psycopg.Connection) -> set[str]:
@@ -21,6 +21,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         "0001_initial",
         "0002_namespace_prefixes",
         "0003_postings_length_doc",
+        "0004_pages_parents_context",
     ]
     assert _tables(pg) == TABLES
     assert migrate(pg, TEST_SCHEMA) == []  # second run: nothing pending
@@ -31,6 +32,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         ("0001_initial",),
         ("0002_namespace_prefixes",),
         ("0003_postings_length_doc",),
+        ("0004_pages_parents_context",),
     ]
 
 
@@ -103,7 +105,7 @@ def test_0003_backfills_existing_postings(pg: psycopg.Connection) -> None:
         f"INSERT INTO {s}.postings (kb, term, chunk_id, tf) VALUES ('ns:kb', 'x', 'd1#0', 1)"
     )
 
-    assert migrate(pg, s) == ["0003_postings_length_doc"]
+    assert migrate(pg, s, until="0003_postings_length_doc") == ["0003_postings_length_doc"]
 
     row = pg.execute(f"SELECT length, doc_id FROM {s}.postings").fetchone()
     assert row == (2, "d1")

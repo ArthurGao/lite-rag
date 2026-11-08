@@ -1,0 +1,2 @@
+chunking: {strategy: markdown, unit: tokens, size: 40, overlap: 0, min_size: 10}
+retrieval: {mode: hybrid}

@@ -114,3 +114,26 @@ def test_real_ask_cites_the_source_it_used(pg: psycopg.Connection, pg_url: str) 
     assert answer.model_id == "ollama/qwen3:8b"
     assert "七天" in answer.text or "7" in answer.text
     assert [c.doc_id for c in answer.citations] == ["refund"] and answer.dropped == []
+
+
+def test_real_contextual_headers_are_written_and_indexed(
+    pg: psycopg.Connection, pg_url: str
+) -> None:
+    migrate(pg, TEST_SCHEMA)
+    contextual = {"enabled": True, "llm": {"reasoning_effort": "none"}}
+    settings = load_settings(
+        database_url=pg_url,
+        store={"schema": TEST_SCHEMA},
+        chunking={"strategy": "paragraph", "size": 60, "overlap": 0, "contextual": contextual},
+    )
+    text = "# 员工手册\n\n## 差旅\n\n出差住宿每晚不超过五百元。\n\n## 休假\n\n年假每年十五天。"
+    engine = RagEngine.from_settings(settings, namespace="e2e")
+    try:
+        engine.upsert_text("hb", "handbook", "员工手册", text)
+        hits = engine.search("hb", "住宿标准", top_k=1)
+    finally:
+        engine.close()
+    rows = pg.execute(f"SELECT text, context FROM {TEST_SCHEMA}.chunks ORDER BY n").fetchall()
+    assert rows and all(ctx and 5 < len(ctx) < 400 for _, ctx in rows)  # one short header each
+    assert all(ctx != chunk_text for chunk_text, ctx in rows)
+    assert hits and "五百元" in hits[0].text and hits[0].text in text  # hit text stays the doc's

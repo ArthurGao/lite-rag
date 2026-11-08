@@ -11,12 +11,15 @@ class Document:
     text: str
     source: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    pages: tuple[int, ...] = ()  # where each page starts in `text` (PDF); empty: no pages
 
 
 @dataclass(frozen=True)
 class Chunk:
     """One piece of a document. `chunk_id` is `"{doc_id}#{n}"`; `start` / `end` are character
-    offsets into the document text, for citations."""
+    offsets into the document text, for citations. `page` (1-based) is the page the chunk starts
+    on, None when the document has no pages; `parent` is the `n` of the parent chunk it belongs to
+    (strategy `parent_child`), else None."""
 
     chunk_id: str
     doc_id: str
@@ -26,6 +29,8 @@ class Chunk:
     end: int
     tokens: int
     heading_path: tuple[str, ...] = ()
+    page: int | None = None
+    parent: int | None = None
 
 
 def chunk_id(doc_id: str, n: int) -> str:
@@ -50,5 +55,8 @@ class Hit:
     start: int
     end: int
     heading_path: tuple[str, ...] = ()
+    page: int | None = None
+    # parent_child: `text` / `start` / `end` are the parent's; this is the child span that matched.
+    matched: tuple[int, int] | None = None
     scores: dict[str, float] = field(default_factory=dict)
     ranks: dict[str, int] = field(default_factory=dict)

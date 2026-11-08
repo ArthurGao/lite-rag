@@ -18,6 +18,7 @@ from typing import Any
 from lite_rag.answer import Answer, check_citations, prompt
 from lite_rag.chunking import build_chunker, chunk_context, embedding_text
 from lite_rag.config import Mode, Settings
+from lite_rag.contextual import Contextualizer
 from lite_rag.embedding import Embedder, build_embedder
 from lite_rag.errors import ConfigError, KbNotFound
 from lite_rag.fusion import rrf, weighted
@@ -41,8 +42,12 @@ class Upserted:
     skipped: bool  # unchanged: nothing was re-chunked or re-embedded
 
 
-def content_hash(title: str, text: str, metadata: dict[str, Any]) -> str:
-    payload = json.dumps([title, text, metadata], sort_keys=True, ensure_ascii=False)
+def content_hash(
+    title: str, text: str, metadata: dict[str, Any], pages: tuple[int, ...] = ()
+) -> str:
+    # Pages join only when present, so documents without pages keep the hashes they had.
+    parts: list[Any] = [title, text, metadata, *([list(pages)] if pages else [])]
+    payload = json.dumps(parts, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -67,6 +72,7 @@ class RagEngine:
         namespace: str,
         reranker: Reranker | None = None,
         llm: LLM | None = None,
+        context_llm: LLM | None = None,
     ) -> None:
         """`reranker` and `llm` are built from `settings` on first use when not given, so a
         search-only engine never needs an LLM key or the rerank model."""
@@ -76,8 +82,10 @@ class RagEngine:
         self._embedder = embedder
         self._reranker = reranker
         self._llm = llm
+        self._context_llm = context_llm
         self._counter = build_counter(settings.chunking, settings.embedding)
-        self._chunker = build_chunker(settings.chunking, self._counter)
+        # semantic chunking embeds sentences with the kb's own embedder (and its cache)
+        self._chunker = build_chunker(settings.chunking, self._counter, embedder.embed_documents)
         self._ready: set[KbRef] = set()  # kbs checked against the configuration
 
     @classmethod
@@ -141,26 +149,36 @@ class RagEngine:
         text: str,
         metadata: dict[str, Any] | None = None,
         source: str | None = None,
+        pages: tuple[int, ...] = (),
     ) -> Upserted:
-        """Store a document, replacing any earlier version. Unchanged content is a no-op."""
+        """Store a document, replacing any earlier version. Unchanged content is a no-op.
+        `pages`: where each page starts in `text`, so chunks can cite their page."""
         ref = self._open(kb, create=True)
         meta = metadata or {}
-        digest = content_hash(title, text, meta)
+        digest = content_hash(title, text, meta, pages)
         if self._store.document_hash(ref, doc_id) == digest:
             return Upserted(doc_id, 0, skipped=True)
-        doc = Document(doc_id, title, text, source, meta)
-        chunks = self._chunker.split(doc)
-        inputs = [embedding_text(c) for c in chunks]
+        doc = Document(doc_id, title, text, source, meta, pages)
+        parents, chunks = self._chunker.split_parents(doc)
+        contexts: list[str | None] = (
+            list(self._get_contextualizer().contexts(doc, chunks))
+            if self._settings.chunking.contextual.enabled
+            else [None] * len(chunks)
+        )
+        inputs = [embedding_text(c, ctx) for c, ctx in zip(chunks, contexts, strict=True)]
         vectors = self._embedder.embed_documents(inputs) if inputs else []
         indexed = [
-            IndexedChunk(c, v, terms(t)) for c, v, t in zip(chunks, vectors, inputs, strict=True)
+            IndexedChunk(c, v, terms(t), ctx)
+            for c, v, t, ctx in zip(chunks, vectors, inputs, contexts, strict=True)
         ]
-        self._store.upsert_document(ref, doc, digest, indexed)
+        self._store.upsert_document(ref, doc, digest, indexed, parents)
         return Upserted(doc_id, len(indexed), skipped=False)
 
     def ingest(self, kb: str, path: Path) -> Upserted:
-        title, text = load_file(path)
-        return self.upsert_text(kb, file_doc_id(path), title, text, source=str(path))
+        loaded = load_file(path, self._settings.loader.pdf)
+        return self.upsert_text(
+            kb, file_doc_id(path), loaded.title, loaded.text, source=str(path), pages=loaded.pages
+        )
 
     def delete(self, kb: str, doc_id: str) -> bool:
         """False if the document (or its kb) does not exist: deleting is idempotent, and needs
@@ -189,39 +207,81 @@ class RagEngine:
         with a cross-encoder. `where` keeps only documents whose metadata contains those
         key-values. Each hit carries every stage's score and rank; `score` is the final one."""
         cfg = self._settings.retrieval
-        k, mode = top_k or cfg.top_k, mode or cfg.mode
+        k = cfg.top_k if top_k is None else top_k
+        if k < 1:
+            raise ConfigError(f"top_k must be at least 1, got {k}")
+        mode = mode or cfg.mode
         reranking = self._settings.rerank.enabled if rerank is None else rerank
         # `pool` candidates reach the end (all of them re-scored when reranking); each path
-        # returns `n` — more in hybrid, where fusion needs candidates from both lists.
+        # returns `n` — more in hybrid, where fusion needs candidates from both lists, and more
+        # when several chunks share a parent (parent_child), which count once.
         pool = max(self._settings.rerank.top_n, k) if reranking else k
-        n = max(pool, k * cfg.candidate_factor) if mode == "hybrid" else pool
+        wanted = pool * self._chunker.children_per_parent  # chunks that make `pool` parents
+        n = max(wanted, k * cfg.candidate_factor) if mode == "hybrid" else wanted
         ref = self._open(kb, create=False)
-        rankings: dict[str, list[tuple[str, float]]] = {}
-        if mode in ("vector", "hybrid"):
-            vector = self._embedder.embed_query(query)
-            rankings["vector"] = self._store.vector_query(ref, vector, n, where)
-        if mode in ("bm25", "hybrid"):
-            bm = cfg.bm25
-            rankings["bm25"] = self._store.bm25_query(ref, terms(query), n, bm.k1, bm.b, where)
-        if mode == "hybrid":
-            rankings["fused"] = self._fuse(rankings)
-        ranking = rankings["fused" if mode == "hybrid" else mode]
-        # Look up every ranked chunk: one deleted since it was ranked makes room for the next.
-        stored = self._store.chunks(ref, [chunk for chunk, _ in ranking])
-        candidates = [(c, s) for c, s in ranking if c in stored][:pool]
+        vector = self._embedder.embed_query(query) if mode in ("vector", "hybrid") else None
+        while True:
+            rankings = self._rank(ref, query, vector, mode, n, where)
+            ranking = rankings["fused" if mode == "hybrid" else mode]
+            # Look up every ranked chunk: one deleted since it was ranked makes room for the
+            # next. Short of `pool` while a path came back full (more exists): look deeper —
+            # `children_per_parent` is an estimate, and deletes can race a search.
+            stored = self._store.chunks(ref, [chunk for chunk, _ in ranking])
+            candidates = _best_per_parent([(c, s) for c, s in ranking if c in stored], stored)
+            full = any(len(r) == n for name, r in rankings.items() if name != "fused")
+            if len(candidates) >= pool or not full:
+                break
+            n *= 2
+        candidates = candidates[:pool]
         if reranking and candidates:
             candidates = rankings["rerank"] = self._rerank(query, candidates, stored)
         ranks = {s: {c: i for i, (c, _) in enumerate(r, start=1)} for s, r in rankings.items()}
         scores = {s: dict(r) for s, r in rankings.items()}
-        return [
-            Hit(
-                **vars(stored[chunk]),
-                score=score,
-                scores={s: m[chunk] for s, m in scores.items() if chunk in m},
-                ranks={s: m[chunk] for s, m in ranks.items() if chunk in m},
-            )
-            for chunk, score in candidates[:k]
-        ]
+        return [self._hit(stored[c], score, scores, ranks) for c, score in candidates[:k]]
+
+    def _rank(
+        self,
+        ref: KbRef,
+        query: str,
+        vector: list[float] | None,
+        mode: Mode,
+        n: int,
+        where: dict[str, Any] | None,
+    ) -> dict[str, list[tuple[str, float]]]:
+        """Each path's top `n` (and their fusion, in hybrid mode)."""
+        rankings: dict[str, list[tuple[str, float]]] = {}
+        if vector is not None:
+            rankings["vector"] = self._store.vector_query(ref, vector, n, where)
+        if mode in ("bm25", "hybrid"):
+            bm = self._settings.retrieval.bm25
+            rankings["bm25"] = self._store.bm25_query(ref, terms(query), n, bm.k1, bm.b, where)
+        if mode == "hybrid":
+            rankings["fused"] = self._fuse(rankings)
+        return rankings
+
+    @staticmethod
+    def _hit(
+        c: StoredChunk,
+        score: float,
+        scores: dict[str, dict[str, float]],
+        ranks: dict[str, dict[str, int]],
+    ) -> Hit:
+        """A hit for chunk `c`; a parent_child child returns its parent's text and position."""
+        view = c.parent or c
+        return Hit(
+            chunk_id=c.chunk_id,
+            doc_id=c.doc_id,
+            title=c.title,
+            text=view.text,
+            score=score,
+            start=view.start,
+            end=view.end,
+            heading_path=view.heading_path,
+            page=view.page,
+            matched=(c.start, c.end) if c.parent is not None else None,
+            scores={s: m[c.chunk_id] for s, m in scores.items() if c.chunk_id in m},
+            ranks={s: m[c.chunk_id] for s, m in ranks.items() if c.chunk_id in m},
+        )
 
     def ask(
         self,
@@ -276,6 +336,12 @@ class RagEngine:
             self._reranker = build_reranker(self._settings.rerank)
         return self._reranker
 
+    def _get_contextualizer(self) -> Contextualizer:
+        cfg = self._settings.chunking.contextual
+        if self._context_llm is None:
+            self._context_llm = build_llm(cfg.llm)
+        return Contextualizer(self._context_llm, self._counter, cfg.max_doc_tokens)
+
     def _get_llm(self) -> LLM:
         if self._llm is None:
             self._llm = build_llm(self._settings.llm)
@@ -292,3 +358,21 @@ class RagEngine:
 
     def close(self) -> None:
         self._store.close()
+
+
+def _best_per_parent(
+    ranking: list[tuple[str, float]], stored: dict[str, StoredChunk]
+) -> list[tuple[str, float]]:
+    """The ranking with one chunk per parent (parent_child): the best child stands for its
+    parent, so k hits are k distinct parents. Chunks without a parent all stay."""
+    seen: set[tuple[str, int]] = set()
+    out = []
+    for chunk, score in ranking:
+        parent = stored[chunk].parent
+        if parent is not None:
+            key = (stored[chunk].doc_id, parent.n)
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append((chunk, score))
+    return out

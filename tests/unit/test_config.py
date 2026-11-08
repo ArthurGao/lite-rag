@@ -62,3 +62,25 @@ def test_with_file_wins_the_file_outranks_the_environment(
     assert load_settings(config).chunking.strategy == "recursive"  # normal: env wins
     s = load_settings(config, file_wins=True)
     assert (s.chunking.strategy, s.chunking.size, s.chunking.min_size) == ("fixed", 120, 7)
+
+
+def test_parent_child_needs_parents_larger_than_children() -> None:
+    default = load_settings(chunking={"strategy": "parent_child", "size": 200}).chunking
+    assert default.identity()["parent_size"] == 800  # four times size
+    with pytest.raises(ValidationError, match="parent_size"):
+        load_settings(chunking={"strategy": "parent_child", "size": 200, "parent_size": 200})
+
+
+def test_parent_size_joins_the_identity_only_for_parent_child() -> None:
+    plain = load_settings(chunking={"parent_size": 999}).chunking.identity()
+    assert "parent_size" not in plain  # existing kbs keep the identity they were built with
+    pc = load_settings(chunking={"strategy": "parent_child", "size": 200, "parent_size": 900})
+    assert pc.chunking.identity()["parent_size"] == 900
+
+
+def test_semantic_threshold_joins_the_identity_only_for_semantic() -> None:
+    assert "semantic_threshold" not in load_settings().chunking.identity()
+    s = load_settings(chunking={"strategy": "semantic", "semantic_threshold": 90})
+    assert s.chunking.identity()["semantic_threshold"] == 90
+    with pytest.raises(ValidationError):
+        load_settings(chunking={"strategy": "semantic", "semantic_threshold": 100})

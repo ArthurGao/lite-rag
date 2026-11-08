@@ -47,6 +47,19 @@ class IndexedChunk:
     chunk: Chunk
     vector: list[float]
     terms: list[str]
+    context: str | None = None  # contextual header: indexed with the chunk, never returned
+
+
+@dataclass(frozen=True)
+class StoredParent:
+    """The larger chunk a `parent_child` hit returns instead of the child that matched."""
+
+    n: int  # its number in the document (key with doc_id)
+    text: str
+    start: int
+    end: int
+    heading_path: tuple[str, ...]
+    page: int | None
 
 
 @dataclass(frozen=True)
@@ -58,6 +71,8 @@ class StoredChunk:
     start: int
     end: int
     heading_path: tuple[str, ...]
+    page: int | None = None
+    parent: StoredParent | None = None
 
 
 @dataclass(frozen=True)
@@ -83,8 +98,16 @@ class Store(Protocol):
     def document_hash(self, kb: KbRef, doc_id: str) -> str | None: ...
 
     def upsert_document(
-        self, kb: KbRef, doc: Document, content_hash: str, chunks: list[IndexedChunk]
-    ) -> None: ...
+        self,
+        kb: KbRef,
+        doc: Document,
+        content_hash: str,
+        chunks: list[IndexedChunk],
+        parents: list[Chunk] | None = None,
+    ) -> None:
+        """Replace the document with `chunks` (embedded, indexed) and `parents` (stored only),
+        in one transaction."""
+        ...
 
     def delete_document(self, kb: KbRef, doc_id: str) -> bool: ...
 

@@ -1,0 +1,10 @@
+{"id": "p01", "question": "机票的退款期限是多久？", "doc": "差旅退改规则", "evidence": "出票后七天内申请退款", "kind": "keyword", "lang": "zh"}
+{"id": "p02", "question": "酒店最晚什么时候取消还能全额退款？", "doc": "差旅退改规则", "evidence": "入住日前三天取消可以全额退款", "kind": "keyword", "lang": "zh"}
+{"id": "p03", "question": "火车票改签收费吗？", "doc": "差旅退改规则", "evidence": "开车前改签一次免费", "kind": "keyword", "lang": "zh"}
+{"id": "p04", "question": "住酒店的人想换个日期，要付多少钱？", "doc": "差旅退改规则", "evidence": "修改入住日期每次收取五十元服务费", "kind": "paraphrase", "lang": "zh"}
+{"id": "p05", "question": "坐飞机生病去不了，报销时还要交什么？", "doc": "差旅退改规则", "evidence": "因病无法出行的，另附医院证明", "kind": "paraphrase", "lang": "zh"}
+{"id": "p06", "question": "How long is a laptop loan?", "doc": "equipment-lending", "evidence": "A loan runs for fourteen days", "kind": "keyword", "lang": "en"}
+{"id": "p07", "question": "What is the late fee for a camera?", "doc": "equipment-lending", "evidence": "costs ten dollars, with no maximum", "kind": "keyword", "lang": "en"}
+{"id": "p08", "question": "Who pays when a projector lamp breaks?", "doc": "equipment-lending", "evidence": "The borrower pays for a broken lamp", "kind": "keyword", "lang": "en"}
+{"id": "p09", "question": "If I return the projector two hours late, what does it cost?", "doc": "equipment-lending", "evidence": "Each hour past the due time costs five dollars", "kind": "paraphrase", "lang": "en"}
+{"id": "p10", "question": "Can I keep the camera longer than the weekend?", "doc": "equipment-lending", "evidence": "A loan runs for three days, including weekends, and cannot be renewed", "kind": "paraphrase", "lang": "en"}

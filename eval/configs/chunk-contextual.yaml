@@ -1,0 +1,8 @@
+chunking:
+  strategy: markdown
+  unit: tokens
+  size: 120
+  overlap: 20
+  min_size: 20
+  contextual: {enabled: true, llm: {reasoning_effort: none}}
+retrieval: {mode: hybrid}

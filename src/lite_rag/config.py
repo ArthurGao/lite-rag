@@ -16,6 +16,8 @@ from pydantic_settings import (
     YamlConfigSettingsSource,
 )
 
+from lite_rag.loaders import PdfLoader
+
 OLLAMA_URL = "http://127.0.0.1:11434"  # the local Ollama server (embeddings: /api, LLM: /v1)
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
@@ -62,17 +64,44 @@ class EmbeddingConfig(BaseModel):
 
 
 class ChunkingConfig(BaseModel):
-    strategy: Literal["fixed", "recursive", "sentence", "paragraph", "markdown"] = "recursive"
+    strategy: Literal[
+        "fixed", "recursive", "sentence", "paragraph", "markdown", "parent_child", "semantic"
+    ] = "recursive"
     unit: Literal["tokens", "chars"] = "tokens"
     size: int = Field(default=800, gt=0)
     overlap: int = Field(default=120, ge=0)
     min_size: int = Field(default=50, ge=0)
+    # parent_child: `size` / `overlap` cut the indexed children; parents (what a hit returns) are
+    # cut at headings, then recursively, up to `parent_size` units without overlap (default: four
+    # times `size`).
+    parent_size: int | None = Field(default=None, gt=0)
+    # semantic: cut between adjacent sentences whose embedding distance is above this percentile
+    # of all adjacent distances in the document (higher: fewer, larger chunks).
+    semantic_threshold: float = Field(default=95, gt=0, lt=100)
+    # semantic through chonkie (extra `chonkie`), for comparison: its own method, whose
+    # threshold is a cosine similarity (cut below it), not a percentile.
+    semantic_impl: Literal["own", "chonkie"] = "own"
+    chonkie_threshold: float = Field(default=0.8, gt=0, lt=1)
+    contextual: "ContextualConfig" = Field(default_factory=lambda: ContextualConfig())
 
     @model_validator(mode="after")
     def _overlap_below_size(self) -> "ChunkingConfig":
         if self.overlap >= self.size:
             raise ValueError(f"chunking.overlap ({self.overlap}) must be below size ({self.size})")
+        if self.parent_size is not None and self.parent_size <= self.size:
+            raise ValueError(
+                f"chunking.parent_size ({self.parent_size}) must be above size ({self.size})"
+            )
         return self
+
+    def _semantic_identity(self) -> dict[str, Any]:
+        if self.semantic_impl == "chonkie":
+            return {"semantic_impl": "chonkie", "chonkie_threshold": self.chonkie_threshold}
+        return {"semantic_threshold": self.semantic_threshold}  # own: as before chonkie existed
+
+    @property
+    def effective_parent_size(self) -> int:
+        return self.parent_size or 4 * self.size
 
     def identity(self) -> dict[str, Any]:
         """What changes the chunks this config produces — recorded on a kb and compared when it
@@ -83,7 +112,39 @@ class ChunkingConfig(BaseModel):
             "size": self.size,
             "overlap": self.overlap,
             "min_size": self.min_size,
+            # Only where it applies: kbs built before it existed keep their identity.
+            **(
+                {"parent_size": self.effective_parent_size}
+                if self.strategy == "parent_child"
+                else {}
+            ),
+            **(self._semantic_identity() if self.strategy == "semantic" else {}),
+            **({"contextual": self.contextual.identity()} if self.contextual.enabled else {}),
         }
+
+
+class ContextualConfig(BaseModel):
+    """Contextual chunk headers (design §3.1): one LLM call per chunk at ingest. Its own `llm`
+    section (default: local Ollama), so answers and contexts can use different models."""
+
+    enabled: bool = False
+    llm: "LLMConfig" = Field(default_factory=lambda: LLMConfig())
+    max_doc_tokens: int = Field(default=6000, gt=0)  # longer documents: a window per chunk
+
+    def identity(self) -> dict[str, Any]:
+        from lite_rag.contextual import prompt_digest  # imported late: it imports this module
+
+        return {
+            "llm": f"{self.llm.provider}/{self.llm.model}",
+            "max_doc_tokens": self.max_doc_tokens,
+            "prompt": prompt_digest(),
+        }
+
+
+class LoaderConfig(BaseModel):
+    # pypdf: plain text per page, fast, no models. docling: layout models turn the PDF into
+    # Markdown (headings kept), seconds per document; needs the `docling` extra.
+    pdf: PdfLoader = "pypdf"
 
 
 class BM25Config(BaseModel):
@@ -151,6 +212,10 @@ class LLMConfig(BaseModel):
         return self
 
 
+ChunkingConfig.model_rebuild()
+ContextualConfig.model_rebuild()
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="LITERAG_",
@@ -164,6 +229,7 @@ class Settings(BaseSettings):
     # Required by the engine: every knowledge base lives inside one, e.g. "tenderted/tenant_42".
     namespace: str | None = None
     store: StoreConfig = StoreConfig()
+    loader: LoaderConfig = LoaderConfig()
     embedding: EmbeddingConfig = EmbeddingConfig()
     chunking: ChunkingConfig = ChunkingConfig()
     retrieval: RetrievalConfig = RetrievalConfig()

@@ -250,13 +250,17 @@ def eval_command(
     if len({s.database_url for _, s in loaded}) > 1:
         _fail("all configs must use one database: they are compared on one store")
     with _errors():
-        docs = load_corpus(corpus)
-        questions = load_golden(golden, docs)
+        # One text per PDF loader the configs use; the golden set must hold in every one.
+        corpora = {
+            pdf: load_corpus(corpus, pdf) for pdf in sorted({s.loader.pdf for _, s in loaded})
+        }
+        for docs in corpora.values():
+            questions = load_golden(golden, docs)
         with connect(loaded[0][1].database_url) as conn:
             migrate(conn, schema)
         store = PgStore(loaded[0][1].database_url, schema)
         try:
-            reports = run_configs(loaded, docs, questions, store, keep=keep)
+            reports = run_configs(loaded, corpora.__getitem__, questions, store, keep=keep)
         finally:
             store.close()
     typer.echo(table(reports))

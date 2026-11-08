@@ -17,6 +17,7 @@ How a run is made comparable:
 import hashlib
 import json
 import math
+import re
 import statistics
 import time
 from collections.abc import Callable, Iterable
@@ -28,7 +29,7 @@ from lite_rag.config import EmbeddingConfig, Settings
 from lite_rag.embedding import Embedder, build_embedder
 from lite_rag.engine import RagEngine
 from lite_rag.errors import ConfigError, StoreError
-from lite_rag.loaders import find_files, load_file
+from lite_rag.loaders import PdfLoader, find_files, load_file
 from lite_rag.rerank import Reranker, build_reranker
 from lite_rag.stores.base import KbRef
 from lite_rag.stores.pg import PgStore
@@ -84,18 +85,34 @@ def report(config: str, settings: dict[str, Any], outcomes: list[Outcome]) -> Re
     return Report(config, settings, outcomes, metrics(outcomes), by_kind)
 
 
+_MARKUP = re.compile(r"^#{1,6}[ \t]+|\*\*|__|\\(?=[_*#\\])", re.MULTILINE)
+_CJK_GAP = re.compile(
+    r"(?<=[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])\s+(?=[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])"
+)
+
+
 def _norm(text: str) -> str:
-    return " ".join(text.split())
+    """Text as a quote is matched against it: Markdown markup gone (docling writes headings,
+    bold and escapes), whitespace collapsed, and none between CJK characters (a PDF line break
+    inside a Chinese sentence)."""
+    return _CJK_GAP.sub("", " ".join(_MARKUP.sub("", text).split()))
 
 
-def load_corpus(directory: Path) -> dict[str, tuple[str, str]]:
-    """{doc id (file stem): (title, text)} for every supported file, in a stable order."""
+Corpus = dict[str, tuple[str, str]]  # doc id (file stem) -> (title, text)
+
+
+def load_corpus(directory: Path, pdf: PdfLoader = "pypdf") -> Corpus:
+    """Every supported file, in a stable order; `pdf` picks the PDF loader."""
     files = find_files([directory]) if directory.is_dir() else []
     if not files:
         raise ConfigError(f"no corpus files in {directory}")
     if len({p.stem for p in files}) != len(files):
         raise ConfigError(f"{directory}: two corpus files share a name; ids are file names")
-    return {p.stem: load_file(p) for p in files}
+    corpus: Corpus = {}
+    for p in files:
+        loaded = load_file(p, pdf)
+        corpus[p.stem] = (loaded.title, loaded.text)
+    return corpus
 
 
 def load_golden(path: Path, corpus: dict[str, tuple[str, str]]) -> list[Question]:
@@ -172,6 +189,7 @@ def index_identity(settings: Settings) -> dict[str, Any]:
     embedder). Every embedding setting counts except transport ones — a different endpoint
     serving "the same" model is a different index until shown otherwise."""
     return {
+        "loader": settings.loader.model_dump(),  # another loader: another text
         "chunking": settings.chunking.identity(),
         "embedding": settings.embedding.model_dump(exclude=_TRANSPORT_ONLY),
     }
@@ -195,7 +213,7 @@ EmbedderFor = Callable[[EmbeddingConfig], Embedder]
 
 def run_configs(
     configs: list[tuple[str, Settings]],
-    corpus: dict[str, tuple[str, str]],
+    corpus: Corpus | Callable[[PdfLoader], Corpus],
     questions: Iterable[Question],
     store: PgStore,
     *,
@@ -203,7 +221,8 @@ def run_configs(
     keep: bool = False,
 ) -> list[Report]:
     """One report per config, all on `store`. Embedders and rerankers are built once per
-    distinct config; a kb once per index identity, dropped afterwards unless `keep`."""
+    distinct config; a kb once per index identity, dropped afterwards unless `keep`. `corpus`:
+    the documents, or a function giving them for a PDF loader (configs may differ in it)."""
     questions = list(questions)
     make_embedder = embedder_for or (lambda c: build_embedder(c, cache=store))
     embedders: dict[str, Embedder] = {}
@@ -228,7 +247,8 @@ def run_configs(
             if kb not in built:
                 built.add(kb)  # before the build: a half-built kb is cleaned up too
                 engine.delete_kb(kb)  # a leftover from an interrupted run would mix builds
-                for doc_id, (title, text) in corpus.items():
+                docs = corpus(settings.loader.pdf) if callable(corpus) else corpus
+                for doc_id, (title, text) in docs.items():
                     engine.upsert_text(kb, doc_id, title, text)
             outcomes = _ask_all(engine, kb, questions)
             reports.append(report(name, effective_settings(settings), outcomes))

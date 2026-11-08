@@ -39,8 +39,8 @@ lite-rag 是一个**可读、可改、可单独部署**的轻量 RAG 引擎，�
 
 | 接口 | 方法 | 默认实现 | 其他实现 |
 | --- | --- | --- | --- |
-| `Loader` | `load(path) -> Document` | txt、md | pdf（extra `[pdf]`，只抽纯文本，S5b） |
-| `Chunker` | `split(doc) -> list[Chunk]` | `recursive` | 见 §3.1：fixed、sentence、paragraph、markdown、semantic、parent-child，另有 contextual 增强 |
+| `Loader` | `load_file(path, pdf) -> Loaded(title, text, pages)` | txt、md；pdf 用 pypdf（extra `[pdf]`，逐页抽纯文本） | `docling`（extra `[docling]`，`loader.pdf: docling`）：PDF、DOCX 转成 Markdown，保留标题；`.docx` 总是走它 |
+| `Chunker` | `split(doc) -> list[Chunk]`；`split_parents(doc) -> (parents, chunks)` | `recursive` | 见 §3.1：fixed、sentence、paragraph、markdown、semantic、parent-child，另有 contextual 增强 |
 | `Embedder` | `embed_documents(texts)`、`embed_query(text)`、`dim`、`model` | `ollama`（`bge-m3`） | 见 §3.2：openai 兼容、voyage、cohere、gemini、fastembed、sentence-transformers、`FakeEmbedder` |
 | `Store` | `get_or_create_kb`、`get_kb`、`upsert_document`、`delete_document`、`vector_query`、`bm25_query`、`chunks`、`stats` | `PgStore`（pgvector 存向量，PG 表存 BM25 倒排和文档登记） | `ChromaStore`（extra `[chroma]`）：向量放 Chroma，倒排和登记放 SQLite |
 | `Reranker` | `score(query, texts) -> list[float]`（只打分；排序和组装上下文由引擎负责） | 不启用（`rerank.enabled=false`） | 本地 cross-encoder `BAAI/bge-reranker-v2-m3-int8`（extra `[fastembed]`） |
@@ -62,7 +62,9 @@ engine.stats(kb)
 
 ### 3.1 切块策略（每个 kb 单独配置）
 
-切块方式可以按 kb 配置，按名字从注册表里选实现；以后要加新策略，实现 `Chunker` Protocol 再注册即可。每个 chunk 都带上 `start`、`end` 字符偏移（用于引用定位）、`heading_path`（所在的标题层级）和 `tokens`（真实 token 数）。
+切块方式可以按 kb 配置，按名字从注册表里选实现；以后要加新策略，实现 `Chunker` Protocol 再注册即可。每个 chunk 都带上 `start`、`end` 字符偏移（用于引用定位）、`heading_path`（所在的标题层级）、`tokens`（真实 token 数）、`page`（起始所在页，1 起；文档没有分页时为空，S5b）和 `parent`（`parent_child` 时所属父块的序号）。用的是哪种策略记在 kb 一级（kb 身份），不逐块记录：一个 kb 里不可能混进两种策略切出的块。
+
+**先解析结构，再切块**（2026-11-08）：切块好坏一大半取决于解析时有没有保留结构。PDF 被拍平成纯文本后，任何 chunker 都恢复不出标题层级。所以加载器分两档：pypdf 快、无模型，只给纯文本和页码；docling 用版面模型把 PDF 转成 Markdown（每页之间插分页标记，所以页码也保留），交给 `markdown` 策略得到 `heading_path`。实测 docling 2.148 的两个限制见 §13 S5b 说明。
 
 | 策略 | 做法 | 适用 | 阶段 |
 | --- | --- | --- | --- |
@@ -71,14 +73,15 @@ engine.stats(kb)
 | `sentence` | 按中英文句末标点切句，再按窗口合并（每块 N 句，重叠 M 句） | 问答、短事实 | S2 |
 | `paragraph` | 按空行切段，过短的段落向后合并，过长的再用 recursive 切 | 结构清晰的文章 | S2 |
 | `markdown` | 按标题层级切，块内用 recursive；`heading_path` 作为前缀写进 embedding 文本 | 文档、手册、wiki | S2 |
-| `semantic` | 先按句切，相邻句 embedding 的相似度跌破某个分位数（默认 95）时断开 | 主题频繁切换的长文 | S5b |
-| `parent_child` | 小块（例如 200 token）建索引，命中后返回它所属的大块（例如 1000 token） | 需要精确命中、又需要上下文 | S5b |
-| `contextual`（增强器） | 可以叠加在任意策略上：用 LLM 为每个 chunk 写一两句"这段在全文中讲什么"，拼在 chunk 前面再做 embedding 和 BM25 | 指代多、单看一段看不懂的文档；每个 chunk 多一次 LLM 调用 | S5b |
+| `semantic` | 按句切（标题仍然切开），整篇文档的句子一次 embed（走 kb 的 embedder 和缓存）；相邻两句的余弦距离高于全篇相邻距离的 `semantic_threshold` 分位数（默认 95，线性插值，所以全篇一个话题时不切）时断开，各组再按 `size` 打包 | 主题频繁切换的长文 | S5b |
+| `semantic`（`semantic_impl: chonkie`） | 用 chonkie 1.7.0 的 SemanticChunker（固定余弦相似度阈值 `chonkie_threshold`、3 句窗口、Savitzky-Golay 找谷），用 lite-rag 的 embedder 和 token 计数；外面仍保证 offset 精确、`size` 硬上限、不跨标题 | 和自写版对比（extra `[chonkie]`） | S5b |
+| `parent_child` | 父块：`markdown` 策略、`parent_size`（默认 4×`size`）、无重叠；子块：在每个父块内用 `recursive` 切，所以子块不跨父块。只有子块 embed 和建 BM25；父块存 `parents` 表。检索在子块上排序和 rerank，再换成父块并按父块去重：top-k 是 k 个不同的父块，`Hit.text` 是父块，`Hit.matched` 是命中的子块区间 | 需要精确命中、又需要上下文 | S5b |
+| `contextual`（增强器，`chunking.contextual.enabled`） | 可以叠加在任意策略上：用 LLM 为每个 chunk 写一两句"这段在全文中讲什么"（文档超过 `max_doc_tokens` 时只给以 chunk 为中心的一段），拼在 chunk 前面再做 embedding 和 BM25，存在 `chunks.context`，不出现在 `Hit.text`。kb 身份记录它的 provider/model 和提示词哈希；调用失败则整篇 upsert 失败，不换模型重试 | 指代多、单看一段看不懂的文档；每个 chunk 多一次 LLM 调用 | S5b |
 
 - **长度单位**：可以选 `chars` 或 `tokens`，默认 `tokens`，并且按 embedding 模型自己的 tokenizer 计数。KB 的教训是按词数切会失真（`rag-production-guide` §3）。拿不到 tokenizer 时用字符数估算，并记录这次是估算。
 - **配置示例**：`chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50}`。800/120 是 KB 里实测用过的起点，最终由 eval 决定。
 - **`size` 是硬上限**（embedding 模型有输入长度上限）：任何一步都不会产出超过 `size` 的块。最后一块小于 `min_size` 时，把最后两块重新均分，两块都不超过 `size`、尾块不小于 `min_size`；找不到这样的切分就保持原样。估算计数时，连续的字母或数字每 6 个算一个 token，所以超长的无空格串也会被切开。（Codex review，2026-11-08）
-- **改切块就要重建这个 kb**：`kbs` 表记录 chunker 配置，配置变了就要求 `literag reindex`。阈值也要重新校准，见 §5。
+- **改切块就要重建这个 kb**：`kbs` 表记录 chunker 配置，配置变了就要求重建（`literag reindex` 推迟到 S6：文档原文不存，重建需要源文件）。阈值也要重新校准，见 §5。新加的切块参数只在用到它的策略里进入身份（`parent_size` 只在 `parent_child`，`semantic_*` 只在 `semantic`，`contextual` 只在启用时），已有 kb 的身份不变。
 - 不在 v1 范围内：late chunking 和 proposition 切块。前者需要专门的长上下文 embedding 模型，后者每块都要一次 LLM 调用；等 eval 证明 S5b 不够用时再考虑。
 
 ### 3.2 Embedding（每个 kb 固定一个模型）
@@ -277,7 +280,8 @@ lite-rag/
 | S3 检索 | BM25（Python 版和 SQL 版）、RRF、三种模式、各阶段分数、`literag search` | BM25 与手算结果一致，Python 版和 SQL 版结果一致；融合顺序正确；`-m ollama` 真实往返测试通过 |
 | S4 rerank 与回答 | cross-encoder、三种 LLM 实现、回答模板、`literag ask`、引用核对 | FakeLLM 测试：越界的引用会被拒绝；切换 provider 只需改配置 |
 | S5 评测 | 语料、金标问题、`literag eval` 对比表 | 用真实 Ollama 跑出一张对比表：fixed 对比 recursive 对比 markdown、vector 对比 hybrid、rerank 开与关 |
-| S5b 进阶切块与更多 embedding | 进阶切块 `semantic`（先评估 `chonkie`，MIT 许可：用 eval 和自己实现的版本对比，再决定直接用库还是参考它的做法）、`parent_child`、`contextual`；embedder `voyage`、`cohere`、`gemini`、`sentence_transformers` | 切块与 embedder 都有单测（fake 或录制响应）；用 eval 跑出两张表：切块策略对比、多个 embedding 模型对比（含费用列），结果记进 KB |
+| S5b 结构化加载与进阶切块 | PDF 加载：pypdf（默认）与 docling（可选，转 Markdown）；chunk 记录页码；进阶切块 `semantic`（自写，并与 `chonkie` 对比）、`parent_child`、`contextual` | 加载器、切块、存储与检索都有单测和集成测试（fake 模型）；`-m ollama` 跑通真实的 contextual；用 eval 跑出切块对比表和 PDF 加载器对比表，结果记进 KB |
+| S5c 更多 embedding | embedder `voyage`、`cohere`、`gemini`、`sentence_transformers` | 每个 embedder 有单测（MockTransport，录制的响应结构）；本地模型的 embedding 对比表（含费用列），付费 API 只在用户提供 key 并同意后才跑 |
 | S6 HTTP 服务 | FastAPI、API key 鉴权、Problem Details、Dockerfile、compose 示例、CI 构建镜像 | API 测试：未授权返回 401，越权访问 kb 返回 403；`docker compose up` 后能完成 upsert → search → ask；库和 API 的结果一致 |
 | S7b 可选 BM25 后端 | ParadeDB `pg_search`（倒排索引，真正的 BM25）作为 `store.bm25_impl: pg_search`；需要 ParadeDB 镜像 | 等单个 kb 超过约十万个 chunk、实测 BM25 延迟成为瓶颈时再做；结果与自写 BM25 的排序对比测试 |
 | S7 Chroma 后端 | `ChromaStore` 加 SQLite 倒排，以及写入顺序与恢复逻辑 | 同一套 Store 合约测试在 PG 和 Chroma 上都通过；崩溃恢复测试 |
@@ -299,6 +303,38 @@ lite-rag/
   - 切块按 embedding 模型自己的 tokenizer（Hugging Face `tokenizers`，不需要 torch）计数。tokenizer 跟着模型 profile 走：bge-m3 用 `BAAI/bge-m3`，nomic 用 `nomic-ai/nomic-embed-text-v1.5`，`org/name` 形式的模型名直接把自己当作 tokenizer；未知模型用估算。配置 `embedding.tokenizer` 可以覆盖，设为 `""` 表示用估算。fastembed 也走同一张前缀表（用它的普通 `embed`），所以 kb 上记录的前缀就是实际使用的前缀。
   - `markdown` 策略把标题路径拼在 chunk 前面，再做 embedding 和 BM25；`chunks.text` 保存原文切片，用于引用。
   - PDF 抽取推迟到 S5b，S2 只支持 txt 和 md。
+- S5b 实现说明（2026-11-08）：
+  - **页码**：`load_file` 返回 `Loaded(title, text, pages)`，`pages` 是每页在全文里的起始 offset（各页用空行连接）。chunk 的 `page` 是它起始位置所在的页（`bisect`）；没有分页的文档为空，从不编页码。内容哈希只在有分页时才把它算进去，已有文档的哈希不变。迁移 `0004_pages_parents_context` 给 `chunks` 加 `page`、`parent_n`、`context`，并新建 `parents` 表（随文档级联删除）。
+  - **docling 2.148 实测**（三页的生成样本，无 OCR）：首次约 1 分钟，大部分是加载模型；每一级标题都输出成 `##`（层级被拍平）；中文标题"退货规则"被当成普通段落。`export_to_markdown(page_break_placeholder=…)` 可以保留分页。
+  - **chonkie 1.7.0 实测**：`threshold` 是固定的余弦相似度，不是分位数；先按 3 句窗口算相似度，相似度序列至少要有 `filter_window`（5）个值才会找切点，所以大约 8 句以下的文本不会按语义切，只按大小切。在 10 句咖啡 + 10 句税务的文本上，它的切点落在交界之后，自写版正好切在交界。默认分隔符没有中文句末标点，适配器补上了。
+  - **评测结果**（bge-m3、32 题、120/20 token、hybrid，ranx 核对一致；与 S5 基线逐位相同，说明 eval 可复现）：
+
+    | 配置 | hit@1 | hit@5 | MRR@10 | 改写 hit@5 |
+    | --- | --- | --- | --- | --- |
+    | markdown（S5 基线） | 0.91 | 0.94 | 0.930 | 0.88 |
+    | semantic（自写，57 块） | 0.91 | 0.94 | 0.925 | 0.88 |
+    | semantic（chonkie） | 0.91 | 0.94 | 0.930 | 0.88 |
+    | parent_child 120/480 | 0.91 | 0.94 | 0.927 | 0.88 |
+    | contextual（qwen3:8b） | 0.88 | 0.97 | 0.907 | 0.94 |
+    | markdown 40 | 0.72 | 0.94 | 0.814 | 0.88 |
+    | parent_child 40/120 | 0.88 | 0.97 | 0.916 | 0.94 |
+
+    - 这份语料的章节都很短：按标题切开后几乎每节都不到 120 token。所以 chonkie 版和 parent_child 120/480 切出的块与 markdown 逐块相同（各 49 块），结果相同或相近是语料决定的，不说明策略本身无效。parent_child 120/480 比 markdown 少 0.003，只差 q12 一题：它每条路径取 50 个候选（候选池 10 × 每父块约 5 个子块），markdown 取 40；多取的那一块在向量路径排 41、BM25 排 8，两路都出现，RRF 融合分就超过了只在向量路径出现的答案块，把答案（原第 10 名）挤出前 10。**RRF 的结果依赖每条路径取多深**：取得越深，"两路都出现"的块越容易挤上来。
+    - parent_child 的作用在小块上看得出来：子块同为 40 token 时，返回父块把 MRR 从 0.814 提到 0.916；但它没有超过直接用 120 token 的 markdown（0.930）。注意父块更长，更容易包含证据原文，这对 parent_child 有利。
+    - contextual 有得有失（hit@5 +1 题，hit@1 −1 题），32 题里差 1 题不算数；代价是建库时每个 chunk 一次 LLM 调用（主语料约 3 分钟）。
+    - semantic：没有带来提升，自写版保留（不依赖额外的库）；chonkie 在本语料上无法和自写版区分，在长文本上切点不准，所以 **不把它作为默认实现**，适配器保留为可选的对比项（`[chonkie]`），等有长文档语料再评。
+  - **PDF 加载器对比**（两份生成的结构化 PDF、10 题；几个章节用相同的小标题，正文不出现章节名）：
+
+    | 配置 | hit@1 | hit@5 | MRR@10 |
+    | --- | --- | --- | --- |
+    | pypdf + recursive | 0.60 | 1.00 | 0.767 |
+    | docling + recursive | 0.70 | 1.00 | 0.833 |
+    | docling + markdown | 0.60 | 1.00 | 0.750 |
+
+    docling + markdown 没有胜出，原因正是标题被拍平：三个"退款期限"小节的 `heading_path` 都只剩"退款期限"，区分它们的上一级标题（机票、酒店、火车）丢了；recursive 的 120 token 块反而经常把"## 机票"这一行带进去。10 题里差 1 题就是 0.1，生成的 PDF 也比真实 PDF 干净，所以结论只是：**默认仍用 pypdf**，docling 留作可选；要真正用上结构，需要能还原标题层级的解析（例如按字号推断），这超出 v1 范围（§1）。
+  - eval：语料按 PDF 加载器分别加载，加载器进入 index 身份；比对证据原文前去掉 Markdown 标记（标题符号、加粗、转义），并去掉中文字符之间的空白（PDF 在句中断行）。
+  - **收尾（2026-11-08）**：/simplify（复用、简化、效率、层次 4 个角度）改了：prompt 渲染与 nonce 防护合并到 `lite_rag.prompts.render_pair`；contextual 的 kb 身份直接用 `contextual.prompt_digest()`；标题正则只留 `loaders.ATX` 一份；docling 转换器用 `@cache`；`embedding_text(chunk, header)` 统一决定被索引的文本；parent_child 先按父块去重、再截到候选池、再 rerank（rerank 不再多打 4 倍），引擎不再判断策略名，改由 chunker 声明 `children_per_parent`（考虑重叠），去重键用 `parents.n`；contextual 每篇只数一次 token；semantic 每个向量只归一化一次。没改的及原因：pypdf 中文断行不在加载器里合并（标题行和下一行之间的换行与句中断行无法区分，合并会把标题拼进正文；只在 eval 比对时归一化）；父块文本不拆成第二次查询（一次搜索最多几百行，多一次往返不划算）；contextual 并发调用推迟到 S5c（本地 Ollama 的并发由服务端决定）；`semantic` 不放进 `STRATEGIES`（这个注册表是不需要模型的策略，通用测试遍历它）；身份字段不改成查表（只有 3 个条件，还要处理 `effective_parent_size` 这种推导值）；`run_configs` 仍接受 dict 或函数（已有测试用 dict）。
+  - **Codex review（2026-11-08）**，修了：`children_per_parent` 只是估计，搜索在去重后凑不满候选池、且某条路径取满时把深度翻倍再取（也兜住检索与删除之间的竞争）；`top_k=0` 不再被当成未指定，小于 1 报错；contextual 的身份加上 `CODE_VERSION`（窗口截取、回复清理这些代码规则改了要升版本）；rerank 测试改为断言送去打分的是每个父块一个子块、最终顺序按 rerank 分数；chonkie 补了 `unit: chars` 和超长无断点串的测试。驳回及原因：跨文档父块被误去重（`documents` 主键是 `(kb, doc_id)`，检索只在一个 kb 内，`(doc_id, n)` 已唯一）；nonce 标签能被正文闭合（`_material` 转义所有 `</source…`，已有测试覆盖）；chonkie 在 chars 模式下超出 `size`（它用的就是 lite-rag 的计数器，之后还会再 `_fit`，新测试已验证）；空页导致页码错位（页间有分隔符，起点不重复，加了测试锁住）；semantic 把超长句子送去 embed（每句先经过 `_fit`，最细到 token 窗口）；已有 semantic kb 的身份变化（S5b 之前没有 semantic）；金标题只按一个加载器校验（simplify 之后已对每个加载器校验）。
 - S5 实现说明（2026-11-08）：
   - **金标按"证据原文"标注**，不按 chunk id：每道题写明答案所在的文档和一段原文。某个命中只有同时满足"来自这篇文档"和"包含这段原文"（空白字符统一后比较）才算答对。这样同一套题可以对比不同的切块方式，否则 chunk id 一变，标注就失效了。加载金标时会校验每段原文确实出现在对应文档里。
   - **语料**：`eval/corpus` 下 8 篇自写文档，中英文各 4 篇，内容是公开常识，外加一篇虚构的制度文档。`eval/golden.jsonl` 共 32 题，每篇 4 题：2 道用文中关键词提问，2 道换个说法提问。

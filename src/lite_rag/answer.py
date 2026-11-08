@@ -9,15 +9,11 @@ not called: there is nothing to answer from (`status="no_sources"`).
 """
 
 import re
-import secrets
 from dataclasses import dataclass, field
-from functools import cache
 from typing import Literal
 
-from jinja2 import Environment, PackageLoader, StrictUndefined
-
-from lite_rag.chunking import chunk_context
 from lite_rag.llm import Message
+from lite_rag.prompts import render_pair
 from lite_rag.types import Hit
 
 # [1] · [1, 3] · [1，3] · [1、3], with the spaces before it (removed with an invalid one)
@@ -51,39 +47,8 @@ class Answer:
     dropped: list[int] = field(default_factory=list)
 
 
-@cache
-def _templates() -> Environment:
-    env = Environment(
-        loader=PackageLoader("lite_rag", "prompts"),
-        undefined=StrictUndefined,
-        autoescape=False,  # plain text for a model, not HTML
-        auto_reload=False,  # templates ship with the package
-    )
-    env.globals["context"] = lambda hit: chunk_context(hit.title, hit.heading_path)
-    env.filters["material"] = _material
-    env.filters["attribute"] = _attribute
-    return env
-
-
-def _material(text: str, tag: str) -> str:
-    """Document text inside a source block. The block's tag carries a random nonce chosen per
-    prompt, so a document cannot know it, let alone open or close a block with it; `<source`
-    and the tag itself are escaped as well, as a second line of defence."""
-    escaped = re.sub(r"<(/?)(source)", r"&lt;\1\2", text, flags=re.IGNORECASE)
-    return escaped.replace(f"<{tag}", f"&lt;{tag}").replace(f"</{tag}", f"&lt;/{tag}")
-
-
-def _attribute(text: str) -> str:
-    """A value inside `from="…"`: one line, no quote or tag that could end the attribute."""
-    return " ".join(text.split()).replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
-
-
 def prompt(question: str, hits: list[Hit]) -> list[Message]:
-    env = _templates()
-    tag = f"source-{secrets.token_hex(6)}"  # new per prompt: document text cannot predict it
-    system = env.get_template("answer_system.j2").render(tag=tag).strip()
-    user = env.get_template("answer_user.j2").render(question=question, hits=hits, tag=tag)
-    return [Message("system", system), Message("user", user)]
+    return render_pair("answer_system.j2", "answer_user.j2", question=question, hits=hits)
 
 
 def check_citations(text: str, hits: list[Hit]) -> tuple[str, list[Citation], list[int]]:
