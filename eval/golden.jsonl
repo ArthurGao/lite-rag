@@ -1,0 +1,32 @@
+{"id": "q01", "doc": "coffee-brewing", "kind": "keyword", "lang": "en", "question": "What coffee to water ratio should I use for pour-over?", "evidence": "1 gram of coffee to 16 grams of water"}
+{"id": "q02", "doc": "coffee-brewing", "kind": "keyword", "lang": "en", "question": "What water temperature is right for pour-over coffee?", "evidence": "between 92 and 96 degrees Celsius"}
+{"id": "q03", "doc": "coffee-brewing", "kind": "paraphrase", "lang": "en", "question": "Why do you wait half a minute after the first small pour?", "evidence": "releases carbon dioxide during this bloom"}
+{"id": "q04", "doc": "coffee-brewing", "kind": "paraphrase", "lang": "en", "question": "My cup tastes too acidic. What should I change next time?", "evidence": "if the drink tastes sour, grind finer"}
+{"id": "q05", "doc": "python-virtualenvs", "kind": "keyword", "lang": "en", "question": "How do I create a Python virtual environment?", "evidence": "python -m venv .venv"}
+{"id": "q06", "doc": "python-virtualenvs", "kind": "keyword", "lang": "en", "question": "How do I activate a venv on Windows?", "evidence": ".venv\\Scripts\\activate"}
+{"id": "q07", "doc": "python-virtualenvs", "kind": "paraphrase", "lang": "en", "question": "How can a colleague install exactly the library versions I have?", "evidence": "pip install -r requirements.txt"}
+{"id": "q08", "doc": "python-virtualenvs", "kind": "paraphrase", "lang": "en", "question": "Should the environment folder be checked into git?", "evidence": "Never commit the `.venv` folder"}
+{"id": "q09", "doc": "solar-system", "kind": "keyword", "lang": "en", "question": "Which planet is the hottest?", "evidence": "Venus is the hottest planet"}
+{"id": "q10", "doc": "solar-system", "kind": "keyword", "lang": "en", "question": "What is Olympus Mons?", "evidence": "It has the tallest volcano in the solar system, Olympus Mons"}
+{"id": "q11", "doc": "solar-system", "kind": "paraphrase", "lang": "en", "question": "What gives the red planet its colour?", "evidence": "Mars looks red because iron oxide, rust"}
+{"id": "q12", "doc": "solar-system", "kind": "paraphrase", "lang": "en", "question": "Which planet spins tipped over sideways?", "evidence": "Uranus rotates on its side"}
+{"id": "q13", "doc": "password-security", "kind": "keyword", "lang": "en", "question": "What is credential stuffing?", "evidence": "this is called credential stuffing"}
+{"id": "q14", "doc": "password-security", "kind": "keyword", "lang": "en", "question": "Is an authenticator app better than text message codes?", "evidence": "An authenticator app is safer than text messages"}
+{"id": "q15", "doc": "password-security", "kind": "paraphrase", "lang": "en", "question": "How can I avoid memorising dozens of different logins?", "evidence": "you only remember one master password"}
+{"id": "q16", "doc": "password-security", "kind": "paraphrase", "lang": "en", "question": "Is a short password full of symbols a strong one?", "evidence": "Length matters more than odd symbols"}
+{"id": "q17", "doc": "茶叶分类", "kind": "keyword", "lang": "zh", "question": "乌龙茶属于哪一类茶？", "evidence": "青茶又叫乌龙茶，是半发酵茶"}
+{"id": "q18", "doc": "茶叶分类", "kind": "keyword", "lang": "zh", "question": "白毫银针是什么茶？", "evidence": "白毫银针是白茶中的代表"}
+{"id": "q19", "doc": "茶叶分类", "kind": "paraphrase", "lang": "zh", "question": "哪种茶放得越久越好喝？", "evidence": "黑茶是后发酵茶，在微生物作用下继续转化，可以长期存放，越陈越香"}
+{"id": "q20", "doc": "茶叶分类", "kind": "paraphrase", "lang": "zh", "question": "为什么龙井泡出来是绿色的？", "evidence": "用高温停止酶的活性，所以茶汤保持清绿"}
+{"id": "q21", "doc": "二十四节气", "kind": "keyword", "lang": "zh", "question": "惊蛰是什么意思？", "evidence": "惊蛰时春雷始鸣，蛰伏的虫子被惊醒"}
+{"id": "q22", "doc": "二十四节气", "kind": "keyword", "lang": "zh", "question": "二十四节气是哪一年被列入非物质文化遗产的？", "evidence": "2016 年被列入联合国教科文组织人类非物质文化遗产名录"}
+{"id": "q23", "doc": "二十四节气", "kind": "paraphrase", "lang": "zh", "question": "一年当中哪一天白天最长？", "evidence": "夏至是北半球一年中白昼最长的一天"}
+{"id": "q24", "doc": "二十四节气", "kind": "paraphrase", "lang": "zh", "question": "冬天哪个日子有吃饺子的习惯？", "evidence": "冬至是北半球白昼最短、黑夜最长的一天，很多地方有吃饺子或汤圆的习俗"}
+{"id": "q25", "doc": "垃圾分类", "kind": "keyword", "lang": "zh", "question": "废电池属于什么垃圾？", "evidence": "有害垃圾是对人体健康或环境有危害的垃圾，例如废电池"}
+{"id": "q26", "doc": "垃圾分类", "kind": "keyword", "lang": "zh", "question": "湿垃圾包括哪些东西？", "evidence": "湿垃圾即厨余垃圾，包括剩菜剩饭、果皮、菜叶和茶叶渣"}
+{"id": "q27", "doc": "垃圾分类", "kind": "paraphrase", "lang": "zh", "question": "吃剩的大骨头应该扔进哪个桶？", "evidence": "大骨头因为难以腐烂，应该作为干垃圾投放"}
+{"id": "q28", "doc": "垃圾分类", "kind": "paraphrase", "lang": "zh", "question": "擦过嘴的餐巾纸可以回收吗？", "evidence": "干垃圾是除上述三类之外的其他垃圾，例如用过的纸巾"}
+{"id": "q29", "doc": "差旅报销制度", "kind": "keyword", "lang": "zh", "question": "一线城市的住宿标准是多少？", "evidence": "一线城市每晚住宿上限为 600 元"}
+{"id": "q30", "doc": "差旅报销制度", "kind": "keyword", "lang": "zh", "question": "出差的餐饮补贴每天多少钱？", "evidence": "出差期间按天发放餐饮补贴，每天 100 元"}
+{"id": "q31", "doc": "差旅报销制度", "kind": "paraphrase", "lang": "zh", "question": "出差回来一个多月才去报销还来得及吗？", "evidence": "超过 30 天未提交的，财务部门不予受理"}
+{"id": "q32", "doc": "差旅报销制度", "kind": "paraphrase", "lang": "zh", "question": "什么情况下出差可以坐飞机？", "evidence": "单程超过六小时的，可以选择经济舱机票"}

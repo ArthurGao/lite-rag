@@ -16,6 +16,7 @@ from lite_rag.db import check_vector, connect, migrate, redact_conninfo
 from lite_rag.engine import RagEngine
 from lite_rag.errors import LiteRagError
 from lite_rag.loaders import find_files
+from lite_rag.stores.pg import PgStore
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -216,3 +217,52 @@ def ask(
         typer.echo(f"(removed citations to sources that were not given: {answer.dropped})")
     if answer.model_id:
         typer.echo(f"— {answer.model_id}, tokens {answer.usage}")
+
+
+@app.command("eval")
+def eval_command(
+    configs: Annotated[
+        list[Path],
+        typer.Option("--config", "-c", help="A YAML config to compare; repeat for several"),
+    ],
+    corpus: Annotated[Path, typer.Option(help="Corpus directory")] = Path("eval/corpus"),
+    golden: Annotated[Path, typer.Option(help="Golden questions (JSONL)")] = Path(
+        "eval/golden.jsonl"
+    ),
+    schema: Annotated[
+        str, typer.Option(help="Schema for the evaluation kbs, apart from application data")
+    ] = "lite_rag_eval",
+    out: Annotated[Path | None, typer.Option(help="Also write the full report as JSON")] = None,
+    keep: Annotated[bool, typer.Option(help="Keep the evaluation kbs afterwards")] = False,
+) -> None:
+    """Build a kb per index config from the corpus, run the golden questions, compare.
+    Config files outrank LITERAG_* variables and `.env` here."""
+    from lite_rag.eval import load_corpus, load_golden, run_configs, table
+
+    if not configs:
+        raise typer.BadParameter("give at least one --config")
+    try:
+        loaded = [
+            (p.stem, load_settings(p, file_wins=True, store={"schema": schema})) for p in configs
+        ]
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if len({s.database_url for _, s in loaded}) > 1:
+        _fail("all configs must use one database: they are compared on one store")
+    with _errors():
+        docs = load_corpus(corpus)
+        questions = load_golden(golden, docs)
+        with connect(loaded[0][1].database_url) as conn:
+            migrate(conn, schema)
+        store = PgStore(loaded[0][1].database_url, schema)
+        try:
+            reports = run_configs(loaded, docs, questions, store, keep=keep)
+        finally:
+            store.close()
+    typer.echo(table(reports))
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps([asdict(r) for r in reports], indent=2, ensure_ascii=False), "utf-8"
+        )
+        typer.echo(f"report: {out}")

@@ -277,8 +277,9 @@ lite-rag/
 | S3 检索 | BM25（Python 版和 SQL 版）、RRF、三种模式、各阶段分数、`literag search` | BM25 与手算结果一致，Python 版和 SQL 版结果一致；融合顺序正确；`-m ollama` 真实往返测试通过 |
 | S4 rerank 与回答 | cross-encoder、三种 LLM 实现、回答模板、`literag ask`、引用核对 | FakeLLM 测试：越界的引用会被拒绝；切换 provider 只需改配置 |
 | S5 评测 | 语料、金标问题、`literag eval` 对比表 | 用真实 Ollama 跑出一张对比表：fixed 对比 recursive 对比 markdown、vector 对比 hybrid、rerank 开与关 |
-| S5b 进阶切块与更多 embedding | 进阶切块 `semantic`、`parent_child`、`contextual`；embedder `voyage`、`cohere`、`gemini`、`sentence_transformers` | 切块与 embedder 都有单测（fake 或录制响应）；用 eval 跑出两张表：切块策略对比、多个 embedding 模型对比（含费用列），结果记进 KB |
+| S5b 进阶切块与更多 embedding | 进阶切块 `semantic`（先评估 `chonkie`，MIT 许可：用 eval 和自己实现的版本对比，再决定直接用库还是参考它的做法）、`parent_child`、`contextual`；embedder `voyage`、`cohere`、`gemini`、`sentence_transformers` | 切块与 embedder 都有单测（fake 或录制响应）；用 eval 跑出两张表：切块策略对比、多个 embedding 模型对比（含费用列），结果记进 KB |
 | S6 HTTP 服务 | FastAPI、API key 鉴权、Problem Details、Dockerfile、compose 示例、CI 构建镜像 | API 测试：未授权返回 401，越权访问 kb 返回 403；`docker compose up` 后能完成 upsert → search → ask；库和 API 的结果一致 |
+| S7b 可选 BM25 后端 | ParadeDB `pg_search`（倒排索引，真正的 BM25）作为 `store.bm25_impl: pg_search`；需要 ParadeDB 镜像 | 等单个 kb 超过约十万个 chunk、实测 BM25 延迟成为瓶颈时再做；结果与自写 BM25 的排序对比测试 |
 | S7 Chroma 后端 | `ChromaStore` 加 SQLite 倒排，以及写入顺序与恢复逻辑 | 同一套 Store 合约测试在 PG 和 Chroma 上都通过；崩溃恢复测试 |
 | S8 收尾 | `/simplify`、Codex review、修复问题，然后重跑全部检查 | review 结论记录在案 |
 | S9 接入 llm-steward | `LiteRagProvider`（in-process 和 HTTP 两种）、合约测试、更新 llm-steward 设计文档 | llm-steward 的 KB 合约测试在两种接入方式下都通过；手动端到端：生效条目能检索到，废弃后检索不到 |
@@ -298,6 +299,36 @@ lite-rag/
   - 切块按 embedding 模型自己的 tokenizer（Hugging Face `tokenizers`，不需要 torch）计数。tokenizer 跟着模型 profile 走：bge-m3 用 `BAAI/bge-m3`，nomic 用 `nomic-ai/nomic-embed-text-v1.5`，`org/name` 形式的模型名直接把自己当作 tokenizer；未知模型用估算。配置 `embedding.tokenizer` 可以覆盖，设为 `""` 表示用估算。fastembed 也走同一张前缀表（用它的普通 `embed`），所以 kb 上记录的前缀就是实际使用的前缀。
   - `markdown` 策略把标题路径拼在 chunk 前面，再做 embedding 和 BM25；`chunks.text` 保存原文切片，用于引用。
   - PDF 抽取推迟到 S5b，S2 只支持 txt 和 md。
+- S5 实现说明（2026-11-08）：
+  - **金标按"证据原文"标注**，不按 chunk id：每道题写明答案所在的文档和一段原文。某个命中只有同时满足"来自这篇文档"和"包含这段原文"（空白字符统一后比较）才算答对。这样同一套题可以对比不同的切块方式，否则 chunk id 一变，标注就失效了。加载金标时会校验每段原文确实出现在对应文档里。
+  - **语料**：`eval/corpus` 下 8 篇自写文档，中英文各 4 篇，内容是公开常识，外加一篇虚构的制度文档。`eval/golden.jsonl` 共 32 题，每篇 4 题：2 道用文中关键词提问，2 道换个说法提问。
+  - **`literag eval -c a.yaml -c b.yaml`**：输出 hit@1、hit@5、MRR@10、文档级 hit@5 和 p50/p95 延迟，hit@5 还会按题型分开统计。几处设计（S5 simplify，2026-11-08）：
+    - 索引配置（切块 + embedding）相同的几个配置共用一个 kb，只建一次，然后各自用自己的检索和 rerank 设置去查。kb 名取自索引配置的 hash。
+    - 所有配置共用同一个 store，embedder 和 reranker 按配置各建一次。
+    - 评测使用独立的 schema `lite_rag_eval`（迁移自动执行），不会碰到应用数据，结束后 kb 会被删除。
+    - 配置文件的优先级高于 `LITERAG_*` 环境变量和 `.env`（`load_settings(file_wins=True)`），否则开发者 `.env` 里的设置会悄悄覆盖配置文件，几个配置实际测的是同一套设置。每份报告都会记录当时实际生效的设置。
+    - 延迟只计检索（加 rerank）本身：计时前先算好所有问题的查询向量，再做一次热身搜索。第一次跑时 fixed 测出 40 ms，原因是第一个配置要为每个问题现算一次查询 embedding，而后面的配置直接读缓存，并不是当时写的"tokenizer 首次加载"，已更正。
+    - 检索深度固定为 10（为了算 MRR@10）。hybrid 模式下每条路径取 10 × candidate_factor 个候选，比默认 top_k=5 时的候选池更深。
+    - Codex review 后的修复（2026-11-08）：
+      - 判断"索引是否相同"时，除了只影响取数方式的设置（批大小、并发、重试、超时、缓存），embedding 的其他设置都会参与比较。因此即使模型名相同，只要端点不同，也算作不同的索引。
+      - kb 在开始构建之前就先登记，这样构建失败时，建了一半的 kb 也会被清理。清理时逐个删除 kb，原来的错误照常抛出，清理中遇到的问题作为附注附在上面。
+      - p95 改用 nearest-rank 方法计算，结果一定是某一个实际测到的值。
+      - 所有配置必须使用同一个数据库；没有传 `--config` 时给出明确的报错。
+      - 8 道题的证据原文重写过（q10、q11、q19、q24、q25、q26、q28、q30），现在每段原文里都同时出现问的对象和答案，比如"有害垃圾……例如废电池"，而不再只是一串例子。
+  - **指标经过独立核对**：`eval/crosscheck_ranx.py` 用 ranx 0.3.21 重新计算了 6 个配置的 hit@1、hit@5、MRR@10，与我们的结果完全一致。ranx 依赖太重（pandas、numba 等），所以没有加进项目依赖，需要时用 `uv run --with` 临时运行。
+  - **第一次实测**（bge-m3 + qwen3 本地运行，切块大小 120 token / overlap 20）：
+
+    | 配置 | hit@1 | hit@5 | MRR@10 | 换说法题 hit@5 | p50 ms |
+    | --- | --- | --- | --- | --- | --- |
+    | fixed + hybrid | 0.88 | 1.00 | 0.919 | 1.00 | 5 |
+    | recursive + hybrid | 0.84 | 1.00 | 0.905 | 1.00 | 4 |
+    | markdown + hybrid | 0.91 | 0.94 | 0.930 | 0.88 | 5 |
+    | markdown + 只用向量 | 0.97 | 1.00 | 0.979 | 1.00 | 3 |
+    | markdown + 只用 BM25 | 0.75 | 0.91 | 0.823 | 0.81 | 2 |
+    | markdown + hybrid + rerank | 0.97 | 1.00 | 0.979 | 1.00 | 1061 |
+
+    结论：在这份小语料上，只用向量检索的效果和加 rerank 相同；hybrid 反而被 BM25 拖累，问题集中在换说法提问的题上，BM25 排进来的错误结果经过 RRF 挤占了正确答案的位置。rerank 能把损失补回来，代价是每次查询多花约 1 秒。32 道题太少，这些差距未必稳定；能比较确定的只有一条：只用 BM25 时，换说法的题明显变差。默认配置暂不调整，等语料和题目扩充后再决定。
+  - **哪些自己写、哪些用库**（2026-11-08 决定）：切块、BM25、融合、评测指标自己实现，这几部分正是本项目学习的重点，也需要和精确的 offset、kb 身份信息、namespace、同一事务写入紧密配合；容易写错的底层部分全部用成熟库，包括 pgvector、PostgreSQL、jieba、tokenizers、fastembed、Ollama、官方 SDK。semantic 切块先评估 chonkie（S5b）；数据量变大后再加 `pg_search` 作为 BM25 后端（S7b）；不引入 LangChain 或 LlamaIndex 这类整体框架。
 - S4 实现说明（2026-11-08）：
   - **Rerank**：用 fastembed 的 `TextCrossEncoder`（extra `[fastembed]`），默认模型 `BAAI/bge-reranker-v2-m3-int8`（Apache-2.0、多语言、约 0.6 GB）。`jinaai/jina-reranker-v2-base-multilingual` 是 CC-BY-NC 协议，不用作默认。rerank 默认关闭，可以用 `search(rerank=True)`、`--rerank` 或配置项 `rerank.enabled` 打开。开启后，融合结果中排名前 `rerank.top_n`（默认 20）的候选交给 cross-encoder 打分；送进模型的文本包含 chunk 的标题和标题路径。每条命中都会记录 `scores["rerank"]` 和 `ranks["rerank"]`。
   - **LLM**：`ollama` 和 `openai` 共用 OpenAI SDK，只是 base URL 不同，Ollama 用本机的 `/v1`。`anthropic` 用官方 SDK（extra）。几个实测或核对过的细节：

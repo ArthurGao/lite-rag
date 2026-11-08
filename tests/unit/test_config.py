@@ -50,3 +50,15 @@ def test_the_schema_must_be_a_plain_identifier(schema: str) -> None:
 def test_overlap_must_be_below_the_chunk_size() -> None:
     with pytest.raises(ValidationError, match="must be below size"):
         load_settings(chunking={"size": 100, "overlap": 100})
+
+
+def test_with_file_wins_the_file_outranks_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "eval.yaml"
+    config.write_text("chunking: {strategy: fixed, size: 120, overlap: 20}\n")
+    monkeypatch.setenv("LITERAG_CHUNKING__STRATEGY", "recursive")
+    monkeypatch.setenv("LITERAG_CHUNKING__MIN_SIZE", "7")  # not in the file: env still applies
+    assert load_settings(config).chunking.strategy == "recursive"  # normal: env wins
+    s = load_settings(config, file_wins=True)
+    assert (s.chunking.strategy, s.chunking.size, s.chunking.min_size) == ("fixed", 120, 7)

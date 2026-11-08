@@ -171,6 +171,7 @@ class Settings(BaseSettings):
     llm: LLMConfig = LLMConfig()
 
     yaml_path: ClassVar[Path | None] = None  # set by `load_settings` on a subclass
+    yaml_first: ClassVar[bool] = False  # the file outranks the environment (evaluation)
 
     @classmethod
     def settings_customise_sources(
@@ -181,20 +182,26 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings, dotenv_settings]
+        sources: list[PydanticBaseSettingsSource] = [env_settings, dotenv_settings]
         yaml_path = getattr(settings_cls, "yaml_path", None)
         if yaml_path is not None:
-            sources.append(YamlConfigSettingsSource(settings_cls, yaml_file=yaml_path))
-        return tuple(sources)
+            yaml = YamlConfigSettingsSource(settings_cls, yaml_file=yaml_path)
+            first = getattr(settings_cls, "yaml_first", False)
+            sources = [yaml, *sources] if first else [*sources, yaml]
+        return (init_settings, *sources)
 
 
-def load_settings(config_file: str | Path | None = None, **overrides: Any) -> Settings:
-    """Settings from the environment, on top of `config_file` (YAML) when given."""
+def load_settings(
+    config_file: str | Path | None = None, *, file_wins: bool = False, **overrides: Any
+) -> Settings:
+    """Settings from the environment, on top of `config_file` (YAML) when given. With
+    `file_wins`, the file outranks the environment and `.env` — so evaluation configs measure
+    what they say, whatever a developer's `.env` contains."""
     if config_file is None:
         return Settings(**overrides)
     path = Path(config_file)
     if not path.is_file():
         raise FileNotFoundError(f"config file not found: {path}")
-    with_file = type("FileSettings", (Settings,), {"yaml_path": path})
+    with_file = type("FileSettings", (Settings,), {"yaml_path": path, "yaml_first": file_wins})
     settings: Settings = with_file(**overrides)
     return settings
