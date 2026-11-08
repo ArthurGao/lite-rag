@@ -37,6 +37,9 @@ docling = [
 chonkie = [
     "chonkie==1.7.0",
 ]
+sentence-transformers = [
+    "sentence-transformers==6.2.0",
+]
 
 [dependency-groups]
 dev = [
@@ -67,7 +70,7 @@ packages = ["lite_rag"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["jieba", "fastembed", "fastembed.*", "tokenizers", "docling", "docling.*"]
+module = ["jieba", "fastembed", "fastembed.*", "tokenizers", "docling", "docling.*", "sentence_transformers", "sentence_transformers.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

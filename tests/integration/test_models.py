@@ -31,3 +31,21 @@ def test_docling_turns_a_pdf_into_markdown_with_pages() -> None:
     assert "## Refunds" in loaded.text and "## Shipping" in loaded.text  # headings kept
     assert len(loaded.pages) == 3
     assert "十五天" in loaded.text[loaded.pages[1] : loaded.pages[2]]  # page two holds page two
+
+
+def test_sentence_transformers_runs_a_real_multilingual_model() -> None:
+    from lite_rag.config import EmbeddingConfig
+    from lite_rag.embedding import SentenceTransformerEmbedder
+
+    e = SentenceTransformerEmbedder(
+        EmbeddingConfig(
+            provider="sentence_transformers",
+            model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        )
+    )
+    q = e.embed_query("退款要多久？")
+    near, far = e.embed_documents(["退款会在七天内处理完成。", "今天北京天气晴朗。"])
+    assert e.dim == len(q) == 384
+    assert sum(a * b for a, b in zip(q, near, strict=True)) > sum(
+        a * b for a, b in zip(q, far, strict=True)
+    )

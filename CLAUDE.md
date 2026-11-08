@@ -14,5 +14,8 @@
 - Stage close-out (`AGENTS.md` Workflow step 4), in this order, for **every** stage: run `/simplify` on the
   stage's full diff and apply its fixes; then run Codex from the repo root, read-only, on the stage's whole
   diff: `codex exec -s read-only -o <out.md> "Review \`git diff <commit before the stage>\` (includes
-  uncommitted changes) … focus … report severity, file:line, scenario, fix"`. Fix what holds up, re-run every
+  uncommitted changes) … focus … report severity, file:line, scenario, fix" < /dev/null`. The
+  `< /dev/null` matters: with a piped stdin and a prompt, `codex exec` waits for stdin to close
+  and appends it to the prompt, so from a background shell it hangs forever (0% CPU, no session
+  file; seen with codex-cli 0.160.1, 2026-11-08). Fix what holds up, re-run every
   check, then report and propose the commit. Do not start the next stage before this is done.

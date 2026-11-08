@@ -14,6 +14,9 @@ uv run --all-extras literag eval -c eval/configs/chunk-fixed.yaml -c eval/config
   `chunk-markdown-small.yaml`) — small chunks indexed, parents returned
 - `chunk-contextual.yaml` — markdown chunks with an LLM context header each (local qwen3; one
   call per chunk, a few minutes)
+- `embed-*.yaml` — embedding models, vector retrieval only, against `mode-vector.yaml` (bge-m3):
+  fastembed MiniLM and multilingual-e5-large, sentence-transformers Qwen3-Embedding-0.6B (first
+  run downloads ~4 GB in all)
 - `pdf-*.yaml` — PDF loaders, run on the PDF corpus:
 
 ```

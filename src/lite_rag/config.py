@@ -43,11 +43,16 @@ class StoreConfig(BaseModel):
 class EmbeddingConfig(BaseModel):
     """One embedding model per knowledge base (design §3.2)."""
 
-    provider: Literal["ollama", "openai", "fastembed"] = "ollama"
+    provider: Literal[
+        "ollama", "openai", "fastembed", "voyage", "cohere", "gemini", "sentence_transformers"
+    ] = "ollama"
     model: str = "bge-m3:567m"
-    # ollama: the server root; openai: the API root including /v1 (OpenAI, DashScope, SiliconFlow…)
-    base_url: str | None = OLLAMA_URL
-    api_key_env: str | None = None  # openai-compatible: the env var holding the key
+    # The API root; None = the provider's own (its embedder's `default_url`). openai: including
+    # /v1, so any OpenAI-compatible service works (DashScope, SiliconFlow, TEI…).
+    base_url: str | None = None
+    # The env var holding the key; None = the provider's convention (VOYAGE_API_KEY, CO_API_KEY,
+    # GEMINI_API_KEY; openai-compatible: none, many local servers need no key).
+    api_key_env: str | None = None
     dimensions: int | None = Field(default=None, gt=0)  # truncate, when the model supports it
     batch_size: int = Field(default=32, gt=0)
     max_concurrency: int = Field(default=4, gt=0)
@@ -60,7 +65,7 @@ class EmbeddingConfig(BaseModel):
     # (model_profiles.py); "" = estimate.
     tokenizer: str | None = None
     timeout_s: float = Field(default=60.0, gt=0)
-    cache_dir: str | None = None  # fastembed model cache
+    cache_dir: str | None = None  # fastembed / sentence-transformers model cache
 
 
 class ChunkingConfig(BaseModel):

@@ -21,7 +21,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S5b — structured loading and advanced chunking** (design §12; S0–S5 done 2026-11-08). Next: S5c more embedders. llm-steward's P3 (WeKnora) is paused until S9 is done.
+**S5c — more embedders** (design §12; S0–S5b done 2026-11-08). Next: S6 HTTP service. llm-steward's P3 (WeKnora) is paused until S9 is done.
 
 Decided (2026-11-08): separate public repo; library + optional HTTP service (`literag serve`, Docker image) over one
 `RagEngine`; storage is PostgreSQL + pgvector by default (vectors, own BM25 postings and the document registry in one

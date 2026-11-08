@@ -139,3 +139,12 @@ def test_openai_compatible_refuses_a_missing_key() -> None:
     cfg = EmbeddingConfig(provider="openai", base_url="https://x/v1", api_key_env="NOPE_KEY")
     with pytest.raises(ConfigError, match="NOPE_KEY"):
         OpenAICompatEmbedder(cfg)
+
+
+def test_openai_compatible_without_a_key_sends_no_authorization_header() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        assert "authorization" not in request.headers  # TEI, vLLM: no key, no header
+        return httpx2.Response(200, json={"data": [{"index": 0, "embedding": [1.0]}]})
+
+    cfg = EmbeddingConfig(provider="openai", model="m", base_url="http://tei:8080/v1")
+    assert OpenAICompatEmbedder(cfg, _client(handler)).embed_query("q") == [1.0]

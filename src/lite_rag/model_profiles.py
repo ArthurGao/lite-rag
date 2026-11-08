@@ -12,6 +12,9 @@ Sources (checked 2026-11-08, from each model card on Hugging Face):
 - BAAI/bge-*-v1.5: a query instruction for retrieval; "no instruction needs to be added to passages"
 - BAAI/bge-m3: no instruction
 - Qwen/Qwen3-Embedding-*: f"Instruct: {task}\\nQuery:{query}"; no instruction for documents
+- gemini-embedding-2 (ai.google.dev embeddings guide): "task: search result | query: " /
+  "title: {title} | text: " ("title: none" without one); gemini-embedding-001 takes a taskType
+  parameter instead, as Voyage and Cohere take an input_type: no prefix for those
 """
 
 import re
@@ -53,6 +56,11 @@ KNOWN: tuple[tuple[str, Prefixes, str | None], ...] = (
         "intfloat/multilingual-e5-large",  # all sizes share the XLM-R tokenizer
     ),
     (r"(^|[/:_-])e5([-_]|$)", Prefixes(query="query: ", document="passage: "), None),
+    (
+        r"^gemini-embedding-2",
+        Prefixes(query="task: search result | query: ", document="title: none | text: "),
+        None,
+    ),
 )
 
 

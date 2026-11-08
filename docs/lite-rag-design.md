@@ -92,13 +92,15 @@ engine.stats(kb)
 | --- | --- | --- | --- |
 | `ollama`（默认） | 本地 Ollama `/api/embed` | `bge-m3`（多语言，1024 维）、`qwen3-embedding`、`nomic-embed-text`、`mxbai-embed-large`、`snowflake-arctic-embed2` | 免费 |
 | `fastembed` | 进程内 ONNX，不需要 Ollama | `BAAI/bge-small-zh-v1.5`、`intfloat/multilingual-e5-*` 等 | 免费 |
-| `sentence_transformers` | 进程内 HuggingFace（extra，需要 torch） | 任意 HF embedding 模型 | 免费 |
+| `sentence_transformers` | 进程内 PyTorch（extra `[sentence-transformers]`，6.2.0；CPU / CUDA / Apple MPS；第一次用到时才加载 torch） | 任意 HF embedding 模型，例如 `Qwen/Qwen3-Embedding-0.6B` | 免费 |
 | `openai` | OpenAI 兼容的 `/v1/embeddings` | OpenAI `text-embedding-3-large` / `-small`（支持 `dimensions` 截断）；同一个实现也能接 DashScope（通义 `text-embedding-v*`）、SiliconFlow、Jina、vLLM、TEI | 付费（各家免费额度不一） |
-| `voyage` | 官方 SDK（extra） | `voyage-3-large` 等。KB 中 tenderted 实测用过 | 付费 |
-| `cohere` | 官方 SDK（extra） | `embed-v4` 等多语言模型 | 付费 |
-| `gemini` | 官方 SDK（extra） | `gemini-embedding-*`（支持截断维度） | 付费，有免费额度 |
+| `voyage` | 直接 HTTP `POST /v1/embeddings`（不装 SDK），`input_type` = query / document（Voyage 会自己在前面拼一句检索提示），`output_dimension`；每次最多 1000 条；key `VOYAGE_API_KEY` | `voyage-4-large`、`voyage-4`、`voyage-4-lite`、`voyage-3.5` 等。KB 中 tenderted 实测用过 voyage-3-large | 付费 |
+| `cohere` | 直接 HTTP `POST /v2/embed`，`input_type` = search_document / search_query，`embedding_types: [float]`；每次最多 96 条；key `CO_API_KEY` | `embed-v4.0`、`embed-multilingual-v3.0` 等 | 付费 |
+| `gemini` | 直接 HTTP `POST /v1beta/models/{model}:batchEmbedContents`，每条文本一个 Content（多个 part 放在一个 Content 里会被合成一个向量）；`gemini-embedding-001` 用 `taskType` = RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY，`gemini-embedding-2` 没有这个参数，任务写成前缀（见下表）；`outputDimensionality`；每次最多 100 条；key `GEMINI_API_KEY` | `gemini-embedding-2`、`gemini-embedding-001`（两者的向量空间不兼容） | 付费，有免费额度 |
 
-- **"最好"由自己测**：榜单只能用来缩小候选范围。模型的取舍以本项目语料上的 `literag eval` 结果为准（AGENTS 规则 8）。所以 S5b 的验收是一张多模型对比表，列出 hit@k、MRR、延迟和每千 chunk 的费用。
+每个 provider 有自己的默认 `base_url`（`EMBEDDING_URLS`），`embedding.base_url` 可以覆盖（例如走代理）；`api_key_env` 不填时用各家 SDK 的惯例变量名。托管 provider 不用官方 SDK，是因为请求只有一个 POST，直接 HTTP 可以和 Ollama、OpenAI 兼容接口共用同一套分批、并发和重试（`_HTTPEmbedder`），也不多装依赖（S5c，2026-11-08）。
+
+- **"最好"由自己测**：榜单只能用来缩小候选范围。模型的取舍以本项目语料上的 `literag eval` 结果为准（AGENTS 规则 8）。所以 S5c 的验收是一张多模型对比表，列出 hit@k、MRR、延迟和费用（本地模型为 0；付费 API 只在用户提供 key 并同意后才跑）。
 - **接口**：每个 `Embedder` 都提供 `model_id`（`provider/model`，例如 `ollama/bge-m3:567m`）、`dim`、`prefixes`、`embed_documents` 和 `embed_query`。具体用哪个实现由配置决定，调用方只依赖这个接口。
 - **文档和查询的差异封装在实现里**（最容易踩的坑）：前缀用错不会报错，只会让检索质量悄悄下降。所以 `model_profiles.py` 维护一张已知模型的前缀表，embedder 自己按模型名加前缀，调用方不需要知道这些细节。下表来源是各模型在 Hugging Face 上的模型卡，2026-11-08 核实：
 
@@ -109,8 +111,9 @@ engine.stats(kb)
   | bge-*-v1.5 | 中文 `为这个句子生成表示以用于检索相关文章：`，英文 `Represent this sentence for searching relevant passages:` | 不加 |
   | bge-m3 | 不加 | 不加 |
   | qwen3-embedding | `Instruct: <任务>\nQuery:` | 不加 |
+  | gemini-embedding-2 | `task: search result \| query: ` | `title: none \| text: `（官方格式是 `title: {标题} \| text: …`；lite-rag 的前缀是固定字符串，chunk 自带标题路径，所以用 `none`） |
 
-  配置里的 `query_prefix` / `document_prefix` 可以覆盖这张表，设为 `""` 表示不加。fastembed 自带 `query_embed` / `passage_embed`，前缀由它自己处理，所以 lite-rag 不再叠加。Voyage、Cohere 这类用 `input_type` 参数区分的模型，在 S5b 实现时同样封装在各自的类里。
+  配置里的 `query_prefix` / `document_prefix` 可以覆盖这张表，设为 `""` 表示不加。fastembed 和 sentence-transformers 都用普通的 encode 加上表里的前缀（不用它们自带的 query/passage 方法），所以 kb 记下的前缀就是实际加上去的前缀。Voyage、Cohere、gemini-embedding-001 用请求参数区分文档和查询，这个区分封装在各自的类里，前缀为空。
 - **索引绑定模型**（最重要；`rag-production-guide` §4 规则 2，也是 RAGFlow 换 embedding 时做的检查）：即使维度相同，不同模型的向量也不能混用，比如 bge-m3 和 voyage-3-large 都是 1024 维。`kbs` 表记录 `provider`、`model`、`dim`、查询前缀、文档前缀和切块配置，每次打开 kb（写入或查询）都会校验，不一致就报错，绝不返回错误的结果。换模型的做法是新建一个 kb、重新 embedding，例如命名为 `docs-voyage3`，不会在原索引上直接改。以后加 `literag reindex` 时，也是"建新 kb → 写入 → 验证 → 切换"这个流程。
 - **向量缓存**：每种维度一张 `embedding_cache_<dim>` 表，主键是 `(model_id, sha256(角色 ‖ 前缀 ‖ 文本))`。同一个模型遇到完全相同的输入就直接复用，跨 kb、跨 namespace 都共享，因为向量只取决于模型和输入，和存它的人无关。key 里包含角色（document / query），所以查询永远拿不到文档的向量。这样重复文本不会重复计算，切到付费模型以后也能省钱。可以用 `embedding.cache: false` 关掉。
 - **统一出口（可选）**：如果 llm-gateway 以后提供 OpenAI 兼容的 `/v1/embeddings`，把 `openai` provider 的 `base_url` 指向它即可。所有模型调用都从一个地方出去，用量统计也就集中了。这是 gateway 仓库的事，lite-rag 不需要改。
@@ -303,6 +306,23 @@ lite-rag/
   - 切块按 embedding 模型自己的 tokenizer（Hugging Face `tokenizers`，不需要 torch）计数。tokenizer 跟着模型 profile 走：bge-m3 用 `BAAI/bge-m3`，nomic 用 `nomic-ai/nomic-embed-text-v1.5`，`org/name` 形式的模型名直接把自己当作 tokenizer；未知模型用估算。配置 `embedding.tokenizer` 可以覆盖，设为 `""` 表示用估算。fastembed 也走同一张前缀表（用它的普通 `embed`），所以 kb 上记录的前缀就是实际使用的前缀。
   - `markdown` 策略把标题路径拼在 chunk 前面，再做 embedding 和 BM25；`chunks.text` 保存原文切片，用于引用。
   - PDF 抽取推迟到 S5b，S2 只支持 txt 和 md。
+- S5c 实现说明（2026-11-08）：
+  - 托管 embedder（voyage、cohere、gemini）直接走 HTTP，和 Ollama、OpenAI 兼容接口共用 `_HTTPEmbedder` 的分批、并发和重试；`_call(batch, role)` 把文档 / 查询的角色交给子类，按各家的参数名发出去。请求和响应的格式按 2026-11-08 的官方 API 参考核对，单测用 MockTransport 回放这些格式，测试从不调用真实服务。
+  - `embedding.base_url` 默认不再是 Ollama 的地址，而是 `None`，按 provider 取各家默认（`EMBEDDING_URLS`）。以前 `provider: openai` 不填 base_url 会打到 Ollama，现在默认是 OpenAI。kb 身份里没有 base_url，已有 kb 不受影响。
+  - sentence-transformers 6.2.0：第一次用到模型时才导入 torch（单测从 27 秒降到 0.3 秒，也不要求 CI 装这个 extra）；6.x 把 `get_sentence_embedding_dimension` 改名为 `get_embedding_dimension`，旧名字会给弃用警告。
+  - **embedding 对比**（32 题、markdown 120/20、只用向量检索，每个模型用自己的 tokenizer 切块；ranx 核对一致）：
+
+    | 模型 | 维度 | hit@1 | hit@5 | MRR@10 | 费用 |
+    | --- | --- | --- | --- | --- | --- |
+    | ollama `bge-m3:567m`（默认） | 1024 | 0.97 | 1.00 | 0.979 | 0（本地） |
+    | fastembed `intfloat/multilingual-e5-large` | 1024 | 0.94 | 1.00 | 0.969 | 0（本地） |
+    | sentence-transformers `Qwen/Qwen3-Embedding-0.6B` | 1024 | 0.91 | 1.00 | 0.953 | 0（本地） |
+    | fastembed `paraphrase-multilingual-MiniLM-L12-v2` | 384 | 0.69 | 0.97 | 0.815 | 0（本地） |
+
+    默认仍是 bge-m3。e5-large 只差一题，可以作为不依赖 Ollama 的进程内替代；MiniLM 体积小（0.22 GB），但关键词题 hit@5 掉到 0.94、hit@1 只有 0.69，不适合做检索主力。付费模型（voyage、cohere、gemini、OpenAI）没有跑：需要用户提供 key 并同意后再跑，费用以各家当时的价目表为准。32 题太少，只能排除明显差的模型，分不出前三名的高下。
+  - **收尾 /simplify（2026-11-08）**，改了：每个 provider 的默认地址、key 环境变量和每批上限都作为它自己 embedder 类的属性（`default_url`、`key_env`、`max_batch`），`build_embedder` 改为按 provider 名查 `EMBEDDERS` 表（有测试保证配置里每个 provider 都有实现），config 里不再有按 provider 分支的默认地址；key 一律经 `api_key()` 取得，没配置时请求不带认证头；Voyage 继承 OpenAI 兼容实现，只多一个 `input_type`、维度字段名不同；Gemini 的规则统一为"模型配置有前缀就用前缀，否则发 `taskType`"，未知的 Gemini 型号也不会两样都没有；加前缀的逻辑只在 `_Prefixing` 基类里写一次，HTTP 与进程内两类实现共用。没改的：托管 API 的默认每批条数（Voyage 还限制每次请求的总 token 数，要实测再定）；未配置 `dimensions` 时启动探测维度的那一次调用（kb 身份检查在写入前就要知道维度，每个进程一次；配置 `dimensions` 即可省掉）。
+  - **Codex review（2026-11-08）**：只有一条 P2，成立并已修复：Voyage 除了每次最多 1000 条，还限制每次请求的总 token 数（随模型变化，例如 `voyage-4-large` 是 12 万），一批长 chunk 会收到不可重试的 4xx。现在所有 HTTP embedder 在一批被以 400 / 413 拒绝时把它对半拆开分别重发，直到单条；单条仍被拒绝就报错，其他客户端错误（例如 401）不拆分。Codex 核对了 Gemini 的请求字段、角色、维度和前缀与官方文档一致，`base_url` 默认值的变化已在本节写明。
+
 - S5b 实现说明（2026-11-08）：
   - **页码**：`load_file` 返回 `Loaded(title, text, pages)`，`pages` 是每页在全文里的起始 offset（各页用空行连接）。chunk 的 `page` 是它起始位置所在的页（`bisect`）；没有分页的文档为空，从不编页码。内容哈希只在有分页时才把它算进去，已有文档的哈希不变。迁移 `0004_pages_parents_context` 给 `chunks` 加 `page`、`parent_n`、`context`，并新建 `parents` 表（随文档级联删除）。
   - **docling 2.148 实测**（三页的生成样本，无 OCR）：首次约 1 分钟，大部分是加载模型；每一级标题都输出成 `##`（层级被拍平）；中文标题"退货规则"被当成普通段落。`export_to_markdown(page_break_placeholder=…)` 可以保留分页。
