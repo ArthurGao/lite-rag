@@ -4,7 +4,7 @@ Two different things on purpose:
 - `terms` feeds the keyword index — words, lowercased, punctuation dropped;
 - a `TokenCounter` measures chunk size in the embedding model's own tokens, because sizing by words
   misjudges what the model sees (KB rag-production-guide §3). Without a tokenizer the size is an
-  estimate, and the counter says so (`exact = False`).
+  estimate (the counter's identity says `estimate`).
 """
 
 import logging

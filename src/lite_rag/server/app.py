@@ -18,8 +18,15 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from lite_rag.config import Mode, Settings
-from lite_rag.engine import RagEngine
-from lite_rag.errors import ConfigError, KbNotFound, LiteRagError, TooLarge
+from lite_rag.engine import RagEngine, RagRuntime
+from lite_rag.errors import (
+    ConfigError,
+    DocumentNotFound,
+    InvalidRequest,
+    KbNotFound,
+    LiteRagError,
+    TooLarge,
+)
 from lite_rag.loaders import SUFFIXES
 from lite_rag.server.auth import Authorizer
 
@@ -37,7 +44,7 @@ class _BodyLimit:
     """Refuses a request body over its limit before anything parses it — FastAPI reads a whole
     body (a multipart one onto disk) before the route, and before authentication, runs: by
     Content-Length up front, and by counting while it streams when the client sends none.
-    Uploads (`/files`) have their own, larger limit."""
+    The upload route (`/v1/kbs/{kb}/files`, matched exactly) has its own, larger limit."""
 
     def __init__(self, app: ASGIApp, upload_limit: int, body_limit: int) -> None:
         self._app = app
@@ -48,7 +55,7 @@ class _BodyLimit:
         if scope["type"] != "http":
             await self._app(scope, receive, send)
             return
-        limit = self._upload if scope["path"].endswith("/files") else self._body
+        limit = self._upload if UPLOAD_PATH.fullmatch(scope["path"]) else self._body
         length = dict(scope["headers"]).get(b"content-length")
         if length is not None and length.isdigit() and int(length) > limit:
             await problem(413, "TooLarge", TOO_LARGE)(scope, receive, send)
@@ -66,8 +73,10 @@ class _BodyLimit:
         await self._app(scope, counted, send)
 
 
+UPLOAD_PATH = re.compile(r"/v1/kbs/[^/]+/files")
 TOO_LARGE = "the request body is larger than the server allows (server.max_upload_mb / max_body_mb)"
-LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]"]
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}  # bind addresses allowed without keys
+LOCAL_HOSTS = sorted(f"[{h}]" if ":" in h else h for h in LOOPBACK)  # as Host headers spell them
 NAMESPACE_HEADER = "X-LiteRag-Namespace"
 PROBLEM = "application/problem+json"
 TITLES = {401: "Unauthorized", 403: "Forbidden"}
@@ -102,15 +111,15 @@ def problem(status: int, title: str, detail: str | None = None) -> JSONResponse:
     return JSONResponse(body, status_code=status, media_type=PROBLEM, headers=headers)
 
 
-def create_app(settings: Settings, engine: RagEngine) -> FastAPI:
-    """The app around `engine` (its namespace is not used: each request names its own)."""
+def create_app(settings: Settings, runtime: RagRuntime) -> FastAPI:
+    """The app around `runtime`: each request gets an engine for the namespace it names."""
     auth = Authorizer(settings.server.keys)
     upload_limit = int(settings.server.max_upload_mb * 1024 * 1024)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         to_thread.current_default_thread_limiter().total_tokens = settings.server.max_workers
-        await to_thread.run_sync(engine.warm_up)
+        await to_thread.run_sync(runtime.warm_up)
         yield
 
     app = FastAPI(title="lite-rag", lifespan=lifespan)
@@ -155,12 +164,12 @@ def create_app(settings: Settings, engine: RagEngine) -> FastAPI:
             namespace: Annotated[str | None, Header(alias=NAMESPACE_HEADER)] = None,
         ) -> RagEngine:
             if not namespace:
-                raise ConfigError(f"the {NAMESPACE_HEADER} header is required")
+                raise InvalidRequest(f"the {NAMESPACE_HEADER} header is required")
             request.state.key = auth.check(
                 authorization, namespace, request.path_params.get("kb"), write
             )
-            # A copy per request: as cheap as a lookup, and no cache that callers can grow.
-            return engine.for_namespace(namespace)
+            # An engine per request: as cheap as a lookup, and no cache that callers can grow.
+            return runtime.engine(namespace)
 
         return dependency
 
@@ -171,7 +180,7 @@ def create_app(settings: Settings, engine: RagEngine) -> FastAPI:
 
     @app.get("/health")
     def health(deep: bool = False) -> dict[str, str]:
-        engine.health(deep)
+        runtime.health(deep)
         return {"status": "ok"}
 
     # --- knowledge bases -----------------------------------------------------------------------
@@ -207,7 +216,7 @@ def create_app(settings: Settings, engine: RagEngine) -> FastAPI:
     @app.delete("/v1/kbs/{kb}/documents/{doc_id}", status_code=204)
     def delete_document(kb: str, doc_id: str, eng: Write) -> None:
         if not eng.delete(kb, doc_id):
-            raise KbNotFound(f"document {doc_id!r} does not exist in {kb!r}")
+            raise DocumentNotFound(f"document {doc_id!r} does not exist in {kb!r}")
 
     @app.post("/v1/kbs/{kb}/files")
     def upload(
@@ -219,7 +228,9 @@ def create_app(settings: Settings, engine: RagEngine) -> FastAPI:
         name = file.filename or "upload"
         suffix = Path(name).suffix.lower()
         if suffix not in SUFFIXES:  # a fixed message: the client's file name is not echoed
-            raise ConfigError(f"unsupported file type (supported: {', '.join(sorted(SUFFIXES))})")
+            raise InvalidRequest(
+                f"unsupported file type (supported: {', '.join(sorted(SUFFIXES))})"
+            )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / f"upload{suffix}"
             written = 0
@@ -247,9 +258,6 @@ def create_app(settings: Settings, engine: RagEngine) -> FastAPI:
     return app
 
 
-LOOPBACK = {"127.0.0.1", "localhost", "::1"}
-
-
 def check_bind(settings: Settings, host: str) -> None:
     """Without API keys the server is open, so it may only listen on a loopback address."""
     if not settings.server.keys and host not in LOOPBACK:
@@ -258,9 +266,9 @@ def check_bind(settings: Settings, host: str) -> None:
         )
 
 
-def run(settings: Settings, engine: RagEngine, host: str, port: int) -> None:
+def run(settings: Settings, runtime: RagRuntime, host: str, port: int) -> None:
     """Serve the app (uvicorn, extra `server`), after `check_bind` — wherever it is started."""
     check_bind(settings, host)
     from lite_rag.extras import require_extra
 
-    require_extra("uvicorn", "server").run(create_app(settings, engine), host=host, port=port)
+    require_extra("uvicorn", "server").run(create_app(settings, runtime), host=host, port=port)

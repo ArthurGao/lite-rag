@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 from lite_rag.cli import app
 from lite_rag.config import load_settings
 from lite_rag.engine import RagEngine
-from lite_rag.errors import ConfigError, StoreError
+from lite_rag.errors import StoreError
 from lite_rag.stores.base import KbInfo, KbRef
 from lite_rag.stores.chroma import SQLITE_FILE, ChromaStore, collection_name, migrate_sqlite
 from lite_rag.stores.factory import evaluation_store, migrate_store
@@ -240,15 +240,6 @@ def test_vectors_are_added_in_batches_chroma_accepts(
 # --- metadata filters -------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", [["a"], {"k": 1}, None])
-def test_a_filter_on_a_non_scalar_value_is_refused(store: ChromaStore, value: Any) -> None:
-    put(store, "d1", [("alpha", [1, 0, 0, 0])], metadata={"tags": ["a"], "lang": "en"})
-    with pytest.raises(ConfigError, match="scalar"):
-        store.vector_query(KB, [1, 0, 0, 0], 5, {"tags": value})
-    with pytest.raises(ConfigError, match="scalar"):
-        store.bm25_query(KB, ["alpha"], 5, 1.2, 0.75, {"tags": value})
-
-
 @pytest.mark.parametrize(("where", "found"), [({"flag": True}, 1), ({"flag": 1}, 0)])
 def test_both_paths_filter_alike_and_a_bool_never_equals_a_number(
     store: ChromaStore, where: dict[str, Any], found: int
@@ -304,7 +295,7 @@ def test_the_engine_opens_the_configured_backend(tmp_path: Path) -> None:
     settings = load_settings(store={"backend": "chroma", "data_dir": str(tmp_path / "d")})
     engine = RagEngine.from_settings(settings, NS)
     try:
-        assert isinstance(engine._store, ChromaStore) and engine.list_kbs() == []
+        assert isinstance(engine.runtime.store, ChromaStore) and engine.list_kbs() == []
     finally:
         engine.close()
 

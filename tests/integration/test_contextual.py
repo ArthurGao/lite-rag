@@ -3,8 +3,8 @@ import pytest
 
 from lite_rag.config import load_settings
 from lite_rag.embedding import CachingEmbedder
-from lite_rag.engine import RagEngine
-from lite_rag.errors import ConfigError
+from lite_rag.engine import RagRuntime
+from lite_rag.errors import InvalidRequest
 from lite_rag.llm import LLMError
 from lite_rag.stores.pg import PgStore
 from lite_rag.testing import FakeEmbedder, FakeLLM
@@ -19,9 +19,7 @@ def _engine(store: PgStore, llm: FakeLLM, embedder: FakeEmbedder, model: str = "
     settings = load_settings(
         chunking={**CHUNKING, "contextual": {"enabled": True, "llm": {"model": model}}}
     )
-    return RagEngine(
-        settings, store, CachingEmbedder(embedder, store), namespace=NS, context_llm=llm
-    )
+    return RagRuntime(settings, store, CachingEmbedder(embedder, store), context_llm=llm).engine(NS)
 
 
 def test_the_context_is_indexed_but_never_returned(store: PgStore, pg: psycopg.Connection) -> None:
@@ -52,5 +50,30 @@ def test_a_failed_context_call_writes_nothing(store: PgStore, pg: psycopg.Connec
 def test_a_kb_refuses_another_context_model(store: PgStore) -> None:
     _engine(store, FakeLLM(reply=CONTEXT), FakeEmbedder(dim=8)).upsert_text("kb", "d", "H", TEXT)
     other = _engine(store, FakeLLM(reply=CONTEXT), FakeEmbedder(dim=8), model="qwen3:14b")
-    with pytest.raises(ConfigError, match="contextual"):
+    with pytest.raises(InvalidRequest, match="contextual"):
         other.search("kb", "refunds")
+
+
+def test_the_engine_writes_contexts_with_the_configured_concurrency(store: PgStore) -> None:
+    import threading
+
+    class Together(FakeLLM):
+        """Each call waits for the other: one at a time would time out."""
+
+        barrier = threading.Barrier(2, timeout=5)
+
+        def complete(self, messages):  # type: ignore[no-untyped-def]
+            self.barrier.wait()
+            return super().complete(messages)
+
+    settings = load_settings(
+        chunking={**CHUNKING, "contextual": {"enabled": True, "concurrency": 2}}
+    )
+    runtime = RagRuntime(
+        settings,
+        store,
+        CachingEmbedder(FakeEmbedder(dim=8), store),
+        context_llm=Together(reply=CONTEXT),
+    )
+    engine = runtime.engine(NS)
+    assert engine.upsert_text("kb", "d", "Handbook", TEXT).chunks == 2

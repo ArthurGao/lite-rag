@@ -2,9 +2,9 @@
 contract tests). They never touch the network or a model (AGENTS.md rule 6)."""
 
 import hashlib
-import math
 import random
 
+from lite_rag.chunking import unit as normalise
 from lite_rag.llm import Completion, Message
 from lite_rag.model_profiles import Prefixes
 from lite_rag.text import ESTIMATE_TOKEN
@@ -52,11 +52,6 @@ class FakeEmbedder:
 def _tokens(text: str) -> list[str]:
     """The same tokens the estimate counter uses (CJK per character), minus punctuation."""
     return [t for t in ESTIMATE_TOKEN.findall(text.lower()) if t.isalnum()]
-
-
-def normalise(vec: list[float]) -> list[float]:
-    norm = math.sqrt(sum(v * v for v in vec))
-    return [v / norm for v in vec] if norm else vec
 
 
 class SpreadEmbedder(FakeEmbedder):

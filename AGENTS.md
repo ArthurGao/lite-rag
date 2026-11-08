@@ -21,7 +21,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S7 — Chroma backend** (design §12; S0–S6 done 2026-11-08/09). Next: S8 close-out. llm-steward's P3 (WeKnora) is paused until S9 is done.
+**S8 — close-out** (design §12; S0–S7 done 2026-11-08/09). Next: S9 llm-steward `LiteRagProvider`. llm-steward's P3 (WeKnora) is paused until S9 is done.
 
 Decided (2026-11-08): separate public repo; library + optional HTTP service (`literag serve`, Docker image) over one
 `RagEngine`; storage is PostgreSQL + pgvector by default (vectors, own BM25 postings and the document registry in one

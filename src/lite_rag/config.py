@@ -145,6 +145,7 @@ class ContextualConfig(BaseModel):
     enabled: bool = False
     llm: "LLMConfig" = Field(default_factory=lambda: LLMConfig())
     max_doc_tokens: int = Field(default=6000, gt=0)  # longer documents: a window per chunk
+    concurrency: int = Field(default=4, gt=0)  # LLM calls at once while ingesting (not identity)
 
     def identity(self) -> dict[str, Any]:
         from lite_rag.contextual import prompt_digest  # imported late: it imports this module

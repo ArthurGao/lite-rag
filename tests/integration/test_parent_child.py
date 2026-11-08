@@ -1,7 +1,7 @@
 import psycopg
 import pytest
 
-from lite_rag.errors import ConfigError
+from lite_rag.errors import InvalidRequest
 from lite_rag.stores.pg import PgStore
 from lite_rag.testing import FakeEmbedder
 from tests.conftest import TEST_SCHEMA
@@ -69,7 +69,7 @@ def test_deleting_a_document_removes_its_parents(store: PgStore, pg: psycopg.Con
 
 def test_a_kb_refuses_another_parent_size(store: PgStore) -> None:
     _engine(store).upsert_text("kb", "d", "Policy", TEXT)
-    with pytest.raises(ConfigError, match="parent_size"):
+    with pytest.raises(InvalidRequest, match="parent_size"):
         _engine(store, parent_size=90).search("kb", "refunds")
 
 
@@ -103,5 +103,5 @@ def test_search_looks_deeper_when_children_outnumber_the_estimate(store: PgStore
 def test_top_k_below_one_is_an_error(store: PgStore) -> None:
     engine = _engine(store)
     engine.upsert_text("kb", "d", "Policy", TEXT)
-    with pytest.raises(ConfigError, match="top_k"):
+    with pytest.raises(InvalidRequest, match="top_k"):
         engine.search("kb", "refunds", top_k=0)

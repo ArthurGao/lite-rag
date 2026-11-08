@@ -55,3 +55,41 @@ def test_the_kb_identity_records_the_context_model_and_prompt() -> None:
     from lite_rag.contextual import CODE_VERSION
 
     assert prompt_digest().endswith(f".{CODE_VERSION}")  # the code that shapes contexts too
+
+
+def test_contexts_are_written_concurrently_and_returned_in_chunk_order() -> None:
+    import re
+    import threading
+    import time
+
+    from lite_rag.llm import Completion, Message
+
+    class SlowLLM:
+        """Answers with the passage it was shown, slowly, counting calls in flight."""
+
+        model_id = "fake/slow"
+
+        def __init__(self) -> None:
+            self.running = self.peak = 0
+            self._lock = threading.Lock()
+
+        def complete(self, messages: list[Message]) -> Completion:
+            with self._lock:
+                self.running += 1
+                self.peak = max(self.peak, self.running)
+            time.sleep(0.05 if "passage 0" in messages[-1].content else 0.01)  # first ends last
+            with self._lock:
+                self.running -= 1
+            passage = re.findall(r"passage \d", messages[-1].content)[-1]
+            return Completion(passage, self.model_id, {})
+
+    doc = Document("d", "Policy", " ".join(f"passage {i}." for i in range(5)))
+    chunks = [Chunk(f"d#{i}", "d", i, f"passage {i}.", i * 11, i * 11 + 10, 3) for i in range(5)]
+    llm = SlowLLM()
+    contexts = Contextualizer(llm, CharCounter(), 6000, concurrency=3).contexts(doc, chunks)
+    assert contexts == [f"passage {i}" for i in range(5)]  # in chunk order, not finishing order
+    assert llm.peak == 3
+
+    one_at_a_time = SlowLLM()
+    Contextualizer(one_at_a_time, CharCounter(), 6000).contexts(doc, chunks)
+    assert one_at_a_time.peak == 1  # the default

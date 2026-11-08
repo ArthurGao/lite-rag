@@ -219,11 +219,16 @@ class RecursiveChunker(_Base):
     space."""
 
 
+def sentences(text: str, region: Region) -> list[Region]:
+    """`region` cut into sentences (Chinese and English end marks, and line ends)."""
+    return [s for line in split_at(text, region, LINE) for s in split_at(text, line, SENTENCE)]
+
+
 class SentenceChunker(_Base):
     """Pack whole sentences (Chinese and English end marks, and line ends)."""
 
     def _pieces(self, text: str, region: Region) -> list[Region]:
-        return [s for line in split_at(text, region, LINE) for s in split_at(text, line, SENTENCE)]
+        return sentences(text, region)
 
 
 class ParagraphChunker(_Base):
@@ -317,7 +322,7 @@ class SemanticChunker(MarkdownChunker):
         ]
         flat = [p for _, pieces in sections for p in pieces]
         vectors = self._embed([text[a:b].strip() for (a, b), _ in flat]) if flat else []
-        vector_of = {region: _unit(v) for ((region, _), v) in zip(flat, vectors, strict=True)}
+        vector_of = {region: unit(v) for ((region, _), v) in zip(flat, vectors, strict=True)}
         gaps = [
             [_distance(vector_of[a[0]], vector_of[b[0]]) for a, b in pairwise(pieces)]
             for _, pieces in sections
@@ -338,15 +343,10 @@ class SemanticChunker(MarkdownChunker):
 
     def _sentences(self, text: str, region: Region) -> list[Region]:
         """Sentence pieces with some text (whitespace-only pieces carry no meaning to embed)."""
-        return [
-            s
-            for line in split_at(text, region, LINE)
-            for s in split_at(text, line, SENTENCE)
-            if text[s[0] : s[1]].strip()
-        ]
+        return [s for s in sentences(text, region) if text[s[0] : s[1]].strip()]
 
 
-def _unit(v: list[float]) -> list[float]:
+def unit(v: list[float]) -> list[float]:
     """`v` scaled to length 1 (a zero vector stays zero: as far from anything as it gets)."""
     norm = math.sqrt(sum(x * x for x in v))
     return [x / norm for x in v] if norm else v

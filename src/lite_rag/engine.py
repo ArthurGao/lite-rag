@@ -1,17 +1,23 @@
-"""`RagEngine` — the one entry point for the library, the CLI and the HTTP service (design §3).
+"""`RagRuntime` and `RagEngine` — the entry point for the library, the CLI and the HTTP service
+(design §3).
 
-An engine is bound to ONE namespace (e.g. `tenderted/tenant_42`) at construction; every knowledge
-base it touches lives inside that namespace, so one project or tenant can never read or write
-another's index — isolation is enforced here, not left to callers (design §4).
+A `RagRuntime` holds what does not depend on a namespace: settings, store, embedder, token
+counter, chunker, and models built on first use. It is built once (the server keeps one for its
+lifetime) and hands out engines.
+
+A `RagEngine` is that runtime seen from ONE namespace (e.g. `tenderted/tenant_42`): every
+knowledge base it touches lives inside that namespace, so one project or tenant can never read
+or write another's index — isolation is enforced here, not left to callers (design §4). An
+engine is cheap: one per request is fine.
 
 It also owns the index-identity rule: a kb records the embedding model, its prefixes and the
 chunker it was built with, and opening it with anything else raises (design §3.2).
 """
 
-import copy
 import hashlib
 import json
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,13 +27,21 @@ from lite_rag.chunking import build_chunker, chunk_context, embedding_text
 from lite_rag.config import Mode, Settings
 from lite_rag.contextual import Contextualizer
 from lite_rag.embedding import Embedder, build_embedder
-from lite_rag.errors import ConfigError, KbMismatch, KbNotFound, StoreError
+from lite_rag.errors import InvalidRequest, KbMismatch, KbNotFound, StoreError
 from lite_rag.fusion import rrf, weighted
 from lite_rag.llm import LLM, build_llm
 from lite_rag.loaders import doc_id_for, file_doc_id, load_file
 from lite_rag.ranking import ranked
 from lite_rag.rerank import Reranker, build_reranker
-from lite_rag.stores.base import IndexedChunk, KbInfo, KbRef, KbStats, Store, StoredChunk
+from lite_rag.stores.base import (
+    CachedStore,
+    IndexedChunk,
+    KbInfo,
+    KbRef,
+    KbStats,
+    StoredChunk,
+    check_where,
+)
 from lite_rag.stores.factory import open_store
 from lite_rag.text import build_counter, terms
 from lite_rag.types import Document, Hit
@@ -36,20 +50,13 @@ NAMESPACE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}(/[a-z0-9][a-z0-9_.-]{0,62}){
 KB_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,99}$")
 
 
-@dataclass
-class _Models:
-    """Models built on first use, shared by an engine and its `for_namespace` copies."""
-
-    reranker: Reranker | None
-    llm: LLM | None
-    context_llm: LLM | None
-
-
 @dataclass(frozen=True)
 class Upserted:
     doc_id: str
     chunks: int
-    skipped: bool  # unchanged: nothing was re-chunked or re-embedded
+    # Unchanged: nothing was re-chunked or re-embedded. Best effort: two identical upserts
+    # racing may both report False (the stored result is the same either way).
+    skipped: bool
 
 
 def content_hash(
@@ -63,62 +70,117 @@ def content_hash(
 
 def check_namespace(namespace: str | None) -> str:
     if not namespace:
-        raise ConfigError("a namespace is required (e.g. 'myproject' or 'myproject/tenant_42')")
+        raise InvalidRequest("a namespace is required (e.g. 'myproject' or 'myproject/tenant_42')")
     if not NAMESPACE.match(namespace):
-        raise ConfigError(
+        raise InvalidRequest(
             f"invalid namespace {namespace!r}: lowercase letters, digits, '_', '-', '.', "
             "up to 4 levels separated by '/'"
         )
     return namespace
 
 
-class RagEngine:
+class RagRuntime:
     def __init__(
         self,
         settings: Settings,
-        store: Store,
+        store: CachedStore,
         embedder: Embedder,
         *,
-        namespace: str,
         reranker: Reranker | None = None,
         llm: LLM | None = None,
         context_llm: LLM | None = None,
     ) -> None:
-        """`reranker` and `llm` are built from `settings` on first use when not given, so a
-        search-only engine never needs an LLM key or the rerank model."""
-        self.namespace = check_namespace(namespace)
-        self._settings = settings
-        self._store = store
-        self._embedder = embedder
-        self._models = _Models(reranker, llm, context_llm)
-        self._counter = build_counter(settings.chunking, settings.embedding)
+        """`reranker` and the LLMs are built from `settings` on first use when not given, so a
+        search-only runtime never needs an LLM key or the rerank model."""
+        self.settings = settings
+        self.store = store
+        self.embedder = embedder
+        self.counter = build_counter(settings.chunking, settings.embedding)
         # semantic chunking embeds sentences with the kb's own embedder (and its cache)
-        self._chunker = build_chunker(settings.chunking, self._counter, embedder.embed_documents)
+        self.chunker = build_chunker(settings.chunking, self.counter, embedder.embed_documents)
+        self._reranker = reranker
+        self._llm = llm
+        self._context_llm = context_llm
+        self._contextualizer: Contextualizer | None = None
+        self._lock = threading.Lock()  # each model is built once, also under concurrent requests
+
+    @classmethod
+    def from_settings(cls, settings: Settings, *, max_connections: int = 4) -> "RagRuntime":
+        """`max_connections`: the store's pool (the server passes its worker count, so no
+        request waits on the pool)."""
+        store = open_store(settings.store, settings.database_url, max_connections=max_connections)
+        try:
+            embedder = build_embedder(settings.embedding, cache=store)
+            # Built now when enabled, so a misconfigured reranker fails at startup (its model
+            # still loads on first use). The LLMs stay lazy: search needs no key.
+            reranker = build_reranker(settings.rerank) if settings.rerank.enabled else None
+            return cls(settings, store, embedder, reranker=reranker)  # builds the chunker too
+        except BaseException:
+            store.close()
+            raise
+
+    def engine(self, namespace: str) -> "RagEngine":
+        return RagEngine(self, namespace)
+
+    def warm_up(self) -> None:
+        """Load lazily built models now — jieba's dictionary (about a second), and the reranker
+        when enabled: the first request should not pay for them. The embedding model is not
+        touched: that could be a paid call on every start."""
+        terms("warm up")
+        if self.settings.rerank.enabled:
+            self.reranker().score("warm up", ["warm up"])
+
+    def health(self, deep: bool = False) -> None:
+        """Raises when the store (and, `deep`, the embedding service) cannot be reached. The
+        deep probe is a cached query embedding: free after the first call."""
+        self.store.list_kbs("lite-rag-health")
+        if deep:
+            self.embedder.embed_query("lite-rag health check")
+
+    def reranker(self) -> Reranker:
+        with self._lock:
+            if self._reranker is None:
+                self._reranker = build_reranker(self.settings.rerank)
+            return self._reranker
+
+    def llm(self) -> LLM:
+        with self._lock:
+            if self._llm is None:
+                self._llm = build_llm(self.settings.llm)
+            return self._llm
+
+    def contextualizer(self) -> Contextualizer:
+        """One for the runtime: its `concurrency` bounds the context calls of every ingest
+        running at once, not of each."""
+        with self._lock:
+            if self._contextualizer is None:
+                cfg = self.settings.chunking.contextual
+                llm = self._context_llm or build_llm(cfg.llm)
+                self._contextualizer = Contextualizer(
+                    llm, self.counter, cfg.max_doc_tokens, cfg.concurrency
+                )
+            return self._contextualizer
+
+    def close(self) -> None:
+        self.store.close()
+
+
+class RagEngine:
+    def __init__(self, runtime: RagRuntime, namespace: str) -> None:
+        self.namespace = check_namespace(namespace)
+        self.runtime = runtime
+        self._settings = runtime.settings
+        self._store = runtime.store
+        self._embedder = runtime.embedder
+        self._counter = runtime.counter
+        self._chunker = runtime.chunker
         self._ready: set[KbRef] = set()  # kbs checked against the configuration
 
     @classmethod
     def from_settings(cls, settings: Settings, namespace: str | None = None) -> "RagEngine":
-        ns = check_namespace(namespace or settings.namespace)
-        store = open_store(
-            settings.store,
-            settings.database_url,
-            # one connection per request the server runs at once: none waits on the pool
-            max_connections=max(4, settings.server.max_workers),
-        )
-        embedder = build_embedder(settings.embedding, cache=store)
-        # Built now when enabled, so a misconfigured reranker fails at startup (its model still
-        # loads on first use). The LLM stays lazy: a search-only engine needs no key.
-        reranker = build_reranker(settings.rerank) if settings.rerank.enabled else None
-        return cls(settings, store, embedder, namespace=ns, reranker=reranker)
-
-    def for_namespace(self, namespace: str) -> "RagEngine":
-        """This engine for another namespace: the same store, embedder, chunker and models
-        (built once, also when built later), its own record of the kbs it has checked. A shallow
-        copy: any per-namespace state added to the engine must be reset here too."""
-        other = copy.copy(self)
-        other.namespace = check_namespace(namespace)
-        other._ready = set()
-        return other
+        """An engine on its own runtime (the library's shortcut); `close` closes that runtime."""
+        ns = check_namespace(namespace or settings.namespace)  # before connecting to anything
+        return RagRuntime.from_settings(settings).engine(ns)
 
     def create_kb(self, kb: str) -> KbInfo:
         """Create `kb` with this engine's settings (or check an existing one against them)."""
@@ -127,22 +189,9 @@ class RagEngine:
         assert info is not None  # just created or checked
         return info
 
-    def warm_up(self) -> None:
-        """Load lazily built models now (the reranker, when enabled): the first request should
-        not pay for it."""
-        if self._settings.rerank.enabled:
-            self._get_reranker().score("warm up", ["warm up"])
-
-    def health(self, deep: bool = False) -> None:
-        """Raises when the store (and, `deep`, the embedding service) cannot be reached. The
-        deep probe is a cached query embedding: free after the first call."""
-        self._store.list_kbs(self.namespace)
-        if deep:
-            self._embedder.embed_query("lite-rag health check")
-
     def _ref(self, kb: str) -> KbRef:
         if not KB_NAME.match(kb):
-            raise ConfigError(
+            raise InvalidRequest(
                 f"invalid knowledge base name {kb!r}: lowercase letters, digits, '_', '-', '.'"
             )
         return KbRef(self.namespace, kb)
@@ -201,7 +250,7 @@ class RagEngine:
         doc = Document(doc_id, title, text, source, meta, pages)
         parents, chunks = self._chunker.split_parents(doc)
         contexts: list[str | None] = (
-            list(self._get_contextualizer().contexts(doc, chunks))
+            list(self.runtime.contextualizer().contexts(doc, chunks))
             if self._settings.chunking.contextual.enabled
             else [None] * len(chunks)
         )
@@ -250,12 +299,14 @@ class RagEngine:
     ) -> list[Hit]:
         """The best `top_k` chunks for `query` (design §5). `mode`: `vector`, `bm25` or `hybrid`
         (both, fused). `rerank` (default: config) re-scores the best `rerank.top_n` candidates
-        with a cross-encoder. `where` keeps only documents whose metadata contains those
-        key-values. Each hit carries every stage's score and rank; `score` is the final one."""
+        with a cross-encoder. `where` keeps only documents whose metadata has each key equal to
+        its scalar value. Each hit carries every stage's score and rank; `score` is the final
+        one."""
         cfg = self._settings.retrieval
+        where = check_where(where)
         k = cfg.top_k if top_k is None else top_k
         if k < 1:
-            raise ConfigError(f"top_k must be at least 1, got {k}")
+            raise InvalidRequest(f"top_k must be at least 1, got {k}")
         mode = mode or cfg.mode
         reranking = self._settings.rerank.enabled if rerank is None else rerank
         # `pool` candidates reach the end (all of them re-scored when reranking); each path
@@ -352,7 +403,7 @@ class RagEngine:
                 sources=[],
                 model_id=None,
             )
-        completion = self._get_llm().complete(prompt(question, hits))
+        completion = self.runtime.llm().complete(prompt(question, hits))
         text, citations, dropped = check_citations(completion.text, hits)
         return Answer(
             question=question,
@@ -375,23 +426,7 @@ class RagEngine:
             f"{chunk_context(stored[c].title, stored[c].heading_path)}\n{stored[c].text}"
             for c in ids
         ]
-        return ranked(dict(zip(ids, self._get_reranker().score(query, texts), strict=True)))
-
-    def _get_reranker(self) -> Reranker:
-        if self._models.reranker is None:
-            self._models.reranker = build_reranker(self._settings.rerank)
-        return self._models.reranker
-
-    def _get_contextualizer(self) -> Contextualizer:
-        cfg = self._settings.chunking.contextual
-        if self._models.context_llm is None:
-            self._models.context_llm = build_llm(cfg.llm)
-        return Contextualizer(self._models.context_llm, self._counter, cfg.max_doc_tokens)
-
-    def _get_llm(self) -> LLM:
-        if self._models.llm is None:
-            self._models.llm = build_llm(self._settings.llm)
-        return self._models.llm
+        return ranked(dict(zip(ids, self.runtime.reranker().score(query, texts), strict=True)))
 
     def _fuse(self, rankings: dict[str, list[tuple[str, float]]]) -> list[tuple[str, float]]:
         cfg = self._settings.retrieval
@@ -412,19 +447,21 @@ class RagEngine:
             raise KbNotFound.of(source, self.namespace)
         missing = self._store.count_missing_text(source_ref)
         if missing:
-            raise ConfigError(
+            raise InvalidRequest(
                 f"{missing} document(s) in {source!r} have no stored text (ingested before "
                 "lite-rag kept it): re-ingest them, then reindex"
             )
         # Created here, atomically: a kb someone else creates meanwhile is never written into
         # or deleted by this reindex.
         if not self._store.create_kb(self.kb_info(target)):
-            raise ConfigError(f"knowledge base {target!r} already exists: reindex into a new name")
+            raise InvalidRequest(
+                f"knowledge base {target!r} already exists: reindex into a new name"
+            )
         copied = 0
         try:
             for d in self._store.documents(source_ref):  # page by page: never all in memory
                 if d.text is None:  # added since the check: refuse rather than skip it
-                    raise ConfigError(f"{d.doc_id!r} in {source!r} has no stored text")
+                    raise InvalidRequest(f"{d.doc_id!r} in {source!r} has no stored text")
                 self.upsert_text(target, d.doc_id, d.title, d.text, d.metadata, d.source, d.pages)
                 copied += 1
             stats = self._store.stats(target_ref)
@@ -439,7 +476,8 @@ class RagEngine:
         return self._store.stats(self._ref(kb))
 
     def close(self) -> None:
-        self._store.close()
+        """Closes the runtime — shared by every engine it handed out."""
+        self.runtime.close()
 
 
 def _best_per_parent(

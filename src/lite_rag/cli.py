@@ -13,7 +13,7 @@ from lite_rag import __version__
 from lite_rag.chunking import chunk_context
 from lite_rag.config import Mode, Settings, load_settings
 from lite_rag.db import redact_conninfo
-from lite_rag.engine import RagEngine
+from lite_rag.engine import RagEngine, RagRuntime
 from lite_rag.errors import LiteRagError
 from lite_rag.loaders import find_files
 from lite_rag.stores.factory import evaluation_store, location, migrate_store, open_store
@@ -47,6 +47,10 @@ def _errors() -> Iterator[None]:
         _fail(str(exc))
 
 
+def _echo_json(value: Any) -> None:
+    typer.echo(json.dumps(value, indent=2, ensure_ascii=False))
+
+
 def _masked(url: str | None) -> str | None:
     return redact_conninfo(url) if url else url
 
@@ -63,7 +67,7 @@ def show_config(config: ConfigOption = None) -> None:
     settings = _settings(config)
     data = settings.model_dump(mode="json", by_alias=True)
     data["database_url"] = _masked(settings.database_url)
-    typer.echo(json.dumps(data, indent=2, ensure_ascii=False))
+    _echo_json(data)
 
 
 @app.command("migrate")
@@ -126,7 +130,7 @@ def stats(kb: KbArg, config: ConfigOption = None, namespace: NamespaceOption = N
         result = engine.stats(kb)
     if result is None:
         _fail(f"knowledge base {kb!r} does not exist")
-    typer.echo(json.dumps(asdict(result), indent=2, ensure_ascii=False))
+    _echo_json(asdict(result))
 
 
 @app.command()
@@ -156,9 +160,15 @@ def serve(
     host = host or settings.server.host
     with _errors():
         check_bind(settings, host)  # before connecting to anything
-    # The engine's own namespace is never used: every request names one.
-    with _engine(config, settings.namespace or "server") as engine, _errors():
-        run(settings, engine, host, port or settings.server.port)
+    with _errors():
+        # one store connection per request the server runs at once: none waits on the pool
+        runtime = RagRuntime.from_settings(
+            settings, max_connections=max(4, settings.server.max_workers)
+        )
+        try:
+            run(settings, runtime, host, port or settings.server.port)
+        finally:
+            runtime.close()
 
 
 key_app = typer.Typer(help="API keys for the HTTP service", no_args_is_help=True)
@@ -233,7 +243,7 @@ def search(
     with _engine(config, namespace) as engine:
         hits = engine.search(kb, query, top_k=top_k, mode=mode, rerank=rerank)
     if as_json:
-        typer.echo(json.dumps([asdict(h) for h in hits], indent=2, ensure_ascii=False))
+        _echo_json([asdict(h) for h in hits])
         return
     if not hits:
         typer.echo("no hits")
@@ -261,7 +271,7 @@ def ask(
     with _engine(config, namespace) as engine:
         answer = engine.ask(kb, question, top_k=top_k, mode=mode, rerank=rerank)
     if as_json:
-        typer.echo(json.dumps(asdict(answer), indent=2, ensure_ascii=False))
+        _echo_json(asdict(answer))
         return
     if answer.status == "no_sources":
         typer.echo("No relevant material was found in the knowledge base.")

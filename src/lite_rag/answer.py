@@ -58,19 +58,14 @@ def check_citations(text: str, hits: list[Hit]) -> tuple[str, list[Citation], li
     dropped: list[int] = []
 
     def keep_valid(match: re.Match[str]) -> str:
-        if all(1 <= int(x) <= len(hits) for x in re.findall(r"\d+", match.group(2))):
-            for n in (int(x) for x in re.findall(r"\d+", match.group(2))):
-                h = hits[n - 1]
-                cited.setdefault(n, Citation(n, h.chunk_id, h.doc_id, h.title))
+        numbers = [int(x) for x in re.findall(r"\d+", match.group(2))]
+        valid = [n for n in numbers if 1 <= n <= len(hits)]
+        for n in valid:
+            h = hits[n - 1]
+            cited.setdefault(n, Citation(n, h.chunk_id, h.doc_id, h.title))
+        if len(valid) == len(numbers):
             return match.group(0)  # all valid: left exactly as the model wrote it
-        kept = []
-        for n in (int(x) for x in re.findall(r"\d+", match.group(2))):
-            if 1 <= n <= len(hits):
-                kept.append(f"[{n}]")
-                h = hits[n - 1]
-                cited.setdefault(n, Citation(n, h.chunk_id, h.doc_id, h.title))
-            else:
-                dropped.append(n)
-        return match.group(1) + "".join(kept) if kept else ""
+        dropped.extend(n for n in numbers if n not in valid)
+        return match.group(1) + "".join(f"[{n}]" for n in valid) if valid else ""
 
     return CITATION.sub(keep_valid, text).strip(), list(cited.values()), dropped

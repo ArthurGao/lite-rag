@@ -5,8 +5,8 @@
   vectors, one collection per kb (cosine space), named from a hash of the kb key.
 - BM25 is scored in Python (`keyword.bm25`); N, n(t) and avgdl are counted over the kb's ready
   chunks, before any metadata filter — the same statistics as PgStore.
-- Metadata filters compare scalar values (str, int, float, bool) for equality: the document's
-  scalar metadata is copied onto each of its Chroma records. Anything else raises ConfigError.
+- Metadata filters compare scalar values for equality (the engine checks `where`): the
+  document's scalar metadata is copied onto each of its Chroma records.
 - Rows and vectors share no transaction. A write runs in a fixed order — SQLite rows as
   `pending`, then Chroma, then `ready`; a delete marks `deleting`, removes the vectors, then the
   rows — and reads see `ready` documents only. Opening the store removes every document left
@@ -35,10 +35,11 @@ from chromadb.config import Settings as ChromaSettings
 from chromadb.errors import NotFoundError
 
 from lite_rag.db import migration_files
-from lite_rag.errors import ConfigError, KbNotFound, StoreError
+from lite_rag.errors import KbNotFound, StoreError
 from lite_rag.keyword import Bm25Inputs, Posting, bm25
 from lite_rag.ranking import ranked
 from lite_rag.stores.base import (
+    SCALARS,
     IndexedChunk,
     KbInfo,
     KbRef,
@@ -54,7 +55,6 @@ SQLITE_FILE = "lite_rag.sqlite"
 CHROMA_DIR = "chroma"
 COLLECTION_PREFIX = "kb-"
 META_PREFIX = "m."  # document metadata on a Chroma record, apart from our own `doc_id`
-SCALARS = (str, int, float, bool)
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -99,16 +99,6 @@ def migrate_sqlite(data_dir: str | Path) -> list[str]:
 def collection_name(kb: KbRef) -> str:
     """Chroma allows [a-zA-Z0-9._-] only; a kb key has ':' and '/'."""
     return COLLECTION_PREFIX + hashlib.sha256(kb.key.encode()).hexdigest()[:40]
-
-
-def _check_where(where: dict[str, Any] | None) -> dict[str, Any]:
-    for key, value in (where or {}).items():
-        if not isinstance(value, SCALARS):
-            raise ConfigError(
-                f"metadata filter {key!r}: the chroma backend compares scalar values only"
-                " (str, int, float, bool)"
-            )
-    return where or {}
 
 
 def _chroma_where(where: dict[str, Any]) -> dict[str, Any] | None:
@@ -325,7 +315,7 @@ class ChromaStore:
     def vector_query(
         self, kb: KbRef, vector: list[float], n: int, where: dict[str, Any] | None = None
     ) -> list[tuple[str, float]]:
-        flt = _chroma_where(_check_where(where))
+        flt = _chroma_where(where or {})
         with self._lock:
             result = self._collection(kb).query(
                 query_embeddings=vector, n_results=n, where=flt, include=["distances"]
@@ -355,7 +345,7 @@ class ChromaStore:
         b: float,
         where: dict[str, Any] | None = None,
     ) -> list[tuple[str, float]]:
-        flt = _check_where(where)
+        flt = where or {}
         if not terms:
             return []
         with self._lock:
@@ -434,7 +424,7 @@ class ChromaStore:
         with self._lock:
             info = self.get_kb(kb)
             if info is None:
-                raise KbNotFound(f"knowledge base {kb.key!r} does not exist")
+                raise KbNotFound.of(kb.name, kb.namespace)
             for c in chunks:  # before anything is written
                 if len(c.vector) != info.dim:
                     raise StoreError(

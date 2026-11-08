@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from lite_rag import loaders
-from lite_rag.errors import ConfigError
+from lite_rag.errors import InvalidRequest
 from lite_rag.loaders import join_pages, load_file
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -46,7 +46,7 @@ def test_markdown_title_is_the_first_h1_and_text_files_have_no_pages(tmp_path: P
     md = tmp_path / "a.md"
     md.write_text("## Not the title\n\n# Title\n\nBody.")
     assert (load_file(md).title, load_file(md).pages) == ("Title", ())
-    with pytest.raises(ConfigError, match="unsupported file type"):
+    with pytest.raises(InvalidRequest, match="unsupported file type"):
         load_file(tmp_path / "a.rtf")
 
 

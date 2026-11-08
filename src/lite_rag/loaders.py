@@ -13,7 +13,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any, Literal
 
-from lite_rag.errors import ConfigError
+from lite_rag.errors import InvalidRequest
 from lite_rag.extras import require_extra
 
 PdfLoader = Literal["pypdf", "docling"]
@@ -59,7 +59,7 @@ def load_file(path: Path, pdf: PdfLoader = "pypdf", name: str | None = None) -> 
     stem = Path(name).stem if name else path.stem
     suffix = path.suffix.lower()
     if suffix not in SUFFIXES:
-        raise ConfigError(
+        raise InvalidRequest(
             f"{path}: unsupported file type (supported: {', '.join(sorted(SUFFIXES))})"
         )
     if suffix in TEXT_SUFFIXES:

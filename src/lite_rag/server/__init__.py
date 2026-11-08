@@ -1,5 +1,5 @@
-"""The HTTP service (design §7): `create_app` serves one `RagEngine` (and its per-namespace
-copies) over FastAPI. Extra `[server]`."""
+"""The HTTP service (design §7): `create_app` serves one `RagRuntime` (an engine per
+request, for the namespace it names) over FastAPI. Extra `[server]`."""
 
 from lite_rag.server.app import check_bind, create_app, run
 

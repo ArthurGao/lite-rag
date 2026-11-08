@@ -1,7 +1,7 @@
 import psycopg
 import pytest
 
-from lite_rag.errors import ConfigError, KbNotFound
+from lite_rag.errors import InvalidRequest, KbNotFound
 from lite_rag.stores.pg import PgStore
 from tests.conftest import TEST_SCHEMA
 from tests.integration.support import make_engine
@@ -24,7 +24,7 @@ def test_reindex_rebuilds_a_kb_under_the_current_settings(
 ) -> None:
     _fill(store, size=30)
     bigger = make_engine(store, size=80)  # another chunker: the old kb cannot be opened with it
-    with pytest.raises(ConfigError, match="built differently"):
+    with pytest.raises(InvalidRequest, match="built differently"):
         bigger.search("kb", "refunds")
 
     assert bigger.reindex("kb", "kb-80") == 2
@@ -50,7 +50,7 @@ def test_reindex_refuses_documents_stored_without_their_text(
     _fill(store, size=30)
     pg.execute(f"UPDATE {TEST_SCHEMA}.documents SET text = NULL WHERE doc_id = 'ship'")  # pre-0005
     engine = make_engine(store, size=80)
-    with pytest.raises(ConfigError, match=r"1 document.*re-ingest"):
+    with pytest.raises(InvalidRequest, match=r"1 document.*re-ingest"):
         engine.reindex("kb", "kb-80")
     with pytest.raises(KbNotFound):  # nothing half-built is left behind
         engine.search("kb-80", "refunds")
@@ -59,7 +59,7 @@ def test_reindex_refuses_documents_stored_without_their_text(
 def test_reindex_never_writes_into_an_existing_kb(store: PgStore) -> None:
     engine = _fill(store, size=30)
     engine.upsert_text("other", "x", "X", "Something else.")
-    with pytest.raises(ConfigError, match="already exists"):
+    with pytest.raises(InvalidRequest, match="already exists"):
         engine.reindex("kb", "other")
     with pytest.raises(KbNotFound):
         engine.reindex("missing", "new")
@@ -90,16 +90,6 @@ def test_a_reindex_that_fails_halfway_leaves_no_target(store: PgStore) -> None:
         engine.search("kb-80", "refunds")
 
 
-def test_documents_are_read_page_by_page(store: PgStore) -> None:
-    from lite_rag.stores.base import KbRef
-
-    engine = make_engine(store)
-    for i in range(5):
-        engine.upsert_text("kb", f"d{i}", f"T{i}", f"Text number {i}.")
-    docs = list(store.documents(KbRef("proj/tenant_1", "kb"), page=2))  # three pages
-    assert [d.doc_id for d in docs] == ["d0", "d1", "d2", "d3", "d4"]
-
-
 def test_reindex_never_takes_over_a_target_created_meanwhile(
     store: PgStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -108,7 +98,7 @@ def test_reindex_never_takes_over_a_target_created_meanwhile(
     real_get = store.get_kb
     # the race: the "does the target exist?" check runs before the other writer created it
     monkeypatch.setattr(store, "get_kb", lambda ref: None if ref.name == "kb-80" else real_get(ref))
-    with pytest.raises(ConfigError, match="already exists"):
+    with pytest.raises(InvalidRequest, match="already exists"):
         engine.reindex("kb", "kb-80")
     monkeypatch.undo()
     hits = engine.search("kb-80", "someone else", mode="bm25")

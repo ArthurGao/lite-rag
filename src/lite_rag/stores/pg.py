@@ -58,8 +58,9 @@ def _vector_text(vector: list[float]) -> str:
 def _metadata_filter(
     kb: sql.Composable, doc_id: sql.Composable, where: dict[str, Any] | None
 ) -> tuple[sql.Composable, dict[str, Any]]:
-    """`AND …` keeping rows whose document's metadata contains `where` (JSON containment: every
-    key equals its value), and its parameters. Nothing when there is no filter."""
+    """`AND …` keeping rows whose document's metadata contains `where` (JSON containment; for
+    the scalar values the engine allows, every key equals its value), and its parameters.
+    Nothing when there is no filter."""
     if not where:
         return sql.SQL(""), {}
     clause = sql.SQL(
@@ -430,7 +431,7 @@ class PgStore:
         if row is None:
             if missing_ok:
                 return None
-            raise KbNotFound(f"knowledge base {kb.key!r} does not exist")
+            raise KbNotFound.of(kb.name, kb.namespace)
         dim: int = row[0]
         return dim
 

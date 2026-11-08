@@ -7,7 +7,22 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from lite_rag.errors import InvalidRequest
 from lite_rag.types import Chunk, Document
+
+SCALARS = (str, int, float, bool)
+
+
+def check_where(where: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A metadata filter is key → scalar (str, int, float, bool), compared for equality — the
+    same rule on every backend (design §5). The engine checks it before any work; stores only
+    translate it."""
+    for key, value in (where or {}).items():
+        if not isinstance(value, SCALARS):
+            raise InvalidRequest(
+                f"metadata filter {key!r}: values must be scalars (str, int, float, bool)"
+            )
+    return where or None
 
 
 @dataclass(frozen=True)

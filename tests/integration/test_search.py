@@ -4,7 +4,7 @@ import pytest
 from psycopg import sql
 
 from lite_rag.engine import RagEngine
-from lite_rag.errors import ConfigError, KbNotFound
+from lite_rag.errors import InvalidRequest, KbNotFound
 from lite_rag.stores.base import KbRef
 from lite_rag.stores.pg import PgStore, _table, _vector_text, vector_sql
 from lite_rag.testing import FakeEmbedder, SpreadEmbedder
@@ -150,7 +150,7 @@ def test_searching_a_missing_kb_is_an_error_and_creates_nothing(store: PgStore) 
 def test_search_refuses_a_kb_built_with_another_model(store: PgStore) -> None:
     _filled(store)
     other = make_engine(store, FakeEmbedder(dim=8, model="other"), size=200)
-    with pytest.raises(ConfigError, match="embedding_model"):
+    with pytest.raises(InvalidRequest, match="embedding_model"):
         other.search("kb", "refunds")
 
 
@@ -282,3 +282,11 @@ def test_chunks_deleted_mid_search_are_replaced_by_the_next_candidates(
     monkeypatch.setattr(store, "chunks", without_first_two)
     hits = engine.search("kb", "refunds seven days", top_k=2)
     assert len(hits) == 2 and not {h.doc_id for h in hits} & set(first)
+
+
+def test_warm_up_loads_jieba_so_the_first_search_does_not(store: PgStore) -> None:
+    from lite_rag import text
+
+    text._jieba.cache_clear()
+    make_engine(store).runtime.warm_up()
+    assert text._jieba.cache_info().currsize == 1

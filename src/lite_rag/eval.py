@@ -27,7 +27,7 @@ from typing import Any
 
 from lite_rag.config import EmbeddingConfig, Settings
 from lite_rag.embedding import Embedder, build_embedder
-from lite_rag.engine import RagEngine
+from lite_rag.engine import RagEngine, RagRuntime
 from lite_rag.errors import ConfigError, StoreError
 from lite_rag.loaders import PdfLoader, find_files, load_file
 from lite_rag.rerank import Reranker, build_reranker
@@ -242,7 +242,7 @@ def run_configs(
                 if rkey not in rerankers:
                     rerankers[rkey] = build_reranker(settings.rerank)
                 reranker = rerankers[rkey]
-            engine = RagEngine(settings, store, embedder, namespace=NAMESPACE, reranker=reranker)
+            engine = RagRuntime(settings, store, embedder, reranker=reranker).engine(NAMESPACE)
             if kb not in built:
                 built.add(kb)  # before the build: a half-built kb is cleaned up too
                 engine.delete_kb(kb)  # a leftover from an interrupted run would mix builds

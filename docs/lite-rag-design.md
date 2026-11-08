@@ -48,10 +48,11 @@ lite-rag 是一个**可读、可改、可单独部署**的轻量 RAG 引擎，�
 
 `Store` 把向量和倒排放在同一个接口里，这样 PG 后端能在一个事务里完成一篇文档的所有写入。BM25 的公式写在 `keyword.py` 里；store 只提供一个 `bm25_query`，内部决定在哪里打分：PgStore 可以在 SQL 里打分（`store.bm25_impl: sql`，默认），也可以取回 posting 后交给 `keyword.bm25` 打分（`python`）。两种方式共用同一段统计量 SQL。Chroma 后端只用 Python 方式。
 
-`RagEngine` 是库的入口，HTTP 服务调用的也是它：
+库的入口有两层（S8 起）：`RagRuntime` 持有与 namespace 无关的东西（配置、store、embedder、token 计数器、chunker，以及首次用到时才建的 reranker / LLM），只建一次；`runtime.engine(namespace)` 返回绑定一个 namespace 的 `RagEngine`，很轻，每个请求建一个也没问题。HTTP 服务持有一个 runtime。只用一个 namespace 的库调用方可以直接用 `RagEngine.from_settings(settings, namespace)`，它自带一个 runtime，`close()` 时一并关闭。
 
 ```python
-engine = RagEngine.from_config(cfg)
+runtime = RagRuntime.from_settings(settings)   # 服务端：max_connections=工作线程数
+engine = runtime.engine("tenderted/tenant_42")  # 或 RagEngine.from_settings(settings, namespace)
 engine.ingest(kb, path)                                   # 文件 → 文档 id
 engine.upsert_text(kb, doc_id, title, text, metadata={})  # 已存在则整篇替换
 engine.delete(kb, doc_id)
@@ -146,7 +147,7 @@ engine.stats(kb)
   - `chroma/`：`PersistentClient`，关闭遥测（`anonymized_telemetry=False`）；每个 kb 一个 collection（cosine），名字取 kb 键的哈希（Chroma 只允许 `[a-zA-Z0-9._-]`）；
   - `lite_rag.sqlite`：和 PG 后端同样的 `kbs`、`documents`、`chunks`、`parents`、`postings` 和向量缓存，迁移文件在 `migrations_sqlite/`；JSON 存 TEXT 列。N 和 avgdl 每次查询时从 `chunks` 现算，不在 `kbs` 上维护计数。
 - **BM25** 只用 Python 实现（`keyword.bm25`），默认 `bm25_impl: python`，配 `sql` 会在加载配置时报错。统计量和 PG 一样取整个 kb、在元数据过滤之前计算。
-- **元数据过滤**：文档元数据里的标量值（str、int、float、bool）复制到它每条 Chroma 记录上，过滤按相等比较（Chroma `$eq` / `$and`）；bool 不等于数字，两条检索路径一致。过滤值不是标量会报 `ConfigError`（PG 后端用 JSON 包含，支持任意值）。
+- **元数据过滤**：文档元数据里的标量值（str、int、float、bool）复制到它每条 Chroma 记录上，过滤按相等比较（Chroma `$eq` / `$and`）；bool 不等于数字，两条检索路径一致。过滤值必须是标量，这条规则对两个后端一样，由引擎在开始检索前检查（见第 5 节）。
 - **写入不在一个事务里**：向量在 Chroma，其余在 SQLite。文档带状态：
   - upsert：一个 SQLite 事务里删旧版本、写入新行，状态 `pending` → Chroma 删旧向量、分批写新向量（每批不超过 `get_max_batch_size()`）→ 标记 `ready`；
   - 删除：标记 `deleting` → 删 Chroma 向量 → 删 SQLite 行；
@@ -178,7 +179,7 @@ engine.stats(kb)
 - **融合**：默认用 RRF，`score = Σ 1/(k + rank)`，`k=60`。也可以选加权融合：两路分数先各自做 min-max 归一化，再按权重相加。
 - **Rerank**（可选）：取融合后的前 n 条，用 cross-encoder 对每个 `(query, chunk)` 对重新打分，再取前 k 条。
 - **模式**：`vector`、`bm25`、`hybrid`。每个 `Hit` 都带各阶段的分数 `scores={vector, bm25, fused, rerank}` 和排名，方便对比和调试。
-- **过滤**：先按 namespace 和 kb 隔离；`where` 支持对元数据做等值过滤，向量和 BM25 两路都会生效。
+- **过滤**：先按 namespace 和 kb 隔离；`where` 是"键 → 标量值"（str、int、float、bool）的等值过滤，向量和 BM25 两路都会生效；bool 不等于数字。值不是标量（列表、对象、null）会报 `InvalidRequest`（400），在嵌入查询之前就检查，两个后端规则相同（S8 定，2026-11-09）。
 
 ## 6. 生成
 
@@ -220,9 +221,9 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 | `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer（带引用和出处） |
 
 - **鉴权**（S6，KB web-authz：默认拒绝）：`Authorization: Bearer lrk_<prefix>_<secret>`。服务端只保存 key 的 `sha256`，配置在 `server.keys`（YAML，或 `LITERAG_SERVER__KEYS` 设为 JSON 列表）。每个 key 有 `namespaces`、`kbs` 两组 glob（`*` 可以跨 `/`，例如 `steward/*`）和 `mode`（`read` / `write`）；没有默认 namespace，不写就没有访问权限。`literag key create` 生成新 key，只打印一次，同时给出要加进配置的那一条；**没有任何 HTTP 路由能创建 key**。不配 key 时服务完全开放，所以 `serve` 只允许绑定回环地址。
-- **namespace**：每个请求用 `X-LiteRag-Namespace` 头指定（namespace 本身含 `/`，放进路径不干净）。缺这个头返回 400；key 不覆盖这个 namespace 或这个 kb 返回 403，只读 key 写入也是 403；没有 key 或 key 不认识返回 401，带 `WWW-Authenticate: Bearer`。服务端为每个 namespace 建一个引擎副本，共用 store、embedder、chunker 和模型（`RagEngine.for_namespace`）。
+- **namespace**：每个请求用 `X-LiteRag-Namespace` 头指定（namespace 本身含 `/`，放进路径不干净）。缺这个头返回 400；key 不覆盖这个 namespace 或这个 kb 返回 403，只读 key 写入也是 403；没有 key 或 key 不认识返回 401，带 `WWW-Authenticate: Bearer`。服务端持有一个 `RagRuntime`，每个请求用 `runtime.engine(namespace)` 取一个引擎，共用 store、embedder、chunker 和模型。
 - **有意不加鉴权的路径**只有 `GET /health`（`?deep=true` 时还会 embed 一条缓存过的探测查询）。
-- **错误格式**：RFC 9457 Problem Details（`application/problem+json`）：`KbNotFound` 404、kb 配置不一致（`KbMismatch`）409、其他 `ConfigError` 400、请求校验失败 422、embedding / LLM 失败 502、存储失败 503。上游失败的细节只写日志，不返回给客户端（里面可能有地址或供应商的报错原文）。
+- **错误格式**：RFC 9457 Problem Details（`application/problem+json`）：`KbNotFound` / `DocumentNotFound` 404、kb 配置不一致（`KbMismatch`）409、调用方的错误（`InvalidRequest`：名字、参数、文件类型、过滤值）400、请求校验失败 422、embedding / LLM 失败 502、存储失败 503、服务自身配置错误（`ConfigError`：extra 没装、API key 没设、模型不存在）500。上游失败和服务配置错误的细节只写日志，不返回给客户端（里面可能有地址、供应商的报错原文或环境变量名）。
 - **请求体上限**：所有请求在解析之前就按大小检查（JSON `server.max_body_mb`，默认 10；上传 `server.max_upload_mb`），超过返回 413。开放模式（不配 key）只接受本机的 Host（防 DNS rebinding）。`GET /v1/kbs` 只列出 key 的 `kbs` 范围之内的 kb。
 - **并发**：处理函数都是同步的，FastAPI 放进线程池执行，线程数由 `server.max_workers`（默认 8）限制；启用 rerank 时启动阶段先加载模型。
 - **上传**：`POST /v1/kbs/{kb}/files`（multipart，`file` 加可选的 `doc_id`；默认 `file:<sha256(文件名)>`，同名文件再传就是替换），大小上限 `server.max_upload_mb`（默认 20）。
@@ -323,10 +324,42 @@ lite-rag/
   - 决定（用户 2026-11-08 选定）：namespace 放在请求头，key 按 glob 限定范围；documents 表存原文以支持 reindex；镜像只构建不推送；所有 kb 沿用服务自己的配置（按 kb 单独配置留到以后）。
   - **reindex**：迁移 0005 给 `documents` 加 `text`、`pages`。`literag reindex <kb> --into <新 kb>` 用当前配置从原文重建到一个新名字，原 kb 不动，切换就是让客户端改用新名字（就地替换要给所有 kb 外键加 `ON UPDATE CASCADE`，暂不做）。目标已存在、或有文档没有原文（0005 之前写入）都直接拒绝，一条也不写；中途失败会删掉建了一半的目标。
   - 不在 S6 做：按 kb 单独配置；就地 reindex；向量与 BM25 两路并行（检索现在约 4 ms）；发布镜像。
-  - **收尾 /simplify（2026-11-08）**，改了：错误类自己带 HTTP 状态和"能否把信息返回给客户端"（`status` / `expose`），服务端只剩一个处理函数，不再依赖按顺序排列的映射表；`KbNotFound.of()` 统一"kb 不存在"的措辞；上传走 `RagEngine.ingest(doc_id=, source=)`，文档 id 规则只在 `loaders.doc_id_for` 一处，上传边写临时文件边计数，超过上限立即停；检索参数只定义一次；鉴权依赖改为 async、只返回引擎，每个请求现建一个 namespace 副本（浅拷贝，代价与查字典相当），不再有调用方能撑大的缓存；"没有 key 只能绑回环地址"由 `server.check_bind` 负责（`run()` 和 CLI 都经过它）；连接池大小与 `server.max_workers` 一致；reindex 先用一条 SQL 数缺原文的文档，再按 `doc_id` 分页读取，不把整个 kb 的原文读进内存。没改的：把引擎拆成"不绑 namespace 的运行时 + 按 namespace 的视图"（改动超出本阶段；`for_namespace` 的注释写明新增按 namespace 的状态时必须同样重置）；`create_kb` 多查一次 kb 行（低频操作）。
+  - **收尾 /simplify（2026-11-08）**，改了：错误类自己带 HTTP 状态和"能否把信息返回给客户端"（`status` / `expose`），服务端只剩一个处理函数，不再依赖按顺序排列的映射表；`KbNotFound.of()` 统一"kb 不存在"的措辞；上传走 `RagEngine.ingest(doc_id=, source=)`，文档 id 规则只在 `loaders.doc_id_for` 一处，上传边写临时文件边计数，超过上限立即停；检索参数只定义一次；鉴权依赖改为 async、只返回引擎，每个请求现建一个 namespace 副本（浅拷贝，代价与查字典相当），不再有调用方能撑大的缓存；"没有 key 只能绑回环地址"由 `server.check_bind` 负责（`run()` 和 CLI 都经过它）；连接池大小与 `server.max_workers` 一致；reindex 先用一条 SQL 数缺原文的文档，再按 `doc_id` 分页读取，不把整个 kb 的原文读进内存。没改的：把引擎拆成"不绑 namespace 的运行时 + 按 namespace 的视图"（改动超出本阶段；S8 已拆成 `RagRuntime` + `RagEngine`）；`create_kb` 多查一次 kb 行（低频操作）。
   - **Codex review（2026-11-08）**，5 条都成立并已修复，各有先红后绿的回归测试：上传大小上限原先在路由里才检查，而 FastAPI 在路由运行前已经把整个 multipart 请求读完并落盘，现在由 ASGI 中间件在解析前按 `Content-Length` 拒绝、没有长度时边收边数，返回 413（上限另加 8 KiB 给 multipart 边界）；reindex 先查"目标不存在"再写入，中间被别人建了同名 kb 就会写进去、失败时还会删掉它，现在用一条 `INSERT … ON CONFLICT DO NOTHING` 原子地创建目标，没建成就拒绝；上传报错原样带出客户端的文件名，文件类型不支持时甚至带出服务器上的临时路径，现在一律是固定措辞；不返回给客户端的上游错误写日志前去掉 URL 里的凭据和 `password=`；CI 冒烟测试在服务一直没就绪时也会继续往下跑，现在超时即失败，并检查容器仍在运行。Codex 未发现能越过 namespace 或 kb 授权的路径。
   - **提交后安全审查（2026-11-09）**，3 条都成立，单独修复：不配 key 的开放模式只靠绑定回环地址，但浏览器里的网页可以用 DNS rebinding 以自己的域名访问回环地址，现在开放模式只接受 `localhost`、`127.0.0.1`、`[::1]` 这几个 Host（Starlette `TrustedHostMiddleware`）；请求体上限原来只管上传，JSON 请求体没有上限，而 FastAPI 在鉴权之前就会读完请求体，现在所有请求都有上限（`server.max_body_mb`，默认 10，上传仍用 `max_upload_mb`），超过返回 413；`GET /v1/kbs` 原来列出 namespace 下全部 kb，会把 key 的 `kbs` 范围之外的名字也告诉调用方，现在只列 key 能访问的。
   - 端到端（`deploy/compose.yaml`，宿主机 Ollama）发现镜像里没有 `pdf` extra，上传 PDF 会失败；镜像现在带 `server` 和 `pdf`（443 MB）。docling 会带进几 GB 的 torch，不放进镜像，要用就自己构建。
+- S8 收尾（2026-11-09）：
+  - 删掉两条只跑 PG、与合约测试重复的旧用例（`test_delete_kb_removes_everything`、`test_documents_are_read_page_by_page`），用户 2026-11-09 决定。
+  - **用户决定的三处改动**：
+    - 引擎拆成 `RagRuntime`（只建一次，持有 store、embedder、chunker 和模型）和按 namespace 的 `RagEngine`。去掉了 `for_namespace` 的浅拷贝、`serve` 编造的 `server` namespace，以及 `from_settings`、eval、测试里三份重复的组装代码；连接池大小由 `serve` 传入，不再从核心读服务端配置。模型在锁里懒加载，并发请求只建一次。
+    - 元数据过滤两个后端统一为"标量等值"，由引擎在嵌入查询之前检查（`stores.base.check_where`）。
+    - 错误类拆开：`InvalidRequest`（400，返回信息）是调用方的错；`ConfigError` 改为服务自身的配置错误（500，只写日志）。
+  - **/simplify 改了**：
+    - 前缀查找只留 `model_profiles.prefixes_for` 一处；
+    - 向量归一化只留 `chunking.unit` 一处；
+    - 句子切分只留 `chunking.sentences` 一处；
+    - 引用检查只解析一次编号；
+    - CLI 输出 JSON 用一个 helper；
+    - 回环地址只列一遍；
+    - store 里"kb 不存在"统一用 `KbNotFound.of`；
+    - `warm_up` 也预加载 jieba 词典（约 1 秒）；embedding 模型不预加载，以免每次启动都调用一次可能收费的 API。
+  - **contextual 改为并发**：`chunking.contextual.concurrency`（默认 4，不进 kb 身份）。一个 runtime 只有一个 contextualizer，用信号量限制同时进行的 LLM 调用总数，服务端并发摄取时也不会成倍增加（Codex 指出）。
+  - **/simplify 没改的**：
+    - pg 和 chroma 共用行编码 / 分页 helper：SQL 和 JSON 编码各不相同，拆出来反而把列名和语句分开；
+    - 去掉 `count_missing_text`：去掉后，失败会在部分文档重新嵌入之后才发生；
+    - eval 只设一次 schema：`--schema` 经过 `load_settings` 才有合法性校验；
+    - 统一 content hash 与 eval kb 名的哈希：content hash 已存进库，改格式会让所有文档被当成变化；
+    - store 后端注册表：只有两个后端；
+    - LLM provider 注册表；
+    - 按 id 统一 Chunker 协议；
+    - PG 读操作 autocommit、查询向量的进程内 LRU、向量与 BM25 并行、Chroma 读锁、在 SQLite 上维护 N / avgdl 计数：都只在大语料或高并发时才有收益，记在这里，按需再做。
+  - **Codex review（整个库，2026-11-09）**：
+    - 上传上限按路径后缀 `/files` 判断，任何以它结尾的路径都能拿到更大的上限：改为精确匹配 `/v1/kbs/{kb}/files`。
+    - contextual 线程数会随请求数成倍增加：改为共享的信号量。
+    - 删除不存在的文档时，报错说的是 kb 不存在：新增 `DocumentNotFound`。
+    - 两个相同内容的并发 upsert 可能都返回 `skipped=False`：存储结果一样，只在 `Upserted.skipped` 注明这是尽力而为。
+    - 不成立的一条：Codex 说"按 kb 限定的写 key 能通过 `PUT /v1/kbs` 建出范围外的 kb"，但并没有不带 kb 的建库路由，`PUT /v1/kbs/{kb}` 会检查 glob。补了回归测试（`test_a_write_key_cannot_create_or_write_kbs_outside_its_globs`），变异验证能抓到。
+  - **Codex 第二轮（S8 改动之后）**：一条成立并已修复：`RagRuntime.from_settings` 只在 embedder / reranker 构建失败时关闭 store，构建 chunker（在 `RagRuntime.__init__` 里）失败时 store 不会关；现在整个构建都在同一个 `try` 里，有先红后绿的回归测试。其余没有发现问题。
 - S7 实现说明（2026-11-09）：
   - Store 合约测试 `tests/contract/`：`store` fixture 按 `pg`、`chroma` 参数化，只经过 `Store` / `VectorCache` 接口（kb、文档、chunk、向量与 BM25 查询、向量缓存），另有几条引擎级用例（三种检索模式、过滤、parent_child、reindex）。两个后端共用一个 Protocol `CachedStore`；`stores/factory.py` 按 `store.backend` 打开和迁移。
   - Chroma 专属测试（`tests/integration/test_chroma.py`）：在每个步骤边界模拟崩溃（不触发 `except Exception` 的清理），确认崩溃后文档不可见、重新打开后两边都清理干净、能重新摄取；还测了失败时立即清理、清理也失败时留到下次打开、分批写入、过滤限制。

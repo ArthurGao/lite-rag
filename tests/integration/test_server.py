@@ -10,7 +10,7 @@ from lite_rag.config import ApiKeyConfig, load_settings
 from lite_rag.server import create_app
 from lite_rag.server.auth import new_key
 from lite_rag.stores.pg import PgStore
-from tests.integration.support import CHUNKING, make_engine
+from tests.integration.support import CHUNKING, make_engine, make_runtime
 
 NS = "steward/1"
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -36,7 +36,7 @@ def client(store: PgStore, keys: dict[str, str]) -> Iterator[TestClient]:
         for ns, kbs, mode in [scopes[n]]
     ]
     settings = load_settings(chunking=CHUNKING, server={"keys": [e.model_dump() for e in entries]})
-    engine = make_engine(store, namespace="server")
+    engine = make_runtime(store)
     with TestClient(create_app(settings, engine)) as c:
         yield c
 
@@ -158,7 +158,7 @@ def test_ask_answers_through_the_api(store: PgStore, keys: dict[str, str]) -> No
     from lite_rag.testing import FakeLLM
 
     settings = load_settings(chunking=CHUNKING)  # no keys: open (loopback only, see serve)
-    engine = make_engine(store, namespace="server", llm=FakeLLM(reply="Seven days [1]."))
+    engine = make_runtime(store, llm=FakeLLM(reply="Seven days [1]."))
     with TestClient(create_app(settings, engine), base_url="http://localhost") as c:  # open mode
         h = {"X-LiteRag-Namespace": NS}
         c.put(
@@ -199,9 +199,7 @@ def test_an_upload_over_the_limit_is_refused_before_it_is_parsed(
     reached: list[str] = []
     monkeypatch.setattr(RagEngine, "ingest", lambda *a, **k: reached.append("ingest"))
     settings = load_settings(chunking=CHUNKING, server={"max_upload_mb": 0.001})  # ~1 KB
-    with TestClient(
-        create_app(settings, make_engine(store, namespace="server")), base_url="http://localhost"
-    ) as c:
+    with TestClient(create_app(settings, make_runtime(store)), base_url="http://localhost") as c:
         big = ("big.md", b"# Big\n\n" + b"x " * 2000, "text/markdown")
         r = c.post("/v1/kbs/c-1/files", headers={"X-LiteRag-Namespace": NS}, files={"file": big})
     assert r.status_code == 413 and r.headers["content-type"] == "application/problem+json"
@@ -235,9 +233,7 @@ def test_the_same_file_name_replaces_the_same_document(
 
 def test_the_body_limit_acts_before_any_route_code(store: PgStore) -> None:
     settings = load_settings(chunking=CHUNKING, server={"max_upload_mb": 0.001})  # ~1 KB
-    with TestClient(
-        create_app(settings, make_engine(store, namespace="server")), base_url="http://localhost"
-    ) as c:
+    with TestClient(create_app(settings, make_runtime(store)), base_url="http://localhost") as c:
         big = ("big.md", b"x " * 20_000, "text/markdown")  # 40 KB: over limit + overhead
         r = c.post("/v1/kbs/c-1/files", files={"file": big})  # no namespace header at all
     # 413, not the 400 the route's dependency would give: nothing ran, nothing was parsed
@@ -248,10 +244,11 @@ def test_an_open_server_only_answers_to_localhost_host_names(store: PgStore) -> 
     """Open mode (no keys) relies on binding loopback; a DNS-rebinding page reaches loopback
     with its own host name, so any other Host is refused."""
     settings = load_settings(chunking=CHUNKING)  # no keys
-    app = create_app(settings, make_engine(store, namespace="server"))
+    app = create_app(settings, make_runtime(store))
     with TestClient(app, base_url="http://localhost:8700") as c:
         assert c.get("/health").status_code == 200
         assert c.get("/health", headers={"Host": "127.0.0.1:8700"}).status_code == 200
+        assert c.get("/health", headers={"Host": "[::1]:8700"}).status_code == 200
         assert c.get("/health", headers={"Host": "evil.example:8700"}).status_code == 400
 
 
@@ -259,9 +256,7 @@ def test_a_json_body_over_the_limit_is_refused_before_authentication(
     store: PgStore,
 ) -> None:
     settings = load_settings(chunking=CHUNKING, server={"max_body_mb": 0.001, "keys": []})
-    with TestClient(
-        create_app(settings, make_engine(store, namespace="server")), base_url="http://localhost"
-    ) as c:
+    with TestClient(create_app(settings, make_runtime(store)), base_url="http://localhost") as c:
         r = c.put("/v1/kbs/c-1/documents/big", json={"title": "t", "text": "x" * 50_000})
     assert r.status_code == 413 and r.json()["title"] == "TooLarge"
 
@@ -272,3 +267,61 @@ def test_listing_shows_only_the_kbs_a_key_may_see(client: TestClient, keys: dict
     listed = client.get("/v1/kbs", headers=_h(keys["reader"])).json()["kbs"]  # kbs: ["c-*"]
     assert listed == ["c-1"]
     assert client.get("/v1/kbs", headers=_h(keys["writer"])).json()["kbs"] == ["c-1", "faq"]
+
+
+def test_a_server_misconfiguration_is_a_500_without_its_detail(
+    store: PgStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator forgot the LLM key: not the caller's fault (not a 400), and the env var name
+    stays in the log. A caller's own mistake still gets a 400 that says what is wrong."""
+    from lite_rag.embedding import CachingEmbedder
+    from lite_rag.engine import RagRuntime
+    from lite_rag.testing import FakeEmbedder
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    settings = load_settings(chunking=CHUNKING, llm={"provider": "openai", "model": "gpt-x"})
+    runtime = RagRuntime(settings, store, CachingEmbedder(FakeEmbedder(dim=8), store))
+    with TestClient(create_app(settings, runtime), base_url="http://localhost") as c:
+        h = {"X-LiteRag-Namespace": NS}
+        c.put("/v1/kbs/c-1/documents/r", headers=h, json={"title": "R", "text": "Refunds."})
+        r = c.post("/v1/kbs/c-1/ask", headers=h, json={"question": "refunds?"})
+        assert r.status_code == 500 and "OPENAI_API_KEY" not in r.text
+        bad = c.post("/v1/kbs/BAD/search", headers=h, json={"query": "x"})
+        assert bad.status_code == 400 and "invalid knowledge base name" in bad.json()["detail"]
+
+
+def test_a_write_key_cannot_create_or_write_kbs_outside_its_globs(store: PgStore) -> None:
+    from lite_rag.server.auth import key_hash
+
+    token = new_key()[0]
+    scoped = ApiKeyConfig(
+        name="scoped", sha256=key_hash(token), namespaces=["steward/*"], kbs=["c-*"], mode="write"
+    )
+    settings = load_settings(chunking=CHUNKING, server={"keys": [scoped.model_dump()]})
+    with TestClient(create_app(settings, make_runtime(store))) as c:
+        h = _h(token)
+        assert c.put("/v1/kbs/c-2", headers=h).status_code == 200
+        assert c.put("/v1/kbs/faq", headers=h).status_code == 403
+        doc = {"title": "T", "text": "x"}
+        assert c.put("/v1/kbs/faq/documents/d", headers=h, json=doc).status_code == 403
+        assert c.put("/v1/kbs/c-2/documents/d", headers=h, json=doc).status_code == 200
+
+
+def test_only_the_upload_route_gets_the_upload_limit(store: PgStore) -> None:
+    settings = load_settings(
+        chunking=CHUNKING, server={"max_body_mb": 0.001, "max_upload_mb": 1, "keys": []}
+    )
+    with TestClient(create_app(settings, make_runtime(store)), base_url="http://localhost") as c:
+        body = b"x" * 5000  # over max_body_mb, under the upload limit
+        for path in ("/anything/files", "/v1/kbs/a/b/files", "/v1/kbs/c-1/files/x"):
+            assert c.post(path, content=body).status_code == 413, path
+
+
+def test_a_missing_document_is_a_404_that_names_the_document(store: PgStore) -> None:
+    settings = load_settings(chunking=CHUNKING)
+    with TestClient(create_app(settings, make_runtime(store)), base_url="http://localhost") as c:
+        h = {"X-LiteRag-Namespace": NS}
+        c.put("/v1/kbs/c-1", headers=h)
+        r = c.delete("/v1/kbs/c-1/documents/nope", headers=h)
+    assert r.status_code == 404
+    assert r.json()["title"] == "DocumentNotFound" and "'nope'" in r.json()["detail"]

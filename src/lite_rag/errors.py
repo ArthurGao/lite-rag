@@ -14,21 +14,28 @@ class LiteRagError(Exception):
     expose: ClassVar[bool] = False
 
 
-class ConfigError(LiteRagError):
-    """The configuration is invalid or does not match what a knowledge base was built with."""
+class InvalidRequest(LiteRagError):
+    """The caller asked for something invalid: a bad name, argument, file type or filter, or a
+    kb that conflicts with the request. The caller can fix it, so the message is shown."""
 
     status = 400
     expose = True
 
 
-class KbMismatch(ConfigError):
+class ConfigError(LiteRagError):
+    """The service's own configuration is wrong or incomplete — an extra not installed, an API
+    key not set, an unknown model. The operator's problem, not the caller's: over HTTP a 500
+    whose message (naming env vars and extras) is logged, not returned. The CLI prints it."""
+
+
+class KbMismatch(InvalidRequest):
     """A knowledge base exists but was built with other settings (model, prefixes, chunker)."""
 
     status = 409
 
 
 class KbNotFound(LiteRagError):
-    """The knowledge base (or a document in it) does not exist. Reads never create one."""
+    """The knowledge base does not exist. Reads never create one."""
 
     status = 404
     expose = True
@@ -36,6 +43,13 @@ class KbNotFound(LiteRagError):
     @classmethod
     def of(cls, kb: str, namespace: str) -> "KbNotFound":
         return cls(f"knowledge base {kb!r} does not exist in {namespace!r}")
+
+
+class DocumentNotFound(LiteRagError):
+    """The document does not exist in the knowledge base."""
+
+    status = 404
+    expose = True
 
 
 class TooLarge(LiteRagError):

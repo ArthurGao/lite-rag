@@ -19,7 +19,7 @@ import httpx2
 from lite_rag.config import OLLAMA_URL, EmbeddingConfig
 from lite_rag.errors import ConfigError, LiteRagError
 from lite_rag.extras import api_key, require_extra
-from lite_rag.model_profiles import Prefixes, profile_for
+from lite_rag.model_profiles import Prefixes, prefixes_for
 from lite_rag.stores.base import VectorCache
 from lite_rag.types import model_id
 
@@ -64,10 +64,6 @@ def _too_large(exc: BaseException | None) -> bool:
     return isinstance(exc, httpx2.HTTPStatusError) and exc.response.status_code in (400, 413)
 
 
-def _profile_prefixes(config: EmbeddingConfig) -> Prefixes:
-    return profile_for(config.model, config.query_prefix, config.document_prefix).prefixes
-
-
 class _Prefixing:
     """Adds the profile's prefixes (part of the index identity), then delegates to `_embed`: the
     one place every embedder writes documents and queries the way its model needs."""
@@ -77,7 +73,7 @@ class _Prefixing:
     def __init__(self, config: EmbeddingConfig) -> None:
         self._config = config
         self.model = config.model
-        self.prefixes = _profile_prefixes(config)
+        self.prefixes = prefixes_for(config.model, config.query_prefix, config.document_prefix)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._embed([self.prefixes.document + t for t in texts], "document")

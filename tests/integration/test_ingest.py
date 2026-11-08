@@ -5,7 +5,7 @@ import psycopg
 import pytest
 
 from lite_rag.embedding import CachingEmbedder
-from lite_rag.errors import ConfigError
+from lite_rag.errors import ConfigError, InvalidRequest
 from lite_rag.model_profiles import Prefixes
 from lite_rag.stores.base import KbRef
 from lite_rag.stores.pg import PgStore
@@ -144,20 +144,20 @@ def test_a_failure_mid_write_keeps_the_old_version(
 def test_a_kb_refuses_another_embedding_model(store: PgStore) -> None:
     make_engine(store, FakeEmbedder(dim=8)).upsert_text("kb", "d1", "t", DOC_V1)
     other = make_engine(store, FakeEmbedder(dim=8, model="another-model"))
-    with pytest.raises(ConfigError, match="embedding_model: built with 'fake-embedder'"):
+    with pytest.raises(InvalidRequest, match="embedding_model: built with 'fake-embedder'"):
         other.upsert_text("kb", "d2", "t", "x")
 
 
 def test_a_kb_refuses_another_chunker(store: PgStore) -> None:
     make_engine(store).upsert_text("kb", "d1", "t", DOC_V1)
-    with pytest.raises(ConfigError, match="chunker: built with"):
+    with pytest.raises(InvalidRequest, match="chunker: built with"):
         make_engine(store, size=80).upsert_text("kb", "d2", "t", "x")
 
 
 def test_a_kb_refuses_another_document_prefix(store: PgStore) -> None:
     make_engine(store, FakeEmbedder(dim=8)).upsert_text("kb", "d1", "t", DOC_V1)
     prefixed = FakeEmbedder(dim=8, prefixes=Prefixes(document="passage: "))
-    with pytest.raises(ConfigError, match="document_prefix: built with ''"):
+    with pytest.raises(InvalidRequest, match="document_prefix: built with ''"):
         make_engine(store, prefixed).upsert_text("kb", "d2", "t", "x")
 
 
@@ -168,15 +168,6 @@ def test_kbs_with_different_dimensions_live_side_by_side(
     make_engine(store, FakeEmbedder(dim=16)).upsert_text("large", "d", "t", DOC_V1)
     assert _count(pg, "embeddings_8", KbRef(NS, "small")) == 2
     assert _count(pg, "embeddings_16", KbRef(NS, "large")) == 2
-
-
-def test_delete_kb_removes_everything(store: PgStore, pg: psycopg.Connection) -> None:
-    engine = make_engine(store)
-    engine.upsert_text("kb", "d1", "Policy", DOC_V1)
-    assert engine.delete_kb("kb") is True
-    assert _count(pg, "kbs", column="name") == 0
-    for table in ("documents", "chunks", "postings", "embeddings_8"):
-        assert _count(pg, table) == 0, table
 
 
 def test_ingest_a_markdown_file_by_path(
@@ -222,12 +213,12 @@ def test_namespaces_never_see_each_other(store: PgStore) -> None:
 
 @pytest.mark.parametrize("bad", ["", "Proj", "a b", "../x", "a:b", "a/b/c/d/e"])
 def test_an_invalid_namespace_is_refused(store: PgStore, bad: str) -> None:
-    with pytest.raises(ConfigError, match="namespace"):
+    with pytest.raises(InvalidRequest, match="namespace"):
         make_engine(store, namespace=bad)
 
 
 def test_a_kb_name_cannot_smuggle_a_namespace(store: PgStore) -> None:
-    with pytest.raises(ConfigError, match="invalid knowledge base name"):
+    with pytest.raises(InvalidRequest, match="invalid knowledge base name"):
         make_engine(store).upsert_text("other:kb", "d", "t", "x")
 
 

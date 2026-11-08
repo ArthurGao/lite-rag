@@ -3,6 +3,7 @@ filters, reindex — must behave the same whichever store holds the kb."""
 
 import pytest
 
+from lite_rag.errors import InvalidRequest
 from lite_rag.stores.base import CachedStore
 from lite_rag.testing import FakeEmbedder
 from tests.integration.support import make_engine
@@ -80,3 +81,16 @@ def test_reindex_rebuilds_a_kb_under_new_settings(store: CachedStore) -> None:
     zh = bigger.search("kb-400", "退款", where={"lang": "zh"}, mode="bm25")
     assert [h.doc_id for h in zh] == ["zh-refund"]  # metadata travelled too
     assert sorted(bigger.list_kbs()) == ["kb", "kb-400"]
+
+
+@pytest.mark.parametrize("value", [["a"], {"k": 1}, None])
+def test_a_filter_value_must_be_a_scalar_and_is_checked_before_any_work(
+    store: CachedStore, value: object
+) -> None:
+    embedder = FakeEmbedder(dim=8)
+    engine = _filled(store, embedder)
+    calls = len(embedder.calls)
+    for mode in ("vector", "bm25", "hybrid"):
+        with pytest.raises(InvalidRequest, match="scalar"):
+            engine.search("kb", "refunds", where={"tags": value}, mode=mode)  # type: ignore[arg-type]
+    assert len(embedder.calls) == calls  # refused before the query was embedded
