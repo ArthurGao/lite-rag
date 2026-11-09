@@ -290,3 +290,71 @@ def test_warm_up_loads_jieba_so_the_first_search_does_not(store: PgStore) -> Non
     text._jieba.cache_clear()
     make_engine(store).runtime.warm_up()
     assert text._jieba.cache_info().currsize == 1
+
+
+# --- several kbs at once (S10, for llm-steward's joint retrieval) ------------------------------
+
+
+def _two_kbs(store: PgStore, **kwargs: Any) -> tuple[RagEngine, FakeEmbedder]:
+    embedder = FakeEmbedder(dim=8)
+    engine = make_engine(store, embedder, size=200, cache=False, **kwargs)
+    engine.upsert_text("faq", "refunds", "Refunds", DOCS["refunds"])
+    engine.upsert_text("faq", "returns", "Returns", DOCS["returns"])
+    engine.upsert_text("ship", "shipping", "Shipping", DOCS["shipping"])
+    # the same doc id in two kbs: two different documents, both must come back
+    engine.upsert_text("ship", "refunds", "Courier refunds", "Courier refunds take seven days.")
+    return engine, embedder
+
+
+def test_several_kbs_are_searched_as_one_with_one_query_embedding(store: PgStore) -> None:
+    engine, embedder = _two_kbs(store)
+    embedder.queries.clear()
+    hits = engine.search_kbs(["faq", "ship"], "refunds seven days", top_k=10)
+    assert embedder.queries == ["refunds seven days"]  # embedded once, not once per kb
+    assert {(h.kb, h.doc_id) for h in hits} == {
+        ("faq", "refunds"),
+        ("ship", "refunds"),
+        ("faq", "returns"),
+        ("ship", "shipping"),
+    }
+    # one fusion over both kbs: the fused score is RRF over the merged lists, best first
+    assert [h.score for h in hits] == sorted((h.score for h in hits), reverse=True)
+    for h in hits:
+        expected = sum(1 / (60 + h.ranks[p]) for p in ("vector", "bm25") if p in h.ranks)
+        assert h.score == pytest.approx(expected)
+    # ranks are positions in the merged lists, so no two hits share a vector rank
+    vector_ranks = [h.ranks["vector"] for h in hits if "vector" in h.ranks]
+    assert len(vector_ranks) == len(set(vector_ranks))
+
+
+def test_one_kb_through_search_kbs_matches_search(store: PgStore) -> None:
+    engine = _filled(store)
+    for query in ["refunds seven days", "shipping 包邮", "packaging"]:
+        alone = engine.search("kb", query, top_k=5)
+        many = engine.search_kbs(["kb"], query, top_k=5)
+        assert [(h.chunk_id, h.score, h.ranks) for h in many] == [
+            (h.chunk_id, h.score, h.ranks) for h in alone
+        ], query
+        assert all(h.kb == "kb" for h in alone)
+
+
+def test_a_kb_that_does_not_exist_yet_is_skipped(store: PgStore) -> None:
+    engine, _ = _two_kbs(store)
+    hits = engine.search_kbs(["faq", "never-written"], "refunds", top_k=5)
+    assert {h.kb for h in hits} == {"faq"}
+    assert engine.search_kbs(["never-written"], "refunds") == []
+    with pytest.raises(InvalidRequest):  # a bad name is still the caller's error
+        engine.search_kbs(["faq", "Bad Name"], "refunds")
+    with pytest.raises(InvalidRequest):
+        engine.search_kbs([], "refunds")
+
+
+def test_several_kbs_are_reranked_once(store: PgStore) -> None:
+    from lite_rag.testing import FakeReranker
+
+    reranker = FakeReranker()
+    engine, _ = _two_kbs(store, reranker=reranker, rerank={"enabled": True, "top_n": 10})
+    hits = engine.search_kbs(["faq", "ship"], "refunds", top_k=3)
+    [(query, texts)] = reranker.calls  # one cross-encoder pass over both kbs' candidates
+    assert query == "refunds" and len(texts) == 4
+    assert len(hits) == 3 and all("rerank" in h.scores for h in hits)

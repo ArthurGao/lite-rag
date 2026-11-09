@@ -101,12 +101,20 @@ Every command takes `-c/--config <file.yaml>` and `-n/--namespace` (or `LITERAG_
 from lite_rag.config import load_settings
 from lite_rag.engine import RagEngine, RagRuntime
 
-settings = load_settings("rag.yaml")          # or load_settings() for environment only
+settings = load_settings("rag.yaml")  # or load_settings() for environment only
 
 engine = RagEngine.from_settings(settings, namespace="myproject/tenant_42")
 engine.upsert_text("handbook", "leave-policy", "Leave policy", text, metadata={"team": "hr"})
-hits = engine.search("handbook", "how many days of annual leave?", top_k=5,
-                     mode="hybrid", rerank=False, where={"team": "hr"})
+hits = engine.search(
+    "handbook",
+    "how many days of annual leave?",
+    top_k=5,
+    mode="hybrid",
+    rerank=False,
+    where={"team": "hr"},
+)
+# several kbs of the namespace as one: embedded once, fused once; each hit names its kb
+hits = engine.search_kbs(["handbook", "faq"], "annual leave", top_k=5)
 answer = engine.ask("handbook", "How many days of annual leave do I get?")
 print(answer.text, [c.chunk_id for c in answer.citations], answer.model_id)
 engine.close()
@@ -139,6 +147,7 @@ uv run --extra server literag serve                                     # 127.0.
 | `POST /v1/kbs/{kb}/files` | Upload a file (multipart `file`, optional `doc_id`) |
 | `DELETE /v1/kbs/{kb}/documents/{doc_id}` | Delete a document |
 | `POST /v1/kbs/{kb}/search` | `{query, top_k, mode, rerank, where}` → hits |
+| `POST /v1/search` | `{kbs, query, top_k, mode, rerank, where}` → hits across several kbs (each hit names its `kb`); the key must cover every kb |
 | `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer with citations |
 
 ```bash

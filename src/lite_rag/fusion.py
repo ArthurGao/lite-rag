@@ -12,18 +12,20 @@ from collections.abc import Mapping, Sequence
 
 from lite_rag.ranking import ranked
 
-Ranking = Sequence[tuple[str, float]]  # (chunk_id, score), best first
+type Ranking[K] = Sequence[tuple[K, float]]  # (chunk key, score), best first
 
 
-def rrf(rankings: Mapping[str, Ranking], k: int = 60) -> list[tuple[str, float]]:
-    fused: dict[str, float] = {}
+def rrf[K: (str, tuple[int, str])](
+    rankings: Mapping[str, Ranking[K]], k: int = 60
+) -> list[tuple[K, float]]:
+    fused: dict[K, float] = {}
     for ranking in rankings.values():
         for rank, (chunk, _) in enumerate(ranking, start=1):
             fused[chunk] = fused.get(chunk, 0.0) + 1.0 / (k + rank)
     return ranked(fused)
 
 
-def _min_max(ranking: Ranking) -> dict[str, float]:
+def _min_max[K: (str, tuple[int, str])](ranking: Ranking[K]) -> dict[K, float]:
     if not ranking:
         return {}
     values = [s for _, s in ranking]
@@ -33,11 +35,11 @@ def _min_max(ranking: Ranking) -> dict[str, float]:
     return {chunk: (s - low) / (high - low) for chunk, s in ranking}
 
 
-def weighted(
-    rankings: Mapping[str, Ranking], weights: Mapping[str, float]
-) -> list[tuple[str, float]]:
+def weighted[K: (str, tuple[int, str])](
+    rankings: Mapping[str, Ranking[K]], weights: Mapping[str, float]
+) -> list[tuple[K, float]]:
     """Sum of each list's min-max normalised score times its weight."""
-    fused: dict[str, float] = {}
+    fused: dict[K, float] = {}
     for stage, ranking in rankings.items():
         for chunk, score in _min_max(ranking).items():
             fused[chunk] = fused.get(chunk, 0.0) + weights[stage] * score

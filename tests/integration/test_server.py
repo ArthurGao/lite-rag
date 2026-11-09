@@ -325,3 +325,35 @@ def test_a_missing_document_is_a_404_that_names_the_document(store: PgStore) -> 
         r = c.delete("/v1/kbs/c-1/documents/nope", headers=h)
     assert r.status_code == 404
     assert r.json()["title"] == "DocumentNotFound" and "'nope'" in r.json()["detail"]
+
+
+def test_several_kbs_are_searched_in_one_request(client: TestClient, keys: dict[str, str]) -> None:
+    _fill(client, keys["writer"], "c-1")
+    _fill(client, keys["writer"], "c-2")
+    body = {"kbs": ["c-1", "c-2", "c-unwritten"], "query": "refunds", "top_k": 4}
+    r = client.post("/v1/search", headers=_h(keys["reader"]), json=body)
+    assert r.status_code == 200, r.text
+    hits = r.json()["hits"]
+    assert {(h["kb"], h["doc_id"]) for h in hits} == {
+        ("c-1", "refund"),
+        ("c-2", "refund"),
+        ("c-1", "ship"),
+        ("c-2", "ship"),
+    }
+    assert [h["score"] for h in hits] == sorted((h["score"] for h in hits), reverse=True)
+
+
+def test_a_multi_kb_search_needs_access_to_every_kb(
+    client: TestClient, keys: dict[str, str]
+) -> None:
+    _fill(client, keys["writer"], "c-1")
+    _fill(client, keys["writer"], "faq")
+    body = {"kbs": ["c-1", "faq"], "query": "refunds"}
+    r = client.post("/v1/search", headers=_h(keys["reader"]), json=body)  # kbs: ["c-*"]
+    assert r.status_code == 403 and "faq" in r.json()["detail"]
+    assert client.post("/v1/search", headers=_h(keys["other"]), json=body).status_code == 403
+    assert (
+        client.post("/v1/search", json=body, headers={"X-LiteRag-Namespace": NS}).status_code == 401
+    )
+    r = client.post("/v1/search", headers=_h(keys["reader"]), json={"kbs": [], "query": "x"})
+    assert r.status_code == 422

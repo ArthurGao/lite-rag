@@ -60,3 +60,4 @@ class Hit:
     matched: tuple[int, int] | None = None
     scores: dict[str, float] = field(default_factory=dict)
     ranks: dict[str, int] = field(default_factory=dict)
+    kb: str = ""  # the knowledge base it came from (several are searched at once)

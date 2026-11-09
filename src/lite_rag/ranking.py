@@ -11,8 +11,11 @@ from collections.abc import Mapping
 PRECISION = 9
 
 
-def ranked(scores: Mapping[str, float], n: int | None = None) -> list[tuple[str, float]]:
-    """(chunk_id, score), best first; only the best `n` when given (heap, not a full sort)."""
+def ranked[K: (str, tuple[int, str])](
+    scores: Mapping[K, float], n: int | None = None
+) -> list[tuple[K, float]]:
+    """(key, score), best first; only the best `n` when given (heap, not a full sort). A key is
+    a chunk id, or (kb index, chunk id) when several kbs are searched as one."""
     key = lambda kv: (-round(kv[1], PRECISION), kv[0])  # noqa: E731
     if n is None:
         return sorted(scores.items(), key=key)

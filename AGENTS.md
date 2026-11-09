@@ -21,7 +21,8 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S9 — llm-steward integration** (design §12; S0–S8 done 2026-11-08/09). After S9, llm-steward's P3 (WeKnora) resumes; lite-rag changes from then on are driven by what llm-steward needs.
+**S10 — multi-kb search** (design §12; S0–S9 done 2026-11-08/09), for llm-steward's P4 (joint retrieval). lite-rag
+changes are driven by what llm-steward needs.
 
 Decided (2026-11-08): separate public repo; library + optional HTTP service (`literag serve`, Docker image) over one
 `RagEngine`; storage is PostgreSQL + pgvector by default (vectors, own BM25 postings and the document registry in one

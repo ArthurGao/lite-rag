@@ -60,11 +60,21 @@ class Authorizer:
             raise Denied(401, "unknown API key")
         if not any(fnmatchcase(namespace, p) for p in key.namespaces):
             raise Denied(403, f"key {key.name!r} has no access to namespace {namespace!r}")
-        if kb is not None and not any(fnmatchcase(kb, p) for p in key.kbs):
-            raise Denied(403, f"key {key.name!r} has no access to knowledge base {kb!r}")
+        if kb is not None:
+            self.require_kbs(key, [kb])
         if write and key.mode != "write":
             raise Denied(403, f"key {key.name!r} is read-only")
         return key
+
+    @staticmethod
+    def require_kbs(key: ApiKeyConfig | None, kbs: list[str]) -> None:
+        """Raise `Denied` (403) unless `key` covers every kb named (None: open mode). A request
+        that names its kbs in the body (several at once) is checked here, like a path's kb."""
+        if key is None:
+            return
+        for kb in kbs:
+            if not any(fnmatchcase(kb, p) for p in key.kbs):
+                raise Denied(403, f"key {key.name!r} has no access to knowledge base {kb!r}")
 
     @staticmethod
     def visible(key: ApiKeyConfig | None, kbs: list[str]) -> list[str]:

@@ -94,6 +94,10 @@ class SearchIn(_Retrieval):
     query: str = Field(min_length=1)
 
 
+class MultiSearchIn(SearchIn):
+    kbs: list[str] = Field(min_length=1, max_length=50)
+
+
 class AskIn(_Retrieval):
     question: str = Field(min_length=1)
 
@@ -242,6 +246,14 @@ def create_app(settings: Settings, runtime: RagRuntime) -> FastAPI:
     @app.post("/v1/kbs/{kb}/search")
     def search(kb: str, body: SearchIn, eng: Read) -> dict[str, Any]:
         hits = eng.search(kb, body.query, **body.model_dump(exclude={"query"}))
+        return {"hits": [dataclasses.asdict(h) for h in hits]}
+
+    @app.post("/v1/search")
+    def search_kbs(body: MultiSearchIn, request: Request, eng: Read) -> dict[str, Any]:
+        """Several kbs of the namespace searched as one (`RagEngine.search_kbs`); the key must
+        cover every kb named, as it would each on its own."""
+        Authorizer.require_kbs(request.state.key, body.kbs)
+        hits = eng.search_kbs(body.kbs, body.query, **body.model_dump(exclude={"query", "kbs"}))
         return {"hits": [dataclasses.asdict(h) for h in hits]}
 
     @app.post("/v1/kbs/{kb}/ask")

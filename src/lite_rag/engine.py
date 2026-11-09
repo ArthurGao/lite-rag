@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,9 @@ from lite_rag.stores.base import (
 from lite_rag.stores.factory import open_store
 from lite_rag.text import build_counter, terms
 from lite_rag.types import Document, Hit
+
+# A chunk's key in a search: (kb index, chunk id), since a chunk id is unique within its kb only.
+type Key = tuple[int, str]
 
 NAMESPACE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}(/[a-z0-9][a-z0-9_.-]{0,62}){0,3}$")
 KB_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,99}$")
@@ -302,6 +306,36 @@ class RagEngine:
         with a cross-encoder. `where` keeps only documents whose metadata has each key equal to
         its scalar value. Each hit carries every stage's score and rank; `score` is the final
         one."""
+        return self._search([kb], query, top_k, mode, rerank, where, skip_missing=False)
+
+    def search_kbs(
+        self,
+        kbs: Sequence[str],
+        query: str,
+        *,
+        top_k: int | None = None,
+        mode: Mode | None = None,
+        rerank: bool | None = None,
+        where: dict[str, Any] | None = None,
+    ) -> list[Hit]:
+        """`search` over several kbs of this namespace as one (design §5: one query embedding,
+        one fusion, one rerank; each hit names its `kb`). A kb that does not exist yet is
+        skipped, so a mistyped (valid) name returns nothing rather than an error."""
+        if not kbs:
+            raise InvalidRequest("search_kbs needs at least one knowledge base")
+        return self._search(list(kbs), query, top_k, mode, rerank, where, skip_missing=True)
+
+    def _search(
+        self,
+        kbs: list[str],
+        query: str,
+        top_k: int | None,
+        mode: Mode | None,
+        rerank: bool | None,
+        where: dict[str, Any] | None,
+        *,
+        skip_missing: bool,
+    ) -> list[Hit]:
         cfg = self._settings.retrieval
         where = check_where(where)
         k = cfg.top_k if top_k is None else top_k
@@ -309,23 +343,34 @@ class RagEngine:
             raise InvalidRequest(f"top_k must be at least 1, got {k}")
         mode = mode or cfg.mode
         reranking = self._settings.rerank.enabled if rerank is None else rerank
+        refs = self._readable(kbs, skip_missing)
+        if not refs:
+            return []
         # `pool` candidates reach the end (all of them re-scored when reranking); each path
         # returns `n` — more in hybrid, where fusion needs candidates from both lists, and more
         # when several chunks share a parent (parent_child), which count once.
         pool = max(self._settings.rerank.top_n, k) if reranking else k
         wanted = pool * self._chunker.children_per_parent  # chunks that make `pool` parents
         n = max(wanted, k * cfg.candidate_factor) if mode == "hybrid" else wanted
-        ref = self._open(kb, create=False)
         vector = self._embedder.embed_query(query) if mode in ("vector", "hybrid") else None
         while True:
-            rankings = self._rank(ref, query, vector, mode, n, where)
+            # Keyed (kb index, chunk id): a chunk id is unique within its kb only. Each path's
+            # lists from every kb are merged by score into one, then fused once.
+            merged: dict[str, dict[Key, float]] = {}
+            full = False
+            for i, ref in enumerate(refs):
+                for path, found in self._rank(ref, query, vector, mode, n, where).items():
+                    full = full or len(found) == n
+                    merged.setdefault(path, {}).update(((i, c), s) for c, s in found)
+            rankings = {path: ranked(scores, n) for path, scores in merged.items()}
+            if mode == "hybrid":
+                rankings["fused"] = self._fuse(rankings)
             ranking = rankings["fused" if mode == "hybrid" else mode]
+            stored = self._stored(refs, [key for key, _ in ranking])
             # Look up every ranked chunk: one deleted since it was ranked makes room for the
             # next. Short of `pool` while a path came back full (more exists): look deeper —
             # `children_per_parent` is an estimate, and deletes can race a search.
-            stored = self._store.chunks(ref, [chunk for chunk, _ in ranking])
             candidates = _best_per_parent([(c, s) for c, s in ranking if c in stored], stored)
-            full = any(len(r) == n for name, r in rankings.items() if name != "fused")
             if len(candidates) >= pool or not full:
                 break
             n *= 2
@@ -334,7 +379,33 @@ class RagEngine:
             candidates = rankings["rerank"] = self._rerank(query, candidates, stored)
         ranks = {s: {c: i for i, (c, _) in enumerate(r, start=1)} for s, r in rankings.items()}
         scores = {s: dict(r) for s, r in rankings.items()}
-        return [self._hit(stored[c], score, scores, ranks) for c, score in candidates[:k]]
+        return [
+            self._hit(refs[key[0]].name, key, stored[key], score, scores, ranks)
+            for key, score in candidates[:k]
+        ]
+
+    def _readable(self, kbs: list[str], skip_missing: bool) -> list[KbRef]:
+        """The kbs to read, in order, each once; every name is checked before any is opened."""
+        names = [self._ref(kb).name for kb in dict.fromkeys(kbs)]
+        refs = []
+        for kb in names:
+            try:
+                refs.append(self._open(kb, create=False))
+            except KbNotFound:
+                if not skip_missing:
+                    raise
+        return refs
+
+    def _stored(self, refs: list[KbRef], keys: list[Key]) -> dict[Key, StoredChunk]:
+        """The stored chunks of `keys`: one lookup per kb."""
+        wanted: dict[int, list[str]] = {}
+        for i, chunk in keys:
+            wanted.setdefault(i, []).append(chunk)
+        return {
+            (i, chunk): c
+            for i, chunks in wanted.items()
+            for chunk, c in self._store.chunks(refs[i], chunks).items()
+        }
 
     def _rank(
         self,
@@ -345,25 +416,26 @@ class RagEngine:
         n: int,
         where: dict[str, Any] | None,
     ) -> dict[str, list[tuple[str, float]]]:
-        """Each path's top `n` (and their fusion, in hybrid mode)."""
+        """Each path's top `n` in one kb (fusion happens once, over every kb's lists)."""
         rankings: dict[str, list[tuple[str, float]]] = {}
         if vector is not None:
             rankings["vector"] = self._store.vector_query(ref, vector, n, where)
         if mode in ("bm25", "hybrid"):
             bm = self._settings.retrieval.bm25
             rankings["bm25"] = self._store.bm25_query(ref, terms(query), n, bm.k1, bm.b, where)
-        if mode == "hybrid":
-            rankings["fused"] = self._fuse(rankings)
         return rankings
 
     @staticmethod
     def _hit(
+        kb: str,
+        key: Key,
         c: StoredChunk,
         score: float,
-        scores: dict[str, dict[str, float]],
-        ranks: dict[str, dict[str, int]],
+        scores: dict[str, dict[Key, float]],
+        ranks: dict[str, dict[Key, int]],
     ) -> Hit:
-        """A hit for chunk `c`; a parent_child child returns its parent's text and position."""
+        """A hit for chunk `c` (ranked under `key`); a parent_child child returns its parent's
+        text and position."""
         view = c.parent or c
         return Hit(
             chunk_id=c.chunk_id,
@@ -376,8 +448,9 @@ class RagEngine:
             heading_path=view.heading_path,
             page=view.page,
             matched=(c.start, c.end) if c.parent is not None else None,
-            scores={s: m[c.chunk_id] for s, m in scores.items() if c.chunk_id in m},
-            ranks={s: m[c.chunk_id] for s, m in ranks.items() if c.chunk_id in m},
+            scores={s: m[key] for s, m in scores.items() if key in m},
+            ranks={s: m[key] for s, m in ranks.items() if key in m},
+            kb=kb,
         )
 
     def ask(
@@ -417,8 +490,8 @@ class RagEngine:
         )
 
     def _rerank(
-        self, query: str, candidates: list[tuple[str, float]], stored: dict[str, StoredChunk]
-    ) -> list[tuple[str, float]]:
+        self, query: str, candidates: list[tuple[Key, float]], stored: dict[Key, StoredChunk]
+    ) -> list[tuple[Key, float]]:
         """The candidates re-scored by the cross-encoder, which reads each chunk with its
         title and heading path."""
         ids = [chunk for chunk, _ in candidates]
@@ -428,7 +501,7 @@ class RagEngine:
         ]
         return ranked(dict(zip(ids, self.runtime.reranker().score(query, texts), strict=True)))
 
-    def _fuse(self, rankings: dict[str, list[tuple[str, float]]]) -> list[tuple[str, float]]:
+    def _fuse(self, rankings: dict[str, list[tuple[Key, float]]]) -> list[tuple[Key, float]]:
         cfg = self._settings.retrieval
         if cfg.fusion == "rrf":
             return rrf(rankings, cfg.rrf_k)
@@ -481,16 +554,16 @@ class RagEngine:
 
 
 def _best_per_parent(
-    ranking: list[tuple[str, float]], stored: dict[str, StoredChunk]
-) -> list[tuple[str, float]]:
+    ranking: list[tuple[Key, float]], stored: dict[Key, StoredChunk]
+) -> list[tuple[Key, float]]:
     """The ranking with one chunk per parent (parent_child): the best child stands for its
     parent, so k hits are k distinct parents. Chunks without a parent all stay."""
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[int, str, int]] = set()
     out = []
     for chunk, score in ranking:
         parent = stored[chunk].parent
         if parent is not None:
-            key = (stored[chunk].doc_id, parent.n)
+            key = (chunk[0], stored[chunk].doc_id, parent.n)
             if key in seen:
                 continue
             seen.add(key)

@@ -179,6 +179,7 @@ engine.stats(kb)
 - **融合**：默认用 RRF，`score = Σ 1/(k + rank)`，`k=60`。也可以选加权融合：两路分数先各自做 min-max 归一化，再按权重相加。
 - **Rerank**（可选）：取融合后的前 n 条，用 cross-encoder 对每个 `(query, chunk)` 对重新打分，再取前 k 条。
 - **模式**：`vector`、`bm25`、`hybrid`。每个 `Hit` 都带各阶段的分数 `scores={vector, bm25, fused, rerank}` 和排名，方便对比和调试。
+- **多个 kb 一起查**（S10，2026-11-09，为 llm-steward 的联合检索）：`RagEngine.search_kbs(kbs, query, …)` 把同一 namespace 里的几个 kb 当成一个来查。query 只嵌入一次；每一路（向量、BM25）在各 kb 取前 n 条，按分数合并成一张表，再只融合一次、只 rerank 一次。结果的 `Hit.kb` 标明来源（chunk id 只在 kb 内唯一，内部用"kb 序号/chunk id"作键）。向量分数在 kb 之间可比（一个引擎只有一个模型）；BM25 的 IDF 是各 kb 自己统计的，合并后的 BM25 表是近似的：小 kb 里同一个词的 IDF 更高，分数偏大，在默认路径（rerank 关）上会占到合并后 BM25 表的前排。开 rerank 时最终顺序完全可比。查询次数随 kb 数增长（每一轮每个 kb 两路各一次，加深时每个 kb 都重查）。留到以后：偏差成问题时，让 Store 返回每个 kb 的 (N, df(t), avgdl)，由引擎算统一的 IDF；kb 多时把各 kb 的查询并行，或在 PG 上一条 SQL 查多个 kb 的向量。还没写过文档（不存在）的 kb 跳过；名字不合法仍是 `InvalidRequest`。单 kb 的 `search` 走同一套流程，结果不变。
 - **过滤**：先按 namespace 和 kb 隔离；`where` 是"键 → 标量值"（str、int、float、bool）的等值过滤，向量和 BM25 两路都会生效；bool 不等于数字。值不是标量（列表、对象、null）会报 `InvalidRequest`（400），在嵌入查询之前就检查，两个后端规则相同（S8 定，2026-11-09）。
 
 ## 6. 生成
@@ -218,6 +219,7 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 | `POST /v1/kbs/{kb}/files` | 上传文件（multipart），返回 `doc_id` |
 | `DELETE /v1/kbs/{kb}/documents/{doc_id}` | 删除文档 |
 | `POST /v1/kbs/{kb}/search` | `{query, top_k, mode, rerank, where}` → hits（带各阶段分数） |
+| `POST /v1/search` | `{kbs, query, top_k, mode, rerank, where}` → 几个 kb 一起查（S10）；key 必须覆盖每一个 kb，否则 403 |
 | `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer（带引用和出处） |
 
 - **鉴权**（S6，KB web-authz：默认拒绝）：`Authorization: Bearer lrk_<prefix>_<secret>`。服务端只保存 key 的 `sha256`，配置在 `server.keys`（YAML，或 `LITERAG_SERVER__KEYS` 设为 JSON 列表）。每个 key 有 `namespaces`、`kbs` 两组 glob（`*` 可以跨 `/`，例如 `steward/*`）和 `mode`（`read` / `write`）；没有默认 namespace，不写就没有访问权限。`literag key create` 生成新 key，只打印一次，同时给出要加进配置的那一条；**没有任何 HTTP 路由能创建 key**。不配 key 时服务完全开放，所以 `serve` 只允许绑定回环地址。
@@ -261,7 +263,7 @@ llm-steward 新增一个 `LiteRagProvider`，实现它的 `KnowledgeProvider` Pr
 | `ensure_collection(collection)` | namespace 为 `steward/<namespace_id>`（每个 llm-steward namespace 一个），kb 名为 `c-<collection_id>`，返回 kb 名 |
 | `upsert_entry(entry, kb, external_id)` | `upsert_text(kb, doc_id=str(entry_id), title, content)`，返回 `doc_id` |
 | `remove(external_id)` | `delete(kb, doc_id)` |
-| `search(query, kbs, top_k)` | 对每个 kb 调用 `search`，按 `doc_id` 合并结果（取最高分） |
+| `search(query, kbs, top_k)` | 一次 `search_kbs`（S10；HTTP 为 `POST /v1/search`），按 `doc_id` 取最高分 |
 | `health()` | 存储可用，且 embedding 服务可用 |
 
 - capabilities 为 `{entry_upsert}`。`doc_parsing` 等 llm-steward P3 做文档时再加。
@@ -304,6 +306,7 @@ lite-rag/
 | S7 Chroma 后端 | `ChromaStore` 加 SQLite 倒排，以及写入顺序与恢复逻辑 | 同一套 Store 合约测试在 PG 和 Chroma 上都通过；崩溃恢复测试 |
 | S8 收尾 | `/simplify`、Codex review、修复问题，然后重跑全部检查 | review 结论记录在案 |
 | S9 接入 llm-steward | `LiteRagProvider`（in-process 和 HTTP 两种）、合约测试、更新 llm-steward 设计文档 | llm-steward 的 KB 合约测试在两种接入方式下都通过；手动端到端：生效条目能检索到，废弃后检索不到 |
+| S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 ## 13. 待确认
 
