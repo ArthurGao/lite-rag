@@ -8,6 +8,7 @@ route creates a key: `literag key create` prints one, once.
 
 import hashlib
 import secrets
+from collections.abc import Sequence
 from fnmatch import fnmatchcase
 
 from lite_rag.config import ApiKeyConfig
@@ -46,10 +47,11 @@ class Authorizer:
         return not self._by_hash
 
     def check(
-        self, authorization: str | None, namespace: str, kb: str | None, write: bool
+        self, authorization: str | None, namespace: str, kbs: Sequence[str], write: bool
     ) -> ApiKeyConfig | None:
-        """The key, when it allows this (None: open mode); raises `Denied` otherwise. `kb` None:
-        a namespace-level request, whose results the caller narrows with `visible`."""
+        """The key, when it allows this (None: open mode); raises `Denied` otherwise. `kbs`: the
+        kbs the request names (path or body), every one checked; none for a namespace-level
+        request, whose results the caller narrows with `visible`."""
         if self.open:
             return None
         scheme, _, token = (authorization or "").partition(" ")
@@ -60,25 +62,20 @@ class Authorizer:
             raise Denied(401, "unknown API key")
         if not any(fnmatchcase(namespace, p) for p in key.namespaces):
             raise Denied(403, f"key {key.name!r} has no access to namespace {namespace!r}")
-        if kb is not None:
-            self.require_kbs(key, [kb])
+        for kb in kbs:
+            if not _covers(key, kb):
+                raise Denied(403, f"key {key.name!r} has no access to knowledge base {kb!r}")
         if write and key.mode != "write":
             raise Denied(403, f"key {key.name!r} is read-only")
         return key
-
-    @staticmethod
-    def require_kbs(key: ApiKeyConfig | None, kbs: list[str]) -> None:
-        """Raise `Denied` (403) unless `key` covers every kb named (None: open mode). A request
-        that names its kbs in the body (several at once) is checked here, like a path's kb."""
-        if key is None:
-            return
-        for kb in kbs:
-            if not any(fnmatchcase(kb, p) for p in key.kbs):
-                raise Denied(403, f"key {key.name!r} has no access to knowledge base {kb!r}")
 
     @staticmethod
     def visible(key: ApiKeyConfig | None, kbs: list[str]) -> list[str]:
         """The kbs `key` may see: a listing never names kbs outside its globs."""
         if key is None:
             return kbs
-        return [kb for kb in kbs if any(fnmatchcase(kb, p) for p in key.kbs)]
+        return [kb for kb in kbs if _covers(key, kb)]
+
+
+def _covers(key: ApiKeyConfig, kb: str) -> bool:
+    return any(fnmatchcase(kb, p) for p in key.kbs)

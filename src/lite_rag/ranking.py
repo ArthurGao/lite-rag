@@ -10,10 +10,12 @@ from collections.abc import Mapping
 
 PRECISION = 9
 
+# A chunk's key in a search over several kbs: (kb index, chunk id), since a chunk id is unique
+# within its kb only. Ranked lists are keyed by a chunk id (one kb, in a store) or by a `Key`.
+type Key = tuple[int, str]
 
-def ranked[K: (str, tuple[int, str])](
-    scores: Mapping[K, float], n: int | None = None
-) -> list[tuple[K, float]]:
+
+def ranked[K: (str, Key)](scores: Mapping[K, float], n: int | None = None) -> list[tuple[K, float]]:
     """(key, score), best first; only the best `n` when given (heap, not a full sort). A key is
     a chunk id, or (kb index, chunk id) when several kbs are searched as one."""
     key = lambda kv: (-round(kv[1], PRECISION), kv[0])  # noqa: E731

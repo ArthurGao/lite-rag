@@ -8,7 +8,7 @@ Q = Question("q1", "How hot?", "doc-a", "between 92 and 96", "keyword")
 
 
 def _hit(doc: str, text: str) -> Hit:
-    return Hit(f"{doc}#0", doc, "t", text, 1.0, 0, len(text))
+    return Hit(f"{doc}#0", doc, "t", text, 1.0, 0, len(text), kb="kb")
 
 
 def test_a_hit_answers_only_with_the_right_document_and_the_quote() -> None:

@@ -32,7 +32,7 @@ from lite_rag.errors import InvalidRequest, KbMismatch, KbNotFound, StoreError
 from lite_rag.fusion import rrf, weighted
 from lite_rag.llm import LLM, build_llm
 from lite_rag.loaders import doc_id_for, file_doc_id, load_file
-from lite_rag.ranking import ranked
+from lite_rag.ranking import Key, ranked
 from lite_rag.rerank import Reranker, build_reranker
 from lite_rag.stores.base import (
     CachedStore,
@@ -46,9 +46,6 @@ from lite_rag.stores.base import (
 from lite_rag.stores.factory import open_store
 from lite_rag.text import build_counter, terms
 from lite_rag.types import Document, Hit
-
-# A chunk's key in a search: (kb index, chunk id), since a chunk id is unique within its kb only.
-type Key = tuple[int, str]
 
 NAMESPACE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}(/[a-z0-9][a-z0-9_.-]{0,62}){0,3}$")
 KB_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,99}$")
@@ -306,7 +303,8 @@ class RagEngine:
         with a cross-encoder. `where` keeps only documents whose metadata has each key equal to
         its scalar value. Each hit carries every stage's score and rank; `score` is the final
         one."""
-        return self._search([kb], query, top_k, mode, rerank, where, skip_missing=False)
+        refs = [self._open(kb, create=False)]
+        return self._search(refs, query, top_k=top_k, mode=mode, rerank=rerank, where=where)
 
     def search_kbs(
         self,
@@ -323,18 +321,24 @@ class RagEngine:
         skipped, so a mistyped (valid) name returns nothing rather than an error."""
         if not kbs:
             raise InvalidRequest("search_kbs needs at least one knowledge base")
-        return self._search(list(kbs), query, top_k, mode, rerank, where, skip_missing=True)
+        names = [self._ref(kb).name for kb in dict.fromkeys(kbs)]  # all checked before any read
+        refs = []
+        for kb in names:
+            try:
+                refs.append(self._open(kb, create=False))
+            except KbNotFound:
+                pass
+        return self._search(refs, query, top_k=top_k, mode=mode, rerank=rerank, where=where)
 
     def _search(
         self,
-        kbs: list[str],
+        refs: list[KbRef],
         query: str,
+        *,
         top_k: int | None,
         mode: Mode | None,
         rerank: bool | None,
         where: dict[str, Any] | None,
-        *,
-        skip_missing: bool,
     ) -> list[Hit]:
         cfg = self._settings.retrieval
         where = check_where(where)
@@ -343,7 +347,6 @@ class RagEngine:
             raise InvalidRequest(f"top_k must be at least 1, got {k}")
         mode = mode or cfg.mode
         reranking = self._settings.rerank.enabled if rerank is None else rerank
-        refs = self._readable(kbs, skip_missing)
         if not refs:
             return []
         # `pool` candidates reach the end (all of them re-scored when reranking); each path
@@ -356,11 +359,11 @@ class RagEngine:
         while True:
             # Keyed (kb index, chunk id): a chunk id is unique within its kb only. Each path's
             # lists from every kb are merged by score into one, then fused once.
+            per_kb = [self._rank(ref, query, vector, mode, n, where) for ref in refs]
+            full = any(len(found) == n for r in per_kb for found in r.values())
             merged: dict[str, dict[Key, float]] = {}
-            full = False
-            for i, ref in enumerate(refs):
-                for path, found in self._rank(ref, query, vector, mode, n, where).items():
-                    full = full or len(found) == n
+            for i, r in enumerate(per_kb):
+                for path, found in r.items():
                     merged.setdefault(path, {}).update(((i, c), s) for c, s in found)
             rankings = {path: ranked(scores, n) for path, scores in merged.items()}
             if mode == "hybrid":
@@ -383,18 +386,6 @@ class RagEngine:
             self._hit(refs[key[0]].name, key, stored[key], score, scores, ranks)
             for key, score in candidates[:k]
         ]
-
-    def _readable(self, kbs: list[str], skip_missing: bool) -> list[KbRef]:
-        """The kbs to read, in order, each once; every name is checked before any is opened."""
-        names = [self._ref(kb).name for kb in dict.fromkeys(kbs)]
-        refs = []
-        for kb in names:
-            try:
-                refs.append(self._open(kb, create=False))
-            except KbNotFound:
-                if not skip_missing:
-                    raise
-        return refs
 
     def _stored(self, refs: list[KbRef], keys: list[Key]) -> dict[Key, StoredChunk]:
         """The stored chunks of `keys`: one lookup per kb."""

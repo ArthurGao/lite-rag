@@ -27,7 +27,7 @@ def test_new_keys_are_unique_and_only_their_hash_is_kept() -> None:
 def test_no_valid_key_is_401(header: str | None) -> None:
     auth, _ = _authorizer()
     with pytest.raises(Denied) as denied:
-        auth.check(header, "steward/1", "c-1", write=False)
+        auth.check(header, "steward/1", ["c-1"], write=False)
     assert denied.value.status == 401
 
 
@@ -44,21 +44,21 @@ def test_a_valid_key_outside_its_scope_is_403(
 ) -> None:
     auth, key = _authorizer()
     with pytest.raises(Denied, match=why) as denied:
-        auth.check(f"Bearer {key}", namespace, kb, write)
+        auth.check(f"Bearer {key}", namespace, [kb], write)
     assert denied.value.status == 403
 
 
 def test_a_read_key_cannot_write_but_can_read() -> None:
     auth, key = _authorizer(mode="read")
-    auth.check(f"Bearer {key}", "steward/1", "c-1", write=False)  # allowed: no exception
+    auth.check(f"Bearer {key}", "steward/1", ["c-1"], write=False)  # allowed: no exception
     with pytest.raises(Denied, match="read-only") as denied:
-        auth.check(f"bearer {key}", "steward/1", "c-1", write=True)
+        auth.check(f"bearer {key}", "steward/1", ["c-1"], write=True)
     assert denied.value.status == 403
 
 
 def test_a_namespace_level_request_checks_the_namespace_only() -> None:
     auth, key = _authorizer()
-    auth.check(f"Bearer {key}", "steward/7/x", None, write=False)  # no kb to check
+    auth.check(f"Bearer {key}", "steward/7/x", [], write=False)  # no kb to check
 
 
 def test_without_keys_the_server_is_open() -> None:
@@ -76,7 +76,7 @@ def test_a_key_needs_at_least_one_namespace() -> None:
 def test_a_valid_key_under_another_scheme_is_401() -> None:
     auth, key = _authorizer()
     with pytest.raises(Denied) as denied:
-        auth.check(f"Basic {key}", "steward/1", "c-1", write=False)
+        auth.check(f"Basic {key}", "steward/1", ["c-1"], write=False)
     assert denied.value.status == 401
 
 

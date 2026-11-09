@@ -25,8 +25,8 @@ The default stack (Ollama `bge-m3` + `qwen3:8b`, PostgreSQL/pgvector, jieba) run
 nothing. [llm-steward](https://github.com/ArthurGao/llm-steward) uses it as its knowledge-base
 engine.
 
-Status: v0.1, stages S0–S8 of the [design](docs/lite-rag-design.md) are done; S9 (llm-steward
-integration) is in progress.
+Status: v0.1, stages S0–S10 of the [design](docs/lite-rag-design.md) are done (S9: llm-steward
+integration; S10: searching several kbs as one).
 
 ## How it works
 

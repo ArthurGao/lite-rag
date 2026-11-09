@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 import tempfile
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -30,6 +30,7 @@ from lite_rag.errors import (
 )
 from lite_rag.loaders import SUFFIXES
 from lite_rag.server.auth import Authorizer
+from lite_rag.types import Hit
 
 log = logging.getLogger("lite_rag.server")
 MULTIPART_OVERHEAD = 8 * 1024  # boundaries and part headers on top of the file itself
@@ -153,27 +154,46 @@ def create_app(settings: Settings, runtime: RagRuntime) -> FastAPI:
         )
         return problem(422, "Unprocessable Content", detail)
 
+    def engine_for(
+        request: Request,
+        authorization: str | None,
+        namespace: str | None,
+        kbs: Sequence[str],
+        write: bool,
+    ) -> RagEngine:
+        """The engine for the request's namespace, once its key allows every kb it names."""
+        if not namespace:
+            raise InvalidRequest(f"the {NAMESPACE_HEADER} header is required")
+        request.state.key = auth.check(authorization, namespace, kbs, write)
+        # An engine per request: as cheap as a lookup, and no cache that callers can grow.
+        return runtime.engine(namespace)
+
     def access(write: bool) -> Callable[..., Coroutine[Any, Any, RagEngine]]:
-        """The engine for the request's namespace, once its key allows the request (async: no
-        I/O, so it runs on the event loop instead of taking a worker thread)."""
+        """The dependency for a route whose kb, if any, is in its path (async: no I/O, so it
+        runs on the event loop instead of taking a worker thread)."""
 
         async def dependency(
             request: Request,
             authorization: Annotated[str | None, Header()] = None,
             namespace: Annotated[str | None, Header(alias=NAMESPACE_HEADER)] = None,
         ) -> RagEngine:
-            if not namespace:
-                raise InvalidRequest(f"the {NAMESPACE_HEADER} header is required")
-            request.state.key = auth.check(
-                authorization, namespace, request.path_params.get("kb"), write
-            )
-            # An engine per request: as cheap as a lookup, and no cache that callers can grow.
-            return runtime.engine(namespace)
+            kb = request.path_params.get("kb")
+            return engine_for(request, authorization, namespace, [kb] if kb else [], write)
 
         return dependency
 
+    async def read_kbs(
+        request: Request,
+        body: MultiSearchIn,
+        authorization: Annotated[str | None, Header()] = None,
+        namespace: Annotated[str | None, Header(alias=NAMESPACE_HEADER)] = None,
+    ) -> RagEngine:
+        """The dependency for a read whose kbs are named in its body: each must be allowed."""
+        return engine_for(request, authorization, namespace, body.kbs, write=False)
+
     Read = Annotated[RagEngine, Depends(access(write=False))]
     Write = Annotated[RagEngine, Depends(access(write=True))]
+    ReadKbs = Annotated[RagEngine, Depends(read_kbs)]
 
     # --- the one deliberately unguarded path ---------------------------------------------------
 
@@ -246,15 +266,14 @@ def create_app(settings: Settings, runtime: RagRuntime) -> FastAPI:
     @app.post("/v1/kbs/{kb}/search")
     def search(kb: str, body: SearchIn, eng: Read) -> dict[str, Any]:
         hits = eng.search(kb, body.query, **body.model_dump(exclude={"query"}))
-        return {"hits": [dataclasses.asdict(h) for h in hits]}
+        return _hits(hits)
 
     @app.post("/v1/search")
-    def search_kbs(body: MultiSearchIn, request: Request, eng: Read) -> dict[str, Any]:
+    def search_kbs(body: MultiSearchIn, eng: ReadKbs) -> dict[str, Any]:
         """Several kbs of the namespace searched as one (`RagEngine.search_kbs`); the key must
         cover every kb named, as it would each on its own."""
-        Authorizer.require_kbs(request.state.key, body.kbs)
         hits = eng.search_kbs(body.kbs, body.query, **body.model_dump(exclude={"query", "kbs"}))
-        return {"hits": [dataclasses.asdict(h) for h in hits]}
+        return _hits(hits)
 
     @app.post("/v1/kbs/{kb}/ask")
     def ask(kb: str, body: AskIn, eng: Read) -> dict[str, Any]:
@@ -279,3 +298,7 @@ def run(settings: Settings, runtime: RagRuntime, host: str, port: int) -> None:
     from lite_rag.extras import require_extra
 
     require_extra("uvicorn", "server").run(create_app(settings, runtime), host=host, port=port)
+
+
+def _hits(hits: list[Hit]) -> dict[str, Any]:
+    return {"hits": [dataclasses.asdict(h) for h in hits]}

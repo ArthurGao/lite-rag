@@ -10,14 +10,12 @@ Both break ties by chunk id, so results are deterministic.
 
 from collections.abc import Mapping, Sequence
 
-from lite_rag.ranking import ranked
+from lite_rag.ranking import Key, ranked
 
-type Ranking[K] = Sequence[tuple[K, float]]  # (chunk key, score), best first
+type Ranking[T] = Sequence[tuple[T, float]]  # (chunk key, score), best first
 
 
-def rrf[K: (str, tuple[int, str])](
-    rankings: Mapping[str, Ranking[K]], k: int = 60
-) -> list[tuple[K, float]]:
+def rrf[K: (str, Key)](rankings: Mapping[str, Ranking[K]], k: int = 60) -> list[tuple[K, float]]:
     fused: dict[K, float] = {}
     for ranking in rankings.values():
         for rank, (chunk, _) in enumerate(ranking, start=1):
@@ -25,7 +23,7 @@ def rrf[K: (str, tuple[int, str])](
     return ranked(fused)
 
 
-def _min_max[K: (str, tuple[int, str])](ranking: Ranking[K]) -> dict[K, float]:
+def _min_max[K](ranking: Ranking[K]) -> dict[K, float]:
     if not ranking:
         return {}
     values = [s for _, s in ranking]
@@ -35,7 +33,7 @@ def _min_max[K: (str, tuple[int, str])](ranking: Ranking[K]) -> dict[K, float]:
     return {chunk: (s - low) / (high - low) for chunk, s in ranking}
 
 
-def weighted[K: (str, tuple[int, str])](
+def weighted[K: (str, Key)](
     rankings: Mapping[str, Ranking[K]], weights: Mapping[str, float]
 ) -> list[tuple[K, float]]:
     """Sum of each list's min-max normalised score times its weight."""
