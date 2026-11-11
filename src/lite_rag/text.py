@@ -85,7 +85,12 @@ class HFTokenCounter:
     def _tokenizer(self) -> Any:
         from tokenizers import Tokenizer
 
-        return Tokenizer.from_pretrained(self.name)
+        tokenizer = Tokenizer.from_pretrained(self.name)
+        # Some tokenizer files ship with truncation on (MiniLM: 128 tokens); measuring and
+        # cutting chunks needs every token, or the text past the limit is silently dropped.
+        tokenizer.no_truncation()
+        tokenizer.no_padding()
+        return tokenizer
 
     def spans(self, text: str) -> list[Span]:
         encoding = self._tokenizer.encode(text, add_special_tokens=False)
