@@ -24,4 +24,12 @@ uv run --all-extras literag eval -c eval/configs/pdf-pypdf-recursive.yaml \
   -c eval/configs/pdf-docling-markdown.yaml --corpus eval/corpus-pdf --golden eval/golden-pdf.jsonl
 ```
 
+Identifier questions (`exact`: error codes, config keys, versions, model numbers, one section
+per identifier), to compare retrieval paths where BM25 should help — e.g. against the mode configs:
+
+```
+uv run --all-extras literag eval -c eval/configs/mode-vector.yaml -c eval/configs/mode-bm25.yaml \
+  -c eval/configs/chunk-markdown.yaml --corpus eval/corpus-exact --golden eval/golden-exact.jsonl
+```
+
 The PDFs in `eval/corpus-pdf/` are generated from `eval/pdf-src/*.md` by `eval/make_pdf.py`.

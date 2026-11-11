@@ -27,6 +27,16 @@ def test_the_shipped_golden_set_matches_its_corpus() -> None:
     assert all(sum(q.doc == d for q in questions) == 4 for d in corpus)
 
 
+def test_the_exact_golden_set_matches_its_corpus() -> None:
+    """Identifier, code and model-number questions (`exact`), with paraphrases of the same
+    documents, for comparing retrieval paths where BM25 is expected to help."""
+    corpus = load_corpus(REPO / "eval" / "corpus-exact")
+    questions = load_golden(REPO / "eval" / "golden-exact.jsonl", corpus)
+    assert len(corpus) == 2 and len(questions) == 12
+    assert [q.kind for q in questions].count("exact") == 8
+    assert {q.lang for q in questions} == {"en", "zh"}
+
+
 def test_a_golden_line_whose_quote_is_not_in_its_document_is_refused(tmp_path: Path) -> None:
     corpus = {"doc": ("Doc", "Refunds take seven days.")}
     golden = tmp_path / "golden.jsonl"

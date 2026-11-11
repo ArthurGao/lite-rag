@@ -1,0 +1,12 @@
+{"id": "x01", "doc": "relay-cli-reference", "kind": "exact", "lang": "en", "question": "What does error E4012 mean?", "evidence": "E4012: the access token is valid but lacks write permission"}
+{"id": "x02", "doc": "relay-cli-reference", "kind": "exact", "lang": "en", "question": "What is the default of sync.retry_backoff_ms?", "evidence": "`sync.retry_backoff_ms`: the first wait before a retry, doubled after each failure, default 200"}
+{"id": "x03", "doc": "relay-cli-reference", "kind": "exact", "lang": "en", "question": "What does exit code 3 mean?", "evidence": "Exit code 3: some files failed and were left for the next run"}
+{"id": "x04", "doc": "relay-cli-reference", "kind": "exact", "lang": "en", "question": "What changed in v2.3.1?", "evidence": "v2.3.1 fixed a crash when a file name contained an emoji"}
+{"id": "x05", "doc": "relay-cli-reference", "kind": "paraphrase", "lang": "en", "question": "Sync fails and says my computer's time is wrong. What should I do?", "evidence": "the clock on this machine is more than 15 minutes off"}
+{"id": "x06", "doc": "relay-cli-reference", "kind": "paraphrase", "lang": "en", "question": "How do I stop temporary files from being uploaded?", "evidence": "`sync.exclude`: glob patterns that are never uploaded"}
+{"id": "x07", "doc": "空调故障码手册", "kind": "exact", "lang": "zh", "question": "空调显示 E6 是什么故障？", "evidence": "E6：室内外机通信故障"}
+{"id": "x08", "doc": "空调故障码手册", "kind": "exact", "lang": "zh", "question": "P2 故障码表示什么？", "evidence": "P2：电源电压过高保护"}
+{"id": "x09", "doc": "空调故障码手册", "kind": "exact", "lang": "zh", "question": "KFR-35GW/BP 是定频还是变频？", "evidence": "KFR-35GW/BP：适用面积 16 到 22 平方米，制冷量 3500 瓦，变频"}
+{"id": "x10", "doc": "空调故障码手册", "kind": "exact", "lang": "zh", "question": "KFR-50LW/BP 适合多大的房间？", "evidence": "KFR-50LW/BP：立柜式，适用面积 23 到 34 平方米"}
+{"id": "x11", "doc": "空调故障码手册", "kind": "paraphrase", "lang": "zh", "question": "冬天特别冷的时候空调为什么自己停了？", "evidence": "P3：室外环境温度过低，制热时低于零下 15 度会停机保护"}
+{"id": "x12", "doc": "空调故障码手册", "kind": "paraphrase", "lang": "zh", "question": "晚上睡觉怎么让空调不那么冷？", "evidence": "睡眠键：开启后每小时自动调高一度"}
