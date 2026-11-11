@@ -22,7 +22,8 @@ OLLAMA_URL = "http://127.0.0.1:11434"  # the local Ollama server (embeddings: /a
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
-Mode = Literal["vector", "bm25", "hybrid"]
+Mode = Literal["vector", "bm25", "graph", "hybrid"]
+RetrievalPath = Literal["vector", "bm25", "graph"]  # one retrieval path; hybrid fuses several
 
 
 class StoreConfig(BaseModel):
@@ -172,12 +173,53 @@ class RetrievalConfig(BaseModel):
     """Design §5."""
 
     mode: Mode = "hybrid"
+    # The paths `hybrid` fuses; adding "graph" needs graph.enabled (design §5, S11).
+    hybrid_paths: list[RetrievalPath] = ["vector", "bm25"]
     top_k: int = Field(default=5, gt=0, le=200)
     candidate_factor: int = Field(default=4, gt=0, le=50)  # each path returns top_k * this
     fusion: Literal["rrf", "weighted"] = "rrf"
     rrf_k: int = Field(default=60, gt=0)
     vector_weight: float = Field(default=0.5, ge=0, le=1)  # weighted fusion; bm25 gets the rest
     bm25: BM25Config = BM25Config()
+
+    @model_validator(mode="after")
+    def _paths(self) -> Self:
+        paths = self.hybrid_paths
+        if len(paths) < 2 or len(set(paths)) != len(paths):
+            raise ValueError(
+                f"retrieval.hybrid_paths must name at least two distinct paths: {paths}"
+            )
+        if self.fusion == "weighted" and set(self.hybrid_paths) != {"vector", "bm25"}:
+            raise ValueError("weighted fusion takes exactly the vector and bm25 paths")
+        return self
+
+
+class GraphConfig(BaseModel):
+    """Graph retrieval, local mode (design §5, S11): at ingest an LLM lists each chunk's entities
+    and relations (its own `llm` section, default local qwen3 without thinking); at query time the
+    `graph` path walks them. Only `llm` and the prompt are index identity; the rest tunes the
+    query and may change freely."""
+
+    enabled: bool = False
+    llm: "LLMConfig" = Field(
+        default_factory=lambda: LLMConfig(reasoning_effort="none", max_output_tokens=2048)
+    )
+    concurrency: int = Field(default=4, gt=0)  # LLM calls at once while ingesting
+    hops: int = Field(default=2, ge=0, le=4)  # 2: the answer two documents from the named one
+    # An entity in more chunks than this is a hub (a company name, a running theme): the walk
+    # neither passes through it nor reaches chunks by it. Tune to the corpus.
+    hub_chunks: int = Field(default=5, gt=0)
+    max_neighbors: int = Field(default=20, gt=0, le=1000)  # new entities kept per hop
+
+    def identity(self) -> dict[str, Any]:
+        from lite_rag.graph import prompt_digest  # imported late: it imports this module
+
+        return {"llm": f"{self.llm.provider}/{self.llm.model}", "prompt": prompt_digest()}
+
+    def index_identity(self) -> dict[str, Any]:
+        """What a graph adds to a kb's identity: nothing when off, so kbs built without one keep
+        theirs (the engine's kb record and the evaluation's kb names both use this)."""
+        return {"graph": self.identity()} if self.enabled else {}
 
 
 class RerankConfig(BaseModel):
@@ -230,6 +272,7 @@ class LLMConfig(BaseModel):
 
 ChunkingConfig.model_rebuild()
 ContextualConfig.model_rebuild()
+GraphConfig.model_rebuild()
 
 
 class ApiKeyConfig(BaseModel):
@@ -272,9 +315,21 @@ class Settings(BaseSettings):
     embedding: EmbeddingConfig = EmbeddingConfig()
     chunking: ChunkingConfig = ChunkingConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
+    graph: GraphConfig = GraphConfig()
     rerank: RerankConfig = RerankConfig()
     llm: LLMConfig = LLMConfig()
     server: ServerConfig = ServerConfig()
+
+    @model_validator(mode="after")
+    def _graph(self) -> Self:
+        if self.graph.enabled and self.store.backend != "postgres":
+            raise ValueError("graph needs the postgres backend (design §5, S11)")
+        uses_graph = self.retrieval.mode == "graph" or "graph" in self.retrieval.hybrid_paths
+        if uses_graph and not self.graph.enabled:
+            raise ValueError(
+                "retrieval uses the graph path: set graph.enabled (and rebuild the kb)"
+            )
+        return self
 
     yaml_path: ClassVar[Path | None] = None  # set by `load_settings` on a subclass
     yaml_first: ClassVar[bool] = False  # the file outranks the environment (evaluation)

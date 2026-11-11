@@ -32,4 +32,13 @@ uv run --all-extras literag eval -c eval/configs/mode-vector.yaml -c eval/config
   -c eval/configs/chunk-markdown.yaml --corpus eval/corpus-exact --golden eval/golden-exact.jsonl
 ```
 
+Multi-hop questions (S11: the answer sits two or three documents away from what the question
+names), against graph retrieval — `graph-*.yaml` turn on entity extraction (local qwen3, one call
+per chunk, a few minutes per build):
+
+```
+uv run --all-extras literag eval -c eval/configs/chunk-markdown.yaml -c eval/configs/graph-hybrid.yaml \
+  --corpus eval/corpus-multihop --golden eval/golden-multihop.jsonl
+```
+
 The PDFs in `eval/corpus-pdf/` are generated from `eval/pdf-src/*.md` by `eval/make_pdf.py`.

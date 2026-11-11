@@ -191,6 +191,7 @@ def index_identity(settings: Settings) -> dict[str, Any]:
         "loader": settings.loader.model_dump(),  # another loader: another text
         "chunking": settings.chunking.identity(),
         "embedding": settings.embedding.model_dump(exclude=_TRANSPORT_ONLY),
+        **settings.graph.index_identity(),  # a graph is built into the index
     }
 
 

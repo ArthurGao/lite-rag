@@ -125,3 +125,49 @@ def test_a_store_location_names_only_what_decides_it_and_masks_the_password() ->
     assert "secret" not in location(pg, url) and "schema lite_rag" in location(pg, url)
     chroma = load_settings(store={"backend": "chroma", "data_dir": "/srv/rag"}).store
     assert location(chroma, url) == location(chroma, None) == "chroma /srv/rag"
+
+
+def test_graph_is_off_by_default_and_hybrid_keeps_two_paths() -> None:
+    s = load_settings()
+    assert s.graph.enabled is False
+    assert s.retrieval.hybrid_paths == ["vector", "bm25"]
+    # extraction on local qwen3 without thinking: the reply is JSON, not a monologue
+    assert (s.graph.llm.provider, s.graph.llm.model) == ("ollama", "qwen3:8b")
+    assert s.graph.llm.reasoning_effort == "none"
+
+
+def test_the_graph_needs_the_postgres_backend() -> None:
+    with pytest.raises(ValidationError, match="graph needs the postgres backend"):
+        load_settings(store={"backend": "chroma"}, graph={"enabled": True})
+
+
+def test_a_graph_path_or_mode_needs_the_graph_enabled() -> None:
+    with pytest.raises(ValidationError, match=r"graph\.enabled"):
+        load_settings(retrieval={"hybrid_paths": ["vector", "graph"]})
+    with pytest.raises(ValidationError, match=r"graph\.enabled"):
+        load_settings(retrieval={"mode": "graph"})
+    s = load_settings(
+        retrieval={"mode": "graph", "hybrid_paths": ["bm25", "graph"]}, graph={"enabled": True}
+    )
+    assert s.retrieval.hybrid_paths == ["bm25", "graph"]
+
+
+def test_hybrid_fuses_at_least_two_distinct_paths() -> None:
+    for paths in (["vector"], ["vector", "vector"]):
+        with pytest.raises(ValidationError, match="at least two"):
+            load_settings(retrieval={"hybrid_paths": paths})
+
+
+def test_weighted_fusion_takes_vector_and_bm25_only() -> None:
+    with pytest.raises(ValidationError, match="weighted fusion"):
+        load_settings(
+            retrieval={"fusion": "weighted", "hybrid_paths": ["vector", "bm25", "graph"]},
+            graph={"enabled": True},
+        )
+
+
+def test_the_graph_identity_names_the_extraction_model_and_prompt() -> None:
+    from lite_rag.graph import prompt_digest
+
+    s = load_settings(graph={"enabled": True, "llm": {"model": "qwen3:14b"}})
+    assert s.graph.identity() == {"llm": "ollama/qwen3:14b", "prompt": prompt_digest()}

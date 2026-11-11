@@ -37,6 +37,15 @@ def test_the_exact_golden_set_matches_its_corpus() -> None:
     assert {q.lang for q in questions} == {"en", "zh"}
 
 
+def test_the_multihop_golden_set_matches_its_corpus() -> None:
+    """Questions whose answer sits two or three documents away from what they name (S11)."""
+    corpus = load_corpus(REPO / "eval" / "corpus-multihop")
+    questions = load_golden(REPO / "eval" / "golden-multihop.jsonl", corpus)
+    assert len(corpus) == 8 and len(questions) == 16
+    assert [q.kind for q in questions].count("multihop") == 12
+    assert {q.lang for q in questions} == {"en", "zh"}
+
+
 def test_a_golden_line_whose_quote_is_not_in_its_document_is_refused(tmp_path: Path) -> None:
     corpus = {"doc": ("Doc", "Refunds take seven days.")}
     golden = tmp_path / "golden.jsonl"

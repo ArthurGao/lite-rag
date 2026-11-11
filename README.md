@@ -13,7 +13,10 @@ measure.
 - **Storage**: PostgreSQL + pgvector (vectors, BM25 postings and the document registry written in
   one transaction), or Chroma + SQLite when you don't want a database server.
 - **Retrieval**: vector search plus an own BM25 (jieba for Chinese), fused with RRF; an optional
-  cross-encoder rerank. Every hit carries each stage's score and rank.
+  cross-encoder rerank. Optional graph retrieval (local GraphRAG, PostgreSQL only): an LLM lists
+  each chunk's entities and relations at ingest, and a `graph` path walks them from the entities a
+  query names — for questions whose answer is a few documents away from what they mention. Every
+  hit carries each stage's score and rank.
 - **Generation**: answers with validated citations through a switchable LLM (Ollama, any
   OpenAI-compatible endpoint, or Anthropic). No fallback chain; every answer records
   `provider/model`.
@@ -25,16 +28,18 @@ The default stack (Ollama `bge-m3` + `qwen3:8b`, PostgreSQL/pgvector, jieba) run
 nothing. [llm-steward](https://github.com/ArthurGao/llm-steward) uses it as its knowledge-base
 engine.
 
-Status: v0.1, stages S0–S10 of the [design](docs/lite-rag-design.md) are done (S9: llm-steward
-integration; S10: searching several kbs as one).
+Status: v0.1, stages S0–S11 of the [design](docs/lite-rag-design.md) are done (S9: llm-steward
+integration; S10: searching several kbs as one; S11: graph retrieval, local mode).
 
 ## How it works
 
 ```
 ingest:  file / text → loader → chunker → chunks → embedder ─┐
-                                             └→ tokenize (jieba) ┴→ store (one transaction: registry + vectors + postings)
+                                             ├→ tokenize (jieba) ┤
+                                             └→ [LLM: entities, relations] ┴→ store (one transaction: registry + vectors + postings + graph)
 search:  query → embedder → vector top-n ┐
-         query → tokenize → BM25 top-n   ┴→ RRF → [rerank] → top-k hits
+         query → tokenize → BM25 top-n   ┤
+         query → seed entities → walk relations → graph top-n ┴→ RRF → [rerank] → top-k hits
 ask:     hits → prompt (prompts/*.j2) → LLM → answer (status, text, citations, provenance)
 ```
 
@@ -86,7 +91,7 @@ Every command takes `-c/--config <file.yaml>` and `-n/--namespace` (or `LITERAG_
 | `literag migrate` | Create or upgrade the store (PG schema or the Chroma data directory) |
 | `literag config` | Show the effective settings (secrets masked) |
 | `literag ingest <kb> <paths…>` | Load, chunk, embed and index files or directories (`.md`, `.txt`, `.pdf`, `.docx`); unchanged files are skipped |
-| `literag search <kb> "<q>" [-k 5] [-m vector\|bm25\|hybrid] [--rerank] [--json]` | Hits with each stage's score and rank |
+| `literag search <kb> "<q>" [-k 5] [-m vector\|bm25\|graph\|hybrid] [--rerank] [--json]` | Hits with each stage's score and rank |
 | `literag ask <kb> "<q>" [--json]` | Answer with citations, model and token usage |
 | `literag stats <kb>` | Size of a kb and how it was built |
 | `literag delete <kb> <doc_id>` · `literag drop-kb <kb> --yes` | Remove a document or a whole kb |
@@ -187,7 +192,8 @@ Settings come from `LITERAG_*` environment variables (nested with `__`, e.g.
 store: {backend: postgres, schema: lite_rag}          # or {backend: chroma, data_dir: ./lite_rag_data}
 embedding: {provider: ollama, model: bge-m3}           # ollama | openai | voyage | cohere | gemini | fastembed | sentence_transformers
 chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50}
-retrieval: {mode: hybrid, top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60}
+retrieval: {mode: hybrid, hybrid_paths: [vector, bm25], top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60}
+graph: {enabled: false, llm: {model: qwen3:8b}, hops: 2, hub_chunks: 5}   # add graph to hybrid_paths, or use mode graph
 rerank: {enabled: false, model: BAAI/bge-reranker-v2-m3-int8, top_n: 20}
 llm: {provider: ollama, model: qwen3:8b}               # ollama | openai | anthropic
 server: {host: 127.0.0.1, port: 8700}
@@ -233,6 +239,21 @@ See [eval/configs/README.md](eval/configs/README.md) for the bundled configs. Re
 
 On this small corpus vector search alone matches hybrid + rerank; 32 questions are too few to
 separate close configurations, so the defaults are unchanged until the corpus grows.
+
+Graph retrieval (S11) on 12 multi-hop questions, where the answer sits two or three documents away
+from what the question names (`eval/golden-multihop.jsonl`, local qwen3 extraction):
+
+| Config | multi-hop hit@5 | MRR@10 | p50 ms |
+| --- | --- | --- | --- |
+| markdown + vector only | 0.50 | 0.373 | 6 |
+| markdown + hybrid + rerank | 0.33 | 0.347 | 861 |
+| markdown + graph (alone, or fused with vector / BM25) | 1.00 | 0.589 | 10–15 |
+| markdown + graph + rerank | 0.25 | 0.381 | 768 |
+
+The graph puts the first link of the chain first and the answer right after it, so hit@1 stays at
+0 for these questions — both chunks are what an answer needs. Rerank undoes the gain: it scores the
+question against one chunk at a time and prefers look-alikes (another council) over the answer.
+On the 32 ordinary questions the graph costs one question (vector 0.97 → 0.94 hit@1).
 
 ## Development
 

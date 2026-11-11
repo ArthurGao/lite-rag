@@ -5,10 +5,10 @@ separate vector cache, which a backend may or may not offer."""
 import dataclasses
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from lite_rag.errors import InvalidRequest
-from lite_rag.types import Chunk, Document
+from lite_rag.types import Chunk, ChunkGraph, Document
 
 SCALARS = (str, int, float, bool)
 
@@ -64,6 +64,9 @@ class IndexedChunk:
     vector: list[float]
     terms: list[str]
     context: str | None = None  # contextual header: indexed with the chunk, never returned
+    graph: ChunkGraph = dataclasses.field(
+        default_factory=ChunkGraph
+    )  # entities and relations an LLM found in it (S11)
 
 
 @dataclass(frozen=True)
@@ -138,8 +141,8 @@ class Store(Protocol):
         chunks: list[IndexedChunk],
         parents: list[Chunk] | None = None,
     ) -> None:
-        """Replace the document with `chunks` (embedded, indexed) and `parents` (stored only),
-        in one transaction."""
+        """Replace the document with `chunks` (embedded, indexed, with their graph) and
+        `parents` (stored only), in one transaction."""
         ...
 
     def delete_document(self, kb: KbRef, doc_id: str) -> bool: ...
@@ -163,9 +166,15 @@ class Store(Protocol):
     # --- retrieval (design §5) ---------------------------------------------------------------
 
     def vector_query(
-        self, kb: KbRef, vector: list[float], n: int, where: dict[str, Any] | None = None
+        self,
+        kb: KbRef,
+        vector: list[float],
+        n: int,
+        where: dict[str, Any] | None = None,
+        among: list[str] | None = None,
     ) -> list[tuple[str, float]]:
-        """The `n` nearest chunks as (chunk_id, cosine similarity), best first."""
+        """The `n` nearest chunks as (chunk_id, cosine similarity), best first; only chunks in
+        `among` when given (the graph path ranks the chunks it reached)."""
         ...
 
     def bm25_query(
@@ -184,6 +193,32 @@ class Store(Protocol):
     def chunks(self, kb: KbRef, chunk_ids: list[str]) -> dict[str, StoredChunk]: ...
 
     def close(self) -> None: ...
+
+
+@runtime_checkable
+class GraphStore(Protocol):
+    """The lookups graph retrieval needs (design §5, S11) — PostgreSQL only; the configuration
+    refuses a graph on any other backend. The rules (which names seed a walk, what a hub is)
+    live in graph.py; these only return data."""
+
+    def graph_names_in(
+        self, kb: KbRef, query_key: str, where: dict[str, Any] | None = None
+    ) -> list[tuple[str, int]]:
+        """(entity, inside) for every entity key found inside `query_key` (the normalised
+        query) and mentioned in a document `where` keeps: `inside` counts the other entity keys
+        of the kb that contain it (a property of the names, so over the whole kb)."""
+        ...
+
+    def graph_chunks_of(
+        self, kb: KbRef, entities: list[str], where: dict[str, Any] | None = None
+    ) -> list[tuple[str, str]]:
+        """(entity, chunk_id) for every chunk mentioning one of `entities`, in a document
+        `where` keeps: a filtered-out document neither returns nor bridges anything."""
+        ...
+
+    def graph_entities_of(self, kb: KbRef, chunk_ids: list[str]) -> list[tuple[str, str]]:
+        """(entity, chunk_id) for every entity the chunks mention."""
+        ...
 
 
 class VectorCache(Protocol):

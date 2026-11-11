@@ -5,6 +5,9 @@ model). Every completion says which `provider/model` produced it.
 What differs between providers is data in `PROVIDERS`, not branches in the clients.
 """
 
+import threading
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -57,6 +60,28 @@ class LLM(Protocol):
     def model_id(self) -> str: ...
 
     def complete(self, messages: list[Message]) -> Completion: ...
+
+
+class BoundedCalls:
+    """An LLM shared by every ingest running at once (a server ingests several documents in
+    parallel): at most `concurrency` calls in flight in total. Used by the per-chunk enhancers
+    (contextual headers, graph extraction)."""
+
+    def __init__(self, llm: LLM, concurrency: int = 1) -> None:
+        self._llm = llm
+        self._concurrency = concurrency
+        self._slots = threading.BoundedSemaphore(concurrency)
+
+    def text(self, messages: list[Message]) -> str:
+        with self._slots:
+            return self._llm.complete(messages).text
+
+    def map[T, R](self, one: Callable[[T], R], items: Sequence[T]) -> list[R]:
+        """`one` over `items`, in order; up to `concurrency` at once (independent calls)."""
+        if self._concurrency == 1 or len(items) <= 1:
+            return [one(i) for i in items]
+        with ThreadPoolExecutor(min(self._concurrency, len(items))) as pool:
+            return list(pool.map(one, items))
 
 
 class _Client:

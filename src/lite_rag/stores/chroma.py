@@ -35,7 +35,7 @@ from chromadb.config import Settings as ChromaSettings
 from chromadb.errors import NotFoundError
 
 from lite_rag.db import migration_files
-from lite_rag.errors import KbNotFound, StoreError
+from lite_rag.errors import ConfigError, KbNotFound, StoreError
 from lite_rag.keyword import Bm25Inputs, Posting, bm25
 from lite_rag.ranking import ranked
 from lite_rag.stores.base import (
@@ -313,8 +313,15 @@ class ChromaStore:
     # --- retrieval ---------------------------------------------------------------------------
 
     def vector_query(
-        self, kb: KbRef, vector: list[float], n: int, where: dict[str, Any] | None = None
+        self,
+        kb: KbRef,
+        vector: list[float],
+        n: int,
+        where: dict[str, Any] | None = None,
+        among: list[str] | None = None,
     ) -> list[tuple[str, float]]:
+        if among is not None:  # only the graph path narrows the search
+            raise _no_graph()
         flt = _chroma_where(where or {})
         with self._lock:
             result = self._collection(kb).query(
@@ -421,6 +428,8 @@ class ChromaStore:
         chunks: list[IndexedChunk],
         parents: list[Chunk] | None = None,
     ) -> None:
+        if any(c.graph.entities for c in chunks):
+            raise _no_graph()
         with self._lock:
             info = self.get_kb(kb)
             if info is None:
@@ -575,3 +584,7 @@ class ChromaStore:
                 " VALUES (?, ?, ?, ?)",
                 [(model_id, dim, key, array("f", v).tobytes()) for key, v in vectors.items()],
             )
+
+
+def _no_graph() -> ConfigError:
+    return ConfigError("graph retrieval needs the postgres backend (design §5, S11)")

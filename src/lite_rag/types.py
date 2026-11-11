@@ -61,3 +61,26 @@ class Hit:
     scores: dict[str, float] = field(default_factory=dict)
     ranks: dict[str, int] = field(default_factory=dict)
     kb: str = field(kw_only=True)  # the knowledge base it came from (several searched at once)
+
+
+# Graph retrieval (design §5, S11): what an LLM found in one chunk.
+
+
+@dataclass(frozen=True)
+class Entity:
+    key: str  # entity_key(name): what merges mentions across chunks and documents
+    name: str  # as the passage writes it (the first spelling seen in the chunk)
+    type: str  # free text from the model, "" when it gave none
+
+
+@dataclass(frozen=True)
+class Relation:
+    source: str  # entity keys
+    target: str
+    description: str
+
+
+@dataclass(frozen=True)
+class ChunkGraph:
+    entities: tuple[Entity, ...] = ()
+    relations: tuple[Relation, ...] = ()

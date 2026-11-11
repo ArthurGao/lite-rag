@@ -88,3 +88,18 @@ def test_the_loader_is_part_of_the_index() -> None:
     a = load_settings(loader={"pdf": "pypdf"})
     b = load_settings(loader={"pdf": "docling"})
     assert kb_for(index_identity(a)) != kb_for(index_identity(b))
+
+
+def test_a_graph_is_part_of_the_index_so_it_gets_its_own_kb() -> None:
+    plain = load_settings(chunking={"strategy": "markdown"})
+    graph = load_settings(chunking={"strategy": "markdown"}, graph={"enabled": True})
+    graph_bigger = load_settings(
+        chunking={"strategy": "markdown"}, graph={"enabled": True, "llm": {"model": "qwen3:14b"}}
+    )
+    graph_deeper = load_settings(
+        chunking={"strategy": "markdown"}, graph={"enabled": True, "hops": 3}
+    )
+    assert kb_for(index_identity(plain)) != kb_for(index_identity(graph))
+    assert kb_for(index_identity(graph)) != kb_for(index_identity(graph_bigger))
+    assert kb_for(index_identity(graph)) == kb_for(index_identity(graph_deeper))  # query-time only
+    assert "graph" not in index_identity(plain)  # existing eval kbs keep their names

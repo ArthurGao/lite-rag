@@ -25,17 +25,19 @@ from typing import Any
 
 from lite_rag.answer import Answer, check_citations, prompt
 from lite_rag.chunking import build_chunker, chunk_context, embedding_text
-from lite_rag.config import Mode, Settings
+from lite_rag.config import Mode, RetrievalPath, Settings
 from lite_rag.contextual import Contextualizer
 from lite_rag.embedding import Embedder, build_embedder
-from lite_rag.errors import InvalidRequest, KbMismatch, KbNotFound, StoreError
+from lite_rag.errors import ConfigError, InvalidRequest, KbMismatch, KbNotFound, StoreError
 from lite_rag.fusion import rrf, weighted
+from lite_rag.graph import GraphExtractor, entity_key, seeds, walk
 from lite_rag.llm import LLM, build_llm
 from lite_rag.loaders import doc_id_for, file_doc_id, load_file
 from lite_rag.ranking import Key, ranked
 from lite_rag.rerank import Reranker, build_reranker
 from lite_rag.stores.base import (
     CachedStore,
+    GraphStore,
     IndexedChunk,
     KbInfo,
     KbRef,
@@ -45,7 +47,7 @@ from lite_rag.stores.base import (
 )
 from lite_rag.stores.factory import open_store
 from lite_rag.text import build_counter, terms
-from lite_rag.types import Document, Hit
+from lite_rag.types import ChunkGraph, Document, Hit
 
 NAMESPACE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}(/[a-z0-9][a-z0-9_.-]{0,62}){0,3}$")
 KB_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,99}$")
@@ -90,6 +92,7 @@ class RagRuntime:
         reranker: Reranker | None = None,
         llm: LLM | None = None,
         context_llm: LLM | None = None,
+        graph_llm: LLM | None = None,
     ) -> None:
         """`reranker` and the LLMs are built from `settings` on first use when not given, so a
         search-only runtime never needs an LLM key or the rerank model."""
@@ -103,6 +106,8 @@ class RagRuntime:
         self._llm = llm
         self._context_llm = context_llm
         self._contextualizer: Contextualizer | None = None
+        self._graph_llm = graph_llm
+        self._graph_extractor: GraphExtractor | None = None
         self._lock = threading.Lock()  # each model is built once, also under concurrent requests
 
     @classmethod
@@ -162,6 +167,15 @@ class RagRuntime:
                 )
             return self._contextualizer
 
+    def graph_extractor(self) -> GraphExtractor:
+        """One for the runtime, like the contextualizer: its `concurrency` bounds every ingest."""
+        with self._lock:
+            if self._graph_extractor is None:
+                cfg = self.settings.graph
+                llm = self._graph_llm or build_llm(cfg.llm)
+                self._graph_extractor = GraphExtractor(llm, cfg.concurrency)
+            return self._graph_extractor
+
     def close(self) -> None:
         self.store.close()
 
@@ -206,7 +220,11 @@ class RagEngine:
             self._embedder.dim,
             self._embedder.prefixes.query,
             self._embedder.prefixes.document,
-            {**self._settings.chunking.identity(), "counter": self._counter.identity},
+            {
+                **self._settings.chunking.identity(),
+                "counter": self._counter.identity,
+                **self._settings.graph.index_identity(),
+            },
         )
 
     def _open(self, kb: str, *, create: bool) -> KbRef:
@@ -255,11 +273,16 @@ class RagEngine:
             if self._settings.chunking.contextual.enabled
             else [None] * len(chunks)
         )
+        graphs = (
+            self.runtime.graph_extractor().extract(chunks)
+            if self._settings.graph.enabled
+            else [ChunkGraph()] * len(chunks)
+        )
         inputs = [embedding_text(c, ctx) for c, ctx in zip(chunks, contexts, strict=True)]
         vectors = self._embedder.embed_documents(inputs) if inputs else []
         indexed = [
-            IndexedChunk(c, v, terms(t), ctx)
-            for c, v, t, ctx in zip(chunks, vectors, inputs, contexts, strict=True)
+            IndexedChunk(c, v, terms(t), ctx, g)
+            for c, v, t, ctx, g in zip(chunks, vectors, inputs, contexts, graphs, strict=True)
         ]
         self._store.upsert_document(ref, doc, digest, indexed, parents)
         return Upserted(doc_id, len(indexed), skipped=False)
@@ -298,11 +321,11 @@ class RagEngine:
         rerank: bool | None = None,
         where: dict[str, Any] | None = None,
     ) -> list[Hit]:
-        """The best `top_k` chunks for `query` (design §5). `mode`: `vector`, `bm25` or `hybrid`
-        (both, fused). `rerank` (default: config) re-scores the best `rerank.top_n` candidates
-        with a cross-encoder. `where` keeps only documents whose metadata has each key equal to
-        its scalar value. Each hit carries every stage's score and rank; `score` is the final
-        one."""
+        """The best `top_k` chunks for `query` (design §5). `mode`: `vector`, `bm25`, `graph`
+        (needs graph.enabled) or `hybrid` (the `retrieval.hybrid_paths`, fused). `rerank`
+        (default: config) re-scores the best `rerank.top_n` candidates with a cross-encoder.
+        `where` keeps only documents whose metadata has each key equal to its scalar value. Each
+        hit carries every stage's score and rank; `score` is the final one."""
         refs = [self._open(kb, create=False)]
         return self._search(refs, query, top_k=top_k, mode=mode, rerank=rerank, where=where)
 
@@ -346,6 +369,7 @@ class RagEngine:
         if k < 1:
             raise InvalidRequest(f"top_k must be at least 1, got {k}")
         mode = mode or cfg.mode
+        paths = self._paths(mode)
         reranking = self._settings.rerank.enabled if rerank is None else rerank
         if not refs:
             return []
@@ -355,11 +379,16 @@ class RagEngine:
         pool = max(self._settings.rerank.top_n, k) if reranking else k
         wanted = pool * self._chunker.children_per_parent  # chunks that make `pool` parents
         n = max(wanted, k * cfg.candidate_factor) if mode == "hybrid" else wanted
-        vector = self._embedder.embed_query(query) if mode in ("vector", "hybrid") else None
+        vector = self._embedder.embed_query(query) if paths & {"vector", "graph"} else None
+        # Each kb's graph is walked once: deeper rounds below only re-rank what it reached.
+        graph = [self._reach(ref, query, where) for ref in refs] if "graph" in paths else []
         while True:
             # Keyed (kb index, chunk id): a chunk id is unique within its kb only. Each path's
             # lists from every kb are merged by score into one, then fused once.
-            per_kb = [self._rank(ref, query, vector, mode, n, where) for ref in refs]
+            per_kb = [
+                self._rank(ref, query, vector, paths, n, where, graph[i] if graph else None)
+                for i, ref in enumerate(refs)
+            ]
             full = any(len(found) == n for r in per_kb for found in r.values())
             merged: dict[str, dict[Key, float]] = {}
             for i, r in enumerate(per_kb):
@@ -403,18 +432,54 @@ class RagEngine:
         ref: KbRef,
         query: str,
         vector: list[float] | None,
-        mode: Mode,
+        paths: set[RetrievalPath],
         n: int,
         where: dict[str, Any] | None,
+        reached: list[str] | None,
     ) -> dict[str, list[tuple[str, float]]]:
-        """Each path's top `n` in one kb (fusion happens once, over every kb's lists)."""
+        """Each path's top `n` in one kb (fusion happens once, over every kb's lists).
+        `reached`: the chunks the kb's graph reached (graph path only)."""
         rankings: dict[str, list[tuple[str, float]]] = {}
-        if vector is not None:
+        if "vector" in paths:
+            assert vector is not None  # embedded for these paths
             rankings["vector"] = self._store.vector_query(ref, vector, n, where)
-        if mode in ("bm25", "hybrid"):
+        if "bm25" in paths:
             bm = self._settings.retrieval.bm25
             rankings["bm25"] = self._store.bm25_query(ref, terms(query), n, bm.k1, bm.b, where)
+        if "graph" in paths:
+            assert vector is not None and reached is not None
+            # the graph narrows, the query vector orders
+            rankings["graph"] = (
+                self._store.vector_query(ref, vector, n, where, among=reached) if reached else []
+            )
         return rankings
+
+    def _paths(self, mode: Mode) -> set[RetrievalPath]:
+        """The retrieval paths `mode` runs: itself, or for hybrid the configured ones."""
+        paths: set[RetrievalPath] = (
+            set(self._settings.retrieval.hybrid_paths) if mode == "hybrid" else {mode}
+        )
+        if "graph" in paths and not self._settings.graph.enabled:
+            raise InvalidRequest(
+                "the graph path needs graph.enabled and a kb built with it (design §5, S11)"
+            )
+        return paths
+
+    def _reach(self, ref: KbRef, query: str, where: dict[str, Any] | None) -> list[str]:
+        """The chunks the kb's graph reaches from the entities the query names (graph.py),
+        walking only documents `where` keeps."""
+        store = self._store
+        if not isinstance(store, GraphStore):  # the configuration refuses this; say so anyway
+            raise ConfigError("graph retrieval needs the postgres backend (design §5, S11)")
+        cfg = self._settings.graph
+        return walk(
+            seeds(store.graph_names_in(ref, entity_key(query), where)),
+            lambda keys: store.graph_chunks_of(ref, keys, where),
+            lambda chunks: store.graph_entities_of(ref, chunks),
+            hops=cfg.hops,
+            hub_chunks=cfg.hub_chunks,
+            max_neighbors=cfg.max_neighbors,
+        )
 
     @staticmethod
     def _hit(

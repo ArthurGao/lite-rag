@@ -23,6 +23,8 @@ def make_runtime(
     rerank: dict[str, Any] | None = None,
     reranker: Reranker | None = None,
     llm: LLM | None = None,
+    graph: dict[str, Any] | None = None,
+    graph_llm: LLM | None = None,
     **chunking: Any,
 ) -> RagRuntime:
     settings = load_settings(
@@ -30,10 +32,11 @@ def make_runtime(
         embedding={"cache": cache},
         retrieval=retrieval or {},
         rerank=rerank or {},
+        graph=graph or {},
     )
     inner = embedder or FakeEmbedder(dim=8)
     wrapped: Embedder = CachingEmbedder(inner, store) if cache else inner
-    return RagRuntime(settings, store, wrapped, reranker=reranker, llm=llm)
+    return RagRuntime(settings, store, wrapped, reranker=reranker, llm=llm, graph_llm=graph_llm)
 
 
 def make_engine(

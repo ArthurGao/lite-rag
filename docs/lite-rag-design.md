@@ -27,9 +27,11 @@ lite-rag 是一个**可读、可改、可单独部署**的轻量 RAG 引擎，�
 
 ```
 摄取：  文件/文本 → Loader → Document → Chunker → chunks → Embedder ─┐
-                                                   └→ 分词(jieba) ────┴→ Store（一个事务：登记 + 向量 + 倒排）
+                                                   ├→ 分词(jieba) ────┤
+                                                   └→ [LLM 抽实体/关系] ┴→ Store（一个事务：登记 + 向量 + 倒排 + 图）
 检索：  query → Embedder → 向量 top-n ┐
-        query → 分词 → BM25 top-n    ┴→ 融合(RRF) → [Reranker] → top-k Hit
+        query → 分词 → BM25 top-n    ┤
+        query → 种子实体 → 沿共现扩展 → 范围内按向量排序 ┴→ 融合(RRF) → [Reranker] → top-k Hit
 回答：  Hit[] → prompt 模板(answer_system.j2 + answer_user.j2) → LLM → Answer(status, text, citations, provenance)
 ```
 
@@ -42,7 +44,7 @@ lite-rag 是一个**可读、可改、可单独部署**的轻量 RAG 引擎，�
 | `Loader` | `load_file(path, pdf) -> Loaded(title, text, pages)` | txt、md；pdf 用 pypdf（extra `[pdf]`，逐页抽纯文本） | `docling`（extra `[docling]`，`loader.pdf: docling`）：PDF、DOCX 转成 Markdown，保留标题；`.docx` 总是走它 |
 | `Chunker` | `split(doc) -> list[Chunk]`；`split_parents(doc) -> (parents, chunks)` | `recursive` | 见 §3.1：fixed、sentence、paragraph、markdown、semantic、parent-child，另有 contextual 增强 |
 | `Embedder` | `embed_documents(texts)`、`embed_query(text)`、`dim`、`model` | `ollama`（`bge-m3`） | 见 §3.2：openai 兼容、voyage、cohere、gemini、fastembed、sentence-transformers、`FakeEmbedder` |
-| `Store` | `get_or_create_kb`、`get_kb`、`upsert_document`、`delete_document`、`vector_query`、`bm25_query`、`chunks`、`stats` | `PgStore`（pgvector 存向量，PG 表存 BM25 倒排和文档登记） | `ChromaStore`（extra `[chroma]`）：向量放 Chroma，倒排和登记放 SQLite |
+| `Store` | `get_or_create_kb`、`get_kb`、`upsert_document`、`delete_document`、`vector_query`（可用 `among` 限定 chunk 范围）、`bm25_query`、`chunks`、`stats`；图检索另有 `GraphStore`（只有 PgStore 实现）：`graph_names_in`、`graph_chunks_of`、`graph_entities_of` | `PgStore`（pgvector 存向量，PG 表存 BM25 倒排和文档登记） | `ChromaStore`（extra `[chroma]`）：向量放 Chroma，倒排和登记放 SQLite |
 | `Reranker` | `score(query, texts) -> list[float]`（只打分；排序和组装上下文由引擎负责） | 不启用（`rerank.enabled=false`） | 本地 cross-encoder `BAAI/bge-reranker-v2-m3-int8`（extra `[fastembed]`） |
 | `LLM` | `complete(messages) -> Completion` | `OpenAICompatLLM`（Ollama `/v1`、OpenAI、llm-gateway） | `AnthropicLLM`（extra `[anthropic]`）、`FakeLLM` |
 
@@ -136,6 +138,8 @@ engine.stats(kb)
 | `chunks` | `id`（`"{doc_id}#{n}"`）、`kb`、`doc_id`、`n`、`text`、`length`（词数）、`metadata` JSONB |
 | `embeddings_<dim>` | `chunk_id`、`kb`、`embedding vector(<dim>)`，HNSW 索引（cosine）。每个维度一张表，首次使用时创建 |
 | `postings` | `kb`、`term`、`chunk_id`、`tf`；索引 `(kb, term)` |
+| `graph_mentions`（S11） | `kb`、`chunk_id`、`doc_id`、`entity`（规范化后的名字）、`name`、`type`：哪个 chunk 提到了哪个实体；随 chunk 级联删除 |
+| `graph_relations`（S11） | `kb`、`chunk_id`、`doc_id`、`source`、`target`、`description`：chunk 里抽出的关系；随 chunk 级联删除 |
 
 - **一个事务**：`upsert_document` 在同一个事务里删掉旧的 chunk、embedding 和 posting，写入新的，再更新 `documents` 和 `kbs` 里的统计。没有中间状态，也不需要恢复逻辑。
 - **BM25 查询**：先在 SQL 里按 `(kb, term)` 取出 posting，同时拿到 `n(t)`、`N`、`avgdl`，再按第 5 节的公式打分。打分既可以在 Python 里算（`keyword.py`，便于阅读），也可以整段在 SQL 里算（快）。两种算法的结果用同一组测试核对。
@@ -180,6 +184,19 @@ engine.stats(kb)
 - **Rerank**（可选）：取融合后的前 n 条，用 cross-encoder 对每个 `(query, chunk)` 对重新打分，再取前 k 条。
 - **模式**：`vector`、`bm25`、`hybrid`。每个 `Hit` 都带各阶段的分数 `scores={vector, bm25, fused, rerank}` 和排名，方便对比和调试。
 - **多个 kb 一起查**（S10，2026-11-09，为 llm-steward 的联合检索）：`RagEngine.search_kbs(kbs, query, …)` 把同一 namespace 里的几个 kb 当成一个来查。query 只嵌入一次；每一路（向量、BM25）在各 kb 取前 n 条，按分数合并成一张表，再只融合一次、只 rerank 一次。结果的 `Hit.kb` 标明来源（chunk id 只在 kb 内唯一，内部用"kb 序号/chunk id"作键）。向量分数在 kb 之间可比（一个引擎只有一个模型）；BM25 的 IDF 是各 kb 自己统计的，合并后的 BM25 表是近似的：小 kb 里同一个词的 IDF 更高，分数偏大，在默认路径（rerank 关）上会占到合并后 BM25 表的前排。开 rerank 时最终顺序完全可比。查询次数随 kb 数增长（每一轮每个 kb 两路各一次，加深时每个 kb 都重查）。留到以后：偏差成问题时，让 Store 返回每个 kb 的 (N, df(t), avgdl)，由引擎算统一的 IDF；kb 多时把各 kb 的查询并行，或在 PG 上一条 SQL 查多个 kb 的向量。还没写过文档（不存在）的 kb 跳过；名字不合法仍是 `InvalidRequest`。单 kb 的 `search` 走同一套流程，结果不变。
+- **图检索**（S11，2026-11-12，只做 local、只支持 PG）：
+  - **建库**：kb 开了 `graph.enabled` 时，每个 chunk 调一次 LLM（`graph.llm`，默认本地 qwen3、关闭思考），按 `prompts/graph_*.j2` 抽出实体（名字、类型）和关系（两端实体、一句描述），回复是 JSON。只给 LLM 看 chunk 正文，不给文档标题：给了标题，本地模型会把标题当成每个 chunk 的实体，成为连接一切的枢纽（实测）。回复不是合法 JSON、缺了 `entities` 或 `relations` 列表（没找到就是空列表，不是缺字段）、或字段类型不对，整篇写入失败，不重试别的模型（规则 5）。关系端点不在实体列表里时补成实体。实体按规范化的名字合并（NFKC、casefold、合并空白），所以同一个人在不同文档里是同一个节点。图和 chunk 在同一个事务里写；抽取模型和 prompt 记进 kb 的身份（`chunker.graph`），换了就要新 kb。Chroma 后端不支持，配置时就报错。
+  - **查询**（`graph` 路径，不调 LLM）：**图圈范围，向量排序。**
+    1. **种子**：名字（规范化后）是 query 子串的实体，至少 2 个字符；名字被包含在 2 个以上其他实体名里的不算（"委员会"、"council" 这类类别词）。
+    2. **扩展**：沿"同一个 chunk 里同时被提到"走：实体 → 提到它的 chunk → 这些 chunk 里的其他实体，共 `graph.hops` 跳（默认 2，即答案离问题点名的实体隔两篇文档）。被超过 `graph.hub_chunks` 个 chunk（默认 5）提到的实体是枢纽（公司名、贯穿全文的主题）：不经过它扩展，也不通过它把 chunk 纳入范围。每跳只留连接 chunk 最多的 `graph.max_neighbors` 个新实体。
+    3. **排序**：到达的 chunk 按与 query 向量的余弦相似度排序（`vector_query(…, among=到达的 chunk)`，按主键精确扫描，不走 HNSW）。分数因此与 vector 路径可比。
+    `where` 限定的是整个语料：种子只从保留下来的文档里找，走图也只经过它们，被过滤掉的文档既不出现在结果里，也不能当桥（S11 收尾时 Codex 指出，2026-11-12）。一次检索里每个 kb 的图只走一次，加深轮次只重新排序。种子规则和枢纽规则都在 `graph.py`，store 只返回数据。
+    走共现而不走抽出的关系，是因为本地模型漏掉了很多它本可以写出的关系（中文人员小节几乎没有关系）；关系照样存下，留给以后的 global 模式和回答上下文。
+  - **为什么这样打分**（2026-11-12 多跳评测，12 道 2–3 跳题，离线比较）：第一版按"实体权重之和"给 chunk 打分，种子所在的 chunk 永远最高，答案被压在后面，多跳 hit@5 只有 0.42，单跳对照题也从 1.00 掉到 0.25；用向量找种子带来大量噪音。"图圈范围、向量排序"多跳 hit@5 0.92、单跳不受影响。多跳题的 hit@1 在所有方式下都是 0：排第一的通常是推理链的第一环（种子所在 chunk），答案紧随其后；回答时两者都要交给 LLM，所以这类题看 hit@5。
+  - **模式**：新增 `mode: graph`（只走图）。`hybrid` 包含哪几路由 `retrieval.hybrid_paths` 决定，默认 `[vector, bm25]`（行为不变），加上 `graph` 就是多路 RRF。加权融合只支持 vector + bm25，配了 graph 会报错。kb 没开图时用 `mode: graph` 报 `InvalidRequest`。
+  - **代价**：建库每个 chunk 一次 LLM 调用；查询多 2–3 条 SQL 加一次限定范围的向量查询。种子匹配扫描整个 kb 的实体名，规模大到成为瓶颈时再加索引。
+  - **局限**：问题必须写出实体的名字（"Atlas 项目的负责人"能找到"atlas 项目"，只写"Atlas"找不到）；`hub_chunks` 是绝对数，语料大了要调。
+  - **不做**（S11b 再定）：global 模式（社区划分 + 社区摘要，回答整批文档的汇总题）、查询时用 LLM 抽关键词或实体向量找种子、实体描述的合并摘要。
 - **过滤**：先按 namespace 和 kb 隔离；`where` 是"键 → 标量值"（str、int、float、bool）的等值过滤，向量和 BM25 两路都会生效；bool 不等于数字。值不是标量（列表、对象、null）会报 `InvalidRequest`（400），在嵌入查询之前就检查，两个后端规则相同（S8 定，2026-11-09）。
 
 ## 6. 生成
@@ -248,7 +265,8 @@ database_url: null        # 一般用环境变量 LITERAG_DATABASE_URL，不写�
 store: {backend: postgres, schema: lite_rag}   # 或 {backend: chroma, data_dir: ./lite_rag_data}
 embedding: {provider: ollama, model: bge-m3, base_url: http://127.0.0.1:11434, batch_size: 32, max_concurrency: 4, query_prefix: ""}
 chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50, contextual: {enabled: false}}
-retrieval: {mode: hybrid, top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60, bm25: {k1: 1.5, b: 0.75}}
+retrieval: {mode: hybrid, hybrid_paths: [vector, bm25], top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60, bm25: {k1: 1.5, b: 0.75}}
+graph: {enabled: false, llm: {provider: ollama, model: qwen3:8b, reasoning_effort: none}, concurrency: 4, hops: 2, hub_chunks: 5, max_neighbors: 20}
 rerank: {enabled: false, model: BAAI/bge-reranker-v2-m3-int8, top_n: 20}
 llm: {provider: ollama, model: qwen3:8b}
 server: {host: 127.0.0.1, port: 8700}
@@ -306,6 +324,7 @@ lite-rag/
 | S7 Chroma 后端 | `ChromaStore` 加 SQLite 倒排，以及写入顺序与恢复逻辑 | 同一套 Store 合约测试在 PG 和 Chroma 上都通过；崩溃恢复测试 |
 | S8 收尾 | `/simplify`、Codex review、修复问题，然后重跑全部检查 | review 结论记录在案 |
 | S9 接入 llm-steward | `LiteRagProvider`（in-process 和 HTTP 两种）、合约测试、更新 llm-steward 设计文档 | llm-steward 的 KB 合约测试在两种接入方式下都通过；手动端到端：生效条目能检索到，废弃后检索不到 |
+| S11 Graph RAG（local） | `graph.enabled`：建库时 LLM 抽实体和关系，存进 PG 的三张图表（与 chunk 同一事务）；`graph` 检索路径（问题点名的实体 → 沿共现扩展 → 范围内按向量排序），`mode: graph` 与 `retrieval.hybrid_paths`；多跳评测集 `eval/golden-multihop.jsonl` | 抽取：FakeLLM 单测（合法、带代码块、非法 JSON；端点补实体；名字合并；prompt 不含标题）；扩展按手算核对（跳数、枢纽、每跳上限与排序）；PG 集成：写入、替换、删除后图随文档消失；类别词和单字母不当种子；多跳答案只能经图找到，分数与 vector 路径一致；配置冲突（chroma、未开图、加权融合）报错；kb 身份含抽取模型；`-m ollama` 真实抽取能解析；eval 前后对比记进 KB |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 ## 13. 待确认
@@ -331,6 +350,13 @@ lite-rag/
   - **Codex review（2026-11-08）**，5 条都成立并已修复，各有先红后绿的回归测试：上传大小上限原先在路由里才检查，而 FastAPI 在路由运行前已经把整个 multipart 请求读完并落盘，现在由 ASGI 中间件在解析前按 `Content-Length` 拒绝、没有长度时边收边数，返回 413（上限另加 8 KiB 给 multipart 边界）；reindex 先查"目标不存在"再写入，中间被别人建了同名 kb 就会写进去、失败时还会删掉它，现在用一条 `INSERT … ON CONFLICT DO NOTHING` 原子地创建目标，没建成就拒绝；上传报错原样带出客户端的文件名，文件类型不支持时甚至带出服务器上的临时路径，现在一律是固定措辞；不返回给客户端的上游错误写日志前去掉 URL 里的凭据和 `password=`；CI 冒烟测试在服务一直没就绪时也会继续往下跑，现在超时即失败，并检查容器仍在运行。Codex 未发现能越过 namespace 或 kb 授权的路径。
   - **提交后安全审查（2026-11-09）**，3 条都成立，单独修复：不配 key 的开放模式只靠绑定回环地址，但浏览器里的网页可以用 DNS rebinding 以自己的域名访问回环地址，现在开放模式只接受 `localhost`、`127.0.0.1`、`[::1]` 这几个 Host（Starlette `TrustedHostMiddleware`）；请求体上限原来只管上传，JSON 请求体没有上限，而 FastAPI 在鉴权之前就会读完请求体，现在所有请求都有上限（`server.max_body_mb`，默认 10，上传仍用 `max_upload_mb`），超过返回 413；`GET /v1/kbs` 原来列出 namespace 下全部 kb，会把 key 的 `kbs` 范围之外的名字也告诉调用方，现在只列 key 能访问的。
   - 端到端（`deploy/compose.yaml`，宿主机 Ollama）发现镜像里没有 `pdf` extra，上传 PDF 会失败；镜像现在带 `server` 和 `pdf`（443 MB）。docling 会带进几 GB 的 torch，不放进镜像，要用就自己构建。
+- S11 实现说明与收尾（2026-11-12）：
+  - 决定（用户 2026-11-12 选定）：lite-rag 尽量覆盖主流 RAG 方式；Graph RAG 第一版只做 local，只支持 PG。
+  - **两版打分**：第一版"实体权重相加 + 实体向量找种子"在多跳题上不如单用向量（见 §5）；离线比较几种打分后改为"问题点名的实体 → 共现扩展 → 范围内按向量排序"，删掉了实体向量表。数字记在 KB `projects/lite-rag/reference/eval-results.md`。
+  - **/simplify 改了**：`Contextualizer` 和 `GraphExtractor` 共用 `llm.BoundedCalls`（限流并发只剩一份）；种子规则从 SQL 搬回 `graph.seeds`；图查询拆成 `GraphStore` Protocol，Chroma 不再需要只会报错的方法；每个 kb 的图一次检索只走一次；`among` 按主键精确扫描；图是否计入 kb 身份统一由 `GraphConfig.index_identity()` 决定（engine 和 eval 共用）；去掉没用的 `doc` 参数、冗余的 `doc_id` 列和两个没用到的关系索引；测试经 `support.make_engine` 构造。
+  - **/simplify 没改的**：类别词判定每次查询扫一遍实体名（规模到了再预计算）；contextual 与图抽取串行（两次 LLM 遍历可以并行，超出本阶段）；两处 prompt 指纹的写法、测试里的 barrier 替身没有合并（收益很小）。
+  - **Codex review**：两条成立并已修复，各有先红后绿的测试：`where` 原先只过滤最终结果，被过滤掉的文档仍能在走图时当桥，现在种子和扩展都只看保留下来的文档；回复缺 `entities` 或 `relations` 字段时被当成空图写入，现在报错。一条不采纳：kb 身份不记录抽取用的 `base_url`、temperature 等，理由与 contextual 一致——身份记录模型和 prompt，不记录采样和传输参数（eval 同样把 `base_url` 视为传输参数）。
+  - 本阶段改了一个已有测试：`test_migrate.py` 的迁移列表加上 `0006_graph`（新增迁移即规格变化）。本阶段早先写的 `test_a_metadata_filter_applies_to_the_graph_path` 验证的是被 Codex 推翻的旧语义，由 `test_a_metadata_filter_also_scopes_the_walk` 取代。
 - S10 收尾（2026-11-09）：
   - **/simplify 改了**：
     - `_search` 直接接收已打开的 kb 列表，"kb 不存在时报错还是跳过"由 `search`、`search_kbs` 各自决定，去掉了 `skip_missing` 参数和 `_readable`；"某一路取满了"在合并之后再算。

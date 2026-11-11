@@ -6,6 +6,8 @@
 - Vectors live in `embeddings_<dim>`, one table per dimension (an HNSW index needs a fixed one),
   created with the first kb of that dimension; up to 2000 dimensions as `vector`, larger as
   `halfvec` (pgvector's HNSW limits).
+- Graph (S11): `graph_mentions` and `graph_relations` are rows of their chunk (they cascade with
+  it).
 - Every pooled connection has `search_path = <schema>, public`, so SQL uses unqualified names.
 """
 
@@ -69,6 +71,9 @@ def _metadata_filter(
     ).format(kb=kb, doc=doc_id)
     return clause, {"where": Jsonb(where)}
 
+
+# The document of a graph mention (graph_mentions keeps no doc_id: it is the chunk's).
+_MENTION_DOC = sql.SQL("(SELECT c.doc_id FROM chunks c WHERE c.kb = m.kb AND c.id = m.chunk_id)")
 
 # BM25 (keyword.py has the formula). One statistics block for both implementations: N and avgdl
 # from `kbs`, n(t) counted over the whole kb BEFORE the metadata filter — a filter narrows which
@@ -269,11 +274,30 @@ class PgStore:
     # The engine opens a kb (existence and identity) before any of these; they trust `kb`.
 
     def vector_query(
-        self, kb: KbRef, vector: list[float], n: int, where: dict[str, Any] | None = None
+        self,
+        kb: KbRef,
+        vector: list[float],
+        n: int,
+        where: dict[str, Any] | None = None,
+        among: list[str] | None = None,
     ) -> list[tuple[str, float]]:
         dim = len(vector)  # the engine checked it is the kb's dimension
         doc = sql.SQL("(SELECT c.doc_id FROM chunks c WHERE c.kb = e.kb AND c.id = e.chunk_id)")
         filter_sql, params = _metadata_filter(sql.SQL("e.kb"), doc, where)
+        params |= {"q": _vector_text(vector), "kb": kb.key, "n": n}
+        if among is not None:
+            # A few hundred known chunks (the graph path): an exact scan by primary key. The
+            # HNSW index would walk much of the graph to find them; OFFSET 0 keeps the planner
+            # from using it.
+            params["among"] = among
+            query = sql.SQL(
+                "SELECT chunk_id, 1 - d FROM (SELECT e.chunk_id, e.embedding <=> %(q)s::{vt} AS d"
+                " FROM {table} e WHERE e.kb = %(kb)s AND e.chunk_id = ANY(%(among)s) {filter}"
+                " OFFSET 0) s ORDER BY d, chunk_id LIMIT %(n)s"
+            ).format(vt=vector_sql(dim), table=_table("embeddings", dim), filter=filter_sql)
+            with self._tx() as conn:
+                rows = conn.execute(query, params).fetchall()
+            return [(chunk, float(sim)) for chunk, sim in rows]
         query = sql.SQL(
             "SELECT e.chunk_id, 1 - (e.embedding <=> %(q)s::{vt}) AS similarity"
             " FROM {table} e WHERE e.kb = %(kb)s {filter}"
@@ -283,9 +307,7 @@ class PgStore:
             # The kb (and metadata) filter is applied after the HNSW scan; iterative scanning
             # keeps reading the index until `n` rows pass it (pgvector >= 0.8), in exact order.
             conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")
-            rows = conn.execute(
-                query, {"q": _vector_text(vector), "kb": kb.key, "n": n, **params}
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [(chunk, float(sim)) for chunk, sim in rows]
 
     def bm25_query(
@@ -307,6 +329,49 @@ class PgStore:
                 return bm25(_bm25_inputs(rows), n, k1, b)
             rows = conn.execute(_BM25_SCORE.format(filter=filter_sql), params).fetchall()
         return [(chunk, float(score)) for chunk, score in rows]
+
+    def graph_names_in(
+        self, kb: KbRef, query_key: str, where: dict[str, Any] | None = None
+    ) -> list[tuple[str, int]]:
+        filter_sql, params = _metadata_filter(sql.SQL("m.kb"), _MENTION_DOC, where)
+        query = sql.SQL(
+            "WITH e AS (SELECT DISTINCT entity FROM graph_mentions WHERE kb = %(kb)s)"
+            " SELECT n.entity, (SELECT count(*) FROM e o WHERE o.entity <> n.entity"
+            "                   AND strpos(o.entity, n.entity) > 0)"
+            " FROM e n WHERE strpos(%(q)s, n.entity) > 0"
+            " AND EXISTS (SELECT 1 FROM graph_mentions m"
+            "             WHERE m.kb = %(kb)s AND m.entity = n.entity {filter})"
+            " ORDER BY n.entity"
+        ).format(filter=filter_sql)
+        with self._tx() as conn:
+            rows = conn.execute(query, {"kb": kb.key, "q": query_key, **params}).fetchall()
+        return [(entity, int(inside)) for entity, inside in rows]
+
+    def graph_chunks_of(
+        self, kb: KbRef, entities: list[str], where: dict[str, Any] | None = None
+    ) -> list[tuple[str, str]]:
+        return self._mentions(kb, "entity", entities, where)
+
+    def graph_entities_of(self, kb: KbRef, chunk_ids: list[str]) -> list[tuple[str, str]]:
+        return self._mentions(kb, "chunk_id", chunk_ids)
+
+    def _mentions(
+        self,
+        kb: KbRef,
+        column: Literal["entity", "chunk_id"],
+        keys: list[str],
+        where: dict[str, Any] | None = None,
+    ) -> list[tuple[str, str]]:
+        if not keys:
+            return []
+        filter_sql, params = _metadata_filter(sql.SQL("m.kb"), _MENTION_DOC, where)
+        query = sql.SQL(
+            "SELECT m.entity, m.chunk_id FROM graph_mentions m"
+            " WHERE m.kb = %(kb)s AND {} = ANY(%(keys)s) {filter}"
+        ).format(sql.Identifier("m", column), filter=filter_sql)
+        with self._tx() as conn:
+            rows = conn.execute(query, {"kb": kb.key, "keys": keys, **params}).fetchall()
+        return [(entity, chunk) for entity, chunk in rows]
 
     def chunks(self, kb: KbRef, chunk_ids: list[str]) -> dict[str, StoredChunk]:
         if not chunk_ids:
@@ -371,6 +436,7 @@ class PgStore:
             )
             self._copy_parents(conn, kb, parents or [])  # first: chunks reference them
             self._copy_chunks(conn, kb, dim, chunks)
+            self._copy_graph(conn, kb, chunks)
             self._adjust_stats(
                 conn,
                 kb,
@@ -524,6 +590,25 @@ class PgStore:
                     length = len(c.terms)
                     for term, tf in Counter(c.terms).items():
                         copy.write_row((kb.key, term, c.chunk.chunk_id, tf, length, c.chunk.doc_id))
+
+    def _copy_graph(self, conn: psycopg.Connection, kb: KbRef, chunks: list[IndexedChunk]) -> None:
+        if not any(c.graph.entities for c in chunks):
+            return
+        with conn.cursor() as cur:
+            with cur.copy(
+                "COPY graph_mentions (kb, chunk_id, entity, name, type) FROM STDIN"
+            ) as copy:
+                for c in chunks:
+                    for e in c.graph.entities:
+                        copy.write_row((kb.key, c.chunk.chunk_id, e.key, e.name, e.type))
+            with cur.copy(
+                "COPY graph_relations (kb, chunk_id, source, target, description) FROM STDIN"
+            ) as copy:
+                for c in chunks:
+                    for r in c.graph.relations:
+                        copy.write_row(
+                            (kb.key, c.chunk.chunk_id, r.source, r.target, r.description)
+                        )
 
     def _ensure_vector_table(self, conn: psycopg.Connection, dim: int) -> None:
         if dim in self._vector_tables:

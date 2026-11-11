@@ -1,0 +1,16 @@
+{"id": "m01", "doc": "northwind-councils", "kind": "multihop", "lang": "en", "question": "How often does the council chaired by the lead of Project Atlas meet?", "evidence": "The Data Safety Council meets every second Thursday"}
+{"id": "m02", "doc": "northwind-people", "kind": "multihop", "lang": "en", "question": "Which office does the lead of Project Beacon work from?", "evidence": "Tom Osei chairs the Spending Council and works from the Berlin office"}
+{"id": "m03", "doc": "northwind-councils", "kind": "multihop", "lang": "en", "question": "What does the council chaired by Project Cedar's lead approve?", "evidence": "It approves every offer to a senior candidate"}
+{"id": "m04", "doc": "northwind-offices", "kind": "multihop", "lang": "en", "question": "When does the office used by Project Delta's lead open?", "evidence": "The Sydney office opens at 7:30"}
+{"id": "m05", "doc": "northwind-people", "kind": "multihop", "lang": "en", "question": "Which council does the person leading Project Atlas chair?", "evidence": "Maria Keller chairs the Data Safety Council"}
+{"id": "m06", "doc": "northwind-offices", "kind": "multihop", "lang": "en", "question": "What does the office of the person who chairs the Spending Council have?", "evidence": "The Berlin office opens at 9:00 and has a bicycle workshop in the basement"}
+{"id": "c01", "doc": "northwind-councils", "kind": "keyword", "lang": "en", "question": "When does the Hiring Council meet?", "evidence": "The Hiring Council meets every Wednesday afternoon"}
+{"id": "c02", "doc": "northwind-projects", "kind": "keyword", "lang": "en", "question": "Who leads Project Delta?", "evidence": "Project Delta rebuilds the customer support portal and its search. Its lead is Jonas Berg."}
+{"id": "m07", "doc": "星河科技委员会", "kind": "multihop", "lang": "zh", "question": "北辰项目负责人主持的委员会多久开一次会？", "evidence": "数据安全委员会每两周的周四开会"}
+{"id": "m08", "doc": "星河科技人员", "kind": "multihop", "lang": "zh", "question": "南星项目的负责人在哪个城市的办公室办公？", "evidence": "王芳兼任支出委员会主任，在成都办公室办公"}
+{"id": "m09", "doc": "星河科技委员会", "kind": "multihop", "lang": "zh", "question": "西岭项目负责人担任主任的那个委员会审批什么？", "evidence": "审批所有高级岗位的录用通知"}
+{"id": "m10", "doc": "星河科技办公室", "kind": "multihop", "lang": "zh", "question": "东湖项目负责人所在的办公室几点开门？", "evidence": "苏州办公室早上七点半开门"}
+{"id": "m11", "doc": "星河科技人员", "kind": "multihop", "lang": "zh", "question": "北辰项目的负责人兼任哪个委员会的主任？", "evidence": "李明兼任数据安全委员会主任"}
+{"id": "m12", "doc": "星河科技办公室", "kind": "multihop", "lang": "zh", "question": "支出委员会主任所在的办公室有什么设施？", "evidence": "成都办公室早上九点开门，地下室有一个自行车维修间"}
+{"id": "c03", "doc": "星河科技委员会", "kind": "keyword", "lang": "zh", "question": "招聘委员会什么时候开会？", "evidence": "招聘委员会每周三下午开会"}
+{"id": "c04", "doc": "星河科技项目", "kind": "keyword", "lang": "zh", "question": "东湖项目由谁负责？", "evidence": "东湖项目负责重建客服门户和站内搜索。负责人是陈静"}

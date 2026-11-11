@@ -3,6 +3,7 @@ contract tests). They never touch the network or a model (AGENTS.md rule 6)."""
 
 import hashlib
 import random
+from collections.abc import Callable
 
 from lite_rag.chunking import unit as normalise
 from lite_rag.llm import Completion, Message
@@ -65,17 +66,19 @@ class SpreadEmbedder(FakeEmbedder):
 
 
 class FakeLLM:
-    """Replies with `reply` and records every prompt."""
+    """Replies with `reply` — a fixed text, or a function of the prompt — and records every
+    prompt."""
 
     model_id = "fake/fake-llm"
 
-    def __init__(self, reply: str = "") -> None:
+    def __init__(self, reply: str | Callable[[list[Message]], str] = "") -> None:
         self._reply = reply
         self.calls: list[list[Message]] = []  # every prompt it was sent
 
     def complete(self, messages: list[Message]) -> Completion:
         self.calls.append(list(messages))
-        return Completion(self._reply, self.model_id, {"input": 10, "output": 5})
+        text = self._reply if isinstance(self._reply, str) else self._reply(messages)
+        return Completion(text, self.model_id, {"input": 10, "output": 5})
 
 
 class FakeReranker:

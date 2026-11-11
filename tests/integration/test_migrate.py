@@ -7,6 +7,7 @@ from lite_rag.db import check_vector, migrate
 from tests.conftest import TEST_SCHEMA
 
 TABLES = {"schema_migrations", "kbs", "documents", "chunks", "postings", "parents"}
+TABLES |= {"graph_mentions", "graph_relations"}  # 0006
 
 
 def _tables(conn: psycopg.Connection) -> set[str]:
@@ -23,6 +24,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         "0003_postings_length_doc",
         "0004_pages_parents_context",
         "0005_documents_text",
+        "0006_graph",
     ]
     assert _tables(pg) == TABLES
     assert migrate(pg, TEST_SCHEMA) == []  # second run: nothing pending
@@ -35,6 +37,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         ("0003_postings_length_doc",),
         ("0004_pages_parents_context",),
         ("0005_documents_text",),
+        ("0006_graph",),
     ]
 
 

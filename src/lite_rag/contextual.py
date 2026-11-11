@@ -3,10 +3,7 @@ chunk in its document; they are prepended to what is embedded and BM25-indexed â
 text a hit returns. One LLM call per chunk, at ingest, up to `concurrency` at once; a failed
 call fails the upsert (nothing is written, no fallback model)."""
 
-import threading
-from concurrent.futures import ThreadPoolExecutor
-
-from lite_rag.llm import LLM, Message
+from lite_rag.llm import LLM, BoundedCalls, Message
 from lite_rag.prompts import digest, render_pair
 from lite_rag.text import TokenCounter
 from lite_rag.types import Chunk, Document
@@ -42,13 +39,9 @@ class Contextualizer:
     def __init__(
         self, llm: LLM, counter: TokenCounter, max_doc_tokens: int, concurrency: int = 1
     ) -> None:
-        self._llm = llm
+        self._calls = BoundedCalls(llm, concurrency)
         self._counter = counter
         self._max = max_doc_tokens
-        self._concurrency = concurrency
-        # Calls in flight across every `contexts` running at once (a server ingests several
-        # documents in parallel): never more than `concurrency` in total.
-        self._slots = threading.BoundedSemaphore(concurrency)
 
     def contexts(self, doc: Document, chunks: list[Chunk]) -> list[str]:
         """One context per chunk, in chunk order. The calls are independent: they run up to
@@ -57,11 +50,7 @@ class Contextualizer:
 
         def one(chunk: Chunk) -> str:
             shown = window(doc.text, chunk, total, self._max)
-            with self._slots:
-                reply = self._llm.complete(context_prompt(doc, chunk, shown)).text
+            reply = self._calls.text(context_prompt(doc, chunk, shown))
             return " ".join(reply.split())
 
-        if self._concurrency == 1 or len(chunks) <= 1:
-            return [one(c) for c in chunks]
-        with ThreadPoolExecutor(min(self._concurrency, len(chunks))) as pool:
-            return list(pool.map(one, chunks))
+        return self._calls.map(one, chunks)

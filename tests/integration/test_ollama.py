@@ -137,3 +137,24 @@ def test_real_contextual_headers_are_written_and_indexed(
     assert rows and all(ctx and 5 < len(ctx) < 400 for _, ctx in rows)  # one short header each
     assert all(ctx != chunk_text for chunk_text, ctx in rows)
     assert hits and "五百元" in hits[0].text and hits[0].text in text  # hit text stays the doc's
+
+
+def test_real_graph_extraction_parses_and_links_two_documents() -> None:
+    from lite_rag.config import GraphConfig
+    from lite_rag.graph import GraphExtractor
+    from lite_rag.llm import build_llm
+    from lite_rag.types import Chunk
+
+    extractor = GraphExtractor(build_llm(GraphConfig().llm))
+    found = []
+    for doc_id, text in (
+        ("projects", "北辰项目负责建设新的结算系统。负责人是李明。"),
+        ("people", "李明兼任数据安全委员会主任，在杭州办公室办公。"),
+    ):
+        chunk = Chunk(f"{doc_id}#0", doc_id, 0, text, 0, len(text), len(text))
+        found.append(extractor.extract([chunk])[0])
+
+    keys = [{e.key for e in g.entities} for g in found]
+    assert "李明" in keys[0] and "李明" in keys[1]  # the same person links the two documents
+    assert any("北辰" in k for k in keys[0])
+    assert found[0].relations and found[1].relations

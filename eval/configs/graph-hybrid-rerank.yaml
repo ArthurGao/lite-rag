@@ -1,0 +1,4 @@
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+graph: {enabled: true}
+retrieval: {mode: hybrid, hybrid_paths: [vector, bm25, graph]}
+rerank: {enabled: true}
