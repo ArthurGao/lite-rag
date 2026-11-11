@@ -39,7 +39,7 @@ ingest:  file / text → loader → chunker → chunks → embedder ─┐
                                              └→ [LLM: entities, relations] ┴→ store (one transaction: registry + vectors + postings + graph)
 search:  query → embedder → vector top-n ┐
          query → tokenize → BM25 top-n   ┤
-         query → seed entities → walk relations → graph top-n ┴→ RRF → [rerank] → top-k hits
+         query → named entities → walk co-mentions → reached chunks by vector ┴→ RRF → [rerank] → top-k hits
 ask:     hits → prompt (prompts/*.j2) → LLM → answer (status, text, citations, provenance)
 ```
 
@@ -118,6 +118,7 @@ hits = engine.search(
     rerank=False,
     where={"team": "hr"},
 )
+# with graph.enabled (PostgreSQL): mode="graph", or "graph" in retrieval.hybrid_paths
 # several kbs of the namespace as one: embedded once, fused once; each hit names its kb
 hits = engine.search_kbs(["handbook", "faq"], "annual leave", top_k=5)
 answer = engine.ask("handbook", "How many days of annual leave do I get?")
@@ -219,9 +220,15 @@ Keep `LITERAG_DATABASE_URL` and API keys in the environment; a provider's key is
 
 ## Evaluation
 
-Retrieval changes are measured, not guessed. `eval/` holds 8 documents (Chinese and English) with
-32 golden questions, and a small PDF corpus. Golden answers are marked by evidence text, not chunk
-ids, so the same questions compare different chunkers.
+Retrieval changes are measured, not guessed. Golden answers are marked by evidence text, not chunk
+ids, so the same questions compare different chunkers. Bundled sets (Chinese and English):
+
+| Set | Corpus | Questions | Tests |
+| --- | --- | --- | --- |
+| `eval/golden.jsonl` | `eval/corpus` (8 docs) | 32: keyword and paraphrased | everyday retrieval |
+| `eval/golden-exact.jsonl` | `eval/corpus-exact` (2 docs) | 12: error codes, config keys, model numbers | where BM25 should help |
+| `eval/golden-multihop.jsonl` | `eval/corpus-multihop` (8 docs) | 16: the answer 2–3 documents away | graph retrieval |
+| `eval/golden-pdf.jsonl` | `eval/corpus-pdf` (2 PDFs) | 10 | PDF loaders |
 
 ```bash
 uv run --all-extras literag eval -c eval/configs/chunk-markdown.yaml -c eval/configs/mode-vector.yaml
@@ -255,6 +262,33 @@ The graph puts the first link of the chain first and the answer right after it, 
 question against one chunk at a time and prefers look-alikes (another council) over the answer.
 On the 32 ordinary questions the graph costs one question (vector 0.97 → 0.94 hit@1).
 
+### Choosing a retrieval mode
+
+What the measurements above and a 4 embedders × 5 chunkers × 4 modes matrix (80 configs, 44
+questions) say. The numbers are small corpora: re-run `literag eval` on yours before you rely on
+them.
+
+- **The embedder decides vector vs hybrid.** With a strong embedder (bge-m3, multilingual-e5-large,
+  Qwen3-Embedding) `vector` alone beats `hybrid`: BM25's wrong hits push paraphrased answers down
+  through RRF, and BM25 never ranked an answer above vector — not even on error codes and model
+  numbers. With a weak one (MiniLM) `hybrid` wins in every chunker.
+- **Rerank flattens the embedder, not the chunker.** With the cross-encoder even MiniLM reaches the
+  best score (0.95 hit@1), at ~1 s per query; recursive or markdown 120-token chunks do best, small
+  40-token chunks worst.
+- **Match the chunker to the embedder.** bge-m3 is 0.95 on markdown or parent_child chunks but
+  0.82 on fixed or recursive ones; e5 prefers recursive.
+- **Small chunks need a parent.** markdown 40 is last in every row; parent_child 40/120 recovers it.
+- **No automatic routing.** A perfect per-question choice between vector and BM25 scores exactly
+  vector alone with bge-m3, so `mode` stays a per-call parameter with a configured default.
+- **Questions that chain facts need the graph**, and no rerank on top of it (see above).
+
+| You want | Use |
+| --- | --- |
+| best quality, ~1 s per query is fine | recursive or markdown chunks + `hybrid` + rerank |
+| milliseconds, strong embedder | markdown (or parent_child) chunks + `vector` |
+| milliseconds, small or weak embedder | recursive or markdown chunks + `hybrid` |
+| questions across documents ("the council chaired by X's lead") | `graph.enabled` + `hybrid_paths: [vector, bm25, graph]`, rerank off |
+
 ## Development
 
 ```bash
@@ -274,6 +308,7 @@ src/lite_rag/
   chunking.py            chunkers (contextual.py, chunking_chonkie.py)
   embedding.py           embedders; model_profiles.py holds prefixes and tokenizers
   keyword.py fusion.py   BM25 and RRF / weighted fusion
+  graph.py               graph retrieval: entity extraction, the co-mention walk
   rerank.py llm.py answer.py prompts/*.j2
   stores/                Store protocol, pg.py, chroma.py, factory.py
   migrations/            PostgreSQL schema; migrations_sqlite/ for Chroma
