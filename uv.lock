@@ -1147,6 +1147,20 @@ wheels = [
 ]
 
 [[package]]
+name = "lite-eval"
+version = "0.0.0"
+source = { git = "https://github.com/ArthurGao/lite-eval?subdirectory=backend&rev=b1a49a960effc39e1aed147d0d84e4ad01824a66#b1a49a960effc39e1aed147d0d84e4ad01824a66" }
+dependencies = [
+    { name = "httpx2" },
+    { name = "jinja2" },
+    { name = "numpy" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "pyyaml" },
+    { name = "typer" },
+]
+
+[[package]]
 name = "lite-rag"
 version = "0.1.0"
 source = { editable = "." }
@@ -1175,6 +1189,9 @@ chroma = [
 docling = [
     { name = "docling" },
 ]
+eval = [
+    { name = "lite-eval" },
+]
 fastembed = [
     { name = "fastembed" },
 ]
@@ -1196,6 +1213,7 @@ dev = [
     { name = "chromadb" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "lite-rag", extra = ["eval"] },
     { name = "mypy" },
     { name = "pypdf" },
     { name = "pytest" },
@@ -1216,6 +1234,7 @@ requires-dist = [
     { name = "httpx2", specifier = ">=2.16" },
     { name = "jieba", specifier = ">=0.42.1" },
     { name = "jinja2", specifier = ">=3.1" },
+    { name = "lite-eval", marker = "extra == 'eval'", git = "https://github.com/ArthurGao/lite-eval?subdirectory=backend&rev=b1a49a960effc39e1aed147d0d84e4ad01824a66" },
     { name = "openai", specifier = ">=1.60" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = "==3.3.8" },
     { name = "pydantic", specifier = ">=2.9" },
@@ -1227,7 +1246,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.15" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = "==0.54.0" },
 ]
-provides-extras = ["fastembed", "anthropic", "pdf", "docling", "chonkie", "sentence-transformers", "chroma", "server"]
+provides-extras = ["fastembed", "anthropic", "pdf", "docling", "chonkie", "sentence-transformers", "chroma", "server", "eval"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1235,6 +1254,7 @@ dev = [
     { name = "chromadb", specifier = "==1.5.9" },
     { name = "fastapi", specifier = "==0.162.2" },
     { name = "httpx", specifier = "==0.28.1" },
+    { name = "lite-rag", extras = ["eval"] },
     { name = "mypy", specifier = ">=1.13" },
     { name = "pypdf", specifier = "==7.0.0" },
     { name = "pytest", specifier = ">=8.3" },

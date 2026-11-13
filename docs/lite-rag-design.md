@@ -253,6 +253,7 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 
 - **语料**：`eval/` 下放一小份语料，中英文各一组，内容是自己写的公开知识。金标问题用 JSONL 存放，每行 `{question, expected_doc_ids[], expected_chunk_ids?[]}`。
 - **对比**：`literag eval --config a.yaml --config b.yaml` 为每个配置建一个临时 kb，再跑全部问题。结果并排列出 hit@1、hit@5、MRR@10，以及检索延迟的 p50 和 p95。
+- **跑在 lite-eval 上**（S12 起）：`literag eval` 把金标集和语料转成 lite-eval 数据集，每个配置是一次 lite-eval 运行（`eval/lite-eval/runs/`，gitignore）。判分（证据句）和指标由 lite-eval 的 retrieval pack 计算，定义和 S12 之前逐字一致（lite-eval 设计 §18.16）。两次运行可以用 `lite-eval compare` 做成对显著性比较；`--crosscheck` 用 ranx 重算排名指标。lite-rag 只保留适配器 `LiteRagTarget`（`src/lite_rag/eval.py`）。
 - **金标集**：每个使用 lite-rag 的项目准备 20–30 个问题，标出正确答案应该来自哪个 chunk。切换任何一层之后都重跑一次，比较 hit rate 和 MRR，用这个回答「换了之后是变好还是变差」。
 - **用法**：这是学习的主循环。每换一种 chunker、加上 BM25、打开 rerank，都跑一次 eval，用数字判断效果有没有变好。
 
@@ -325,6 +326,7 @@ lite-rag/
 | S8 收尾 | `/simplify`、Codex review、修复问题，然后重跑全部检查 | review 结论记录在案 |
 | S9 接入 llm-steward | `LiteRagProvider`（in-process 和 HTTP 两种）、合约测试、更新 llm-steward 设计文档 | llm-steward 的 KB 合约测试在两种接入方式下都通过；手动端到端：生效条目能检索到，废弃后检索不到 |
 | S11 Graph RAG（local） | `graph.enabled`：建库时 LLM 抽实体和关系，存进 PG 的三张图表（与 chunk 同一事务）；`graph` 检索路径（问题点名的实体 → 沿共现扩展 → 范围内按向量排序），`mode: graph` 与 `retrieval.hybrid_paths`；多跳评测集 `eval/golden-multihop.jsonl` | 抽取：FakeLLM 单测（合法、带代码块、非法 JSON；端点补实体；名字合并；prompt 不含标题）；扩展按手算核对（跳数、枢纽、每跳上限与排序）；PG 集成：写入、替换、删除后图随文档消失；类别词和单字母不当种子；多跳答案只能经图找到，分数与 vector 路径一致；配置冲突（chroma、未开图、加权融合）报错；kb 身份含抽取模型；`-m ollama` 真实抽取能解析；eval 前后对比记进 KB |
+| S12 评测迁到 lite-eval | `literag eval` 改为 lite-eval 上的薄包装：适配器 `LiteRagTarget`、金标集转数据集、同一索引共用一次 setup；删掉自写的判分和指标；可选 extra `eval` 按提交锁定 lite-eval | 等价：冻结的旧实现（`tests/legacy_eval.py`）和新实现同一进程同一 store，4 套金标集逐题 `answer_rank`、`doc_rank` 相同，整体与分题型的 hit@1、hit@5、MRR@10、doc hit@5 误差 ≤ 1e-9（FakeEmbedder 进 CI，bge-m3 用 `-m ollama`）；随机 2000 组命中上评分器等价；命令参数和表格不变 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 ## 13. 待确认
@@ -473,7 +475,7 @@ lite-rag/
       - p95 改用 nearest-rank 方法计算，结果一定是某一个实际测到的值。
       - 所有配置必须使用同一个数据库；没有传 `--config` 时给出明确的报错。
       - 8 道题的证据原文重写过（q10、q11、q19、q24、q25、q26、q28、q30），现在每段原文里都同时出现问的对象和答案，比如"有害垃圾……例如废电池"，而不再只是一串例子。
-  - **指标经过独立核对**：`eval/crosscheck_ranx.py` 用 ranx 0.3.21 重新计算了 6 个配置的 hit@1、hit@5、MRR@10，与我们的结果完全一致。ranx 依赖太重（pandas、numba 等），所以没有加进项目依赖，需要时用 `uv run --with` 临时运行。
+  - **指标经过独立核对**：`eval/crosscheck_ranx.py` 用 ranx 0.3.21 重新计算了 6 个配置的 hit@1、hit@5、MRR@10，与我们的结果完全一致。ranx 依赖太重（pandas、numba 等），所以没有加进项目依赖，需要时用 `uv run --with` 临时运行。（S12 起由 `literag eval --crosscheck` 取代，脚本已删除。）
   - **第一次实测**（bge-m3 + qwen3 本地运行，切块大小 120 token / overlap 20）：
 
     | 配置 | hit@1 | hit@5 | MRR@10 | 换说法题 hit@5 | p50 ms |
@@ -521,3 +523,13 @@ lite-rag/
   - `stats()` 不做身份校验，这是有意为之：它的用途正是查看一个 kb 是用什么模型和配置建的，配置不一致时也必须能看到；kb 不存在时返回 None（CLI 会显示 "does not exist"）。Codex 建议它也走读操作的检查，未采纳，理由同上。
   - 暂不实现（S3 simplify 评估过，2026-11-08）：向量和 BM25 两条路径并行执行，留到 S6 服务层；读操作改用 autocommit、缓存写入移出请求路径，等有实测数据再定；向量距离只算一次，需要先用 EXPLAIN 确认不影响 HNSW。
   - 测试里 HNSW 召回不全的数据要用分布均匀的随机向量构造。bag-of-words 的 fake embedder 生成的 8 维向量大量重复，会让 HNSW 图里有些节点永远搜不到，真实模型不会出现这种情况。
+- S12 实现说明（2026-11-14，评测迁到 lite-eval）：
+  - 适配器 `LiteRagTarget` 实现 lite-eval 的 Target 协议：`config()` 是 `effective_settings`，`setup_identity()` 是 `index_identity`，所以同一索引的配置由 lite-eval 分成一组，第一个建 kb，其余接过它的 kb 和 embedder；整组跑完才删 kb。setup 失败（建库或算查询向量）时适配器自己删掉 kb（lite-eval 只 teardown setup 成功的 target），删除再失败就作为附注挂在原错误上。
+  - setup 里不计时地算好全部查询向量（存进 embedding 缓存，所以只在 `embedding.cache` 开着时生效，和 S12 之前一样）；lite-eval 在计时前再做一次预热搜索。每个运行在 `target.info.latency_scope` 记下延迟的口径，表格脚注照此写，口径不同的配置分别写明。并发为 1（检索是同步的），输出缓存关闭（延迟是本次运行的测量，缓存的输出会带着旧运行的延迟）。
+  - 语料每种 PDF loader 只解析一次，embedder 和 reranker 每种配置只建一次；生成的 suite 的 `python:` 入口 `built_in_code` 只会报错：target 在代码里构造（共用一个 store），这个 suite 只用于记录，不能单独重跑。lite-eval 的报错（如 setup 失败）在 CLI 里是一行 `error:`，退出码 1。
+  - 依赖：lite-eval 声明版本区间（它的 AGENTS 规则 13），lite-rag 的 docling extra 要求 typer < 0.28，解析到 typer 0.27.3。
+  - 迁移后本机真实运行（bge-m3）的 mode-vector、mode-bm25、chunk-markdown 三行和 S5 基线（2026-11-08）的 hit@1、hit@5、MRR@10 逐项相同（收尾修改后又跑了一次，仍相同）。
+  - 验证：pytest 480 passed（`--all-extras` 和 CI 的 `--extra anthropic` 两种安装都跑过）；`-m ollama` 的 bge-m3 等价测试通过；改坏脚本 19/19 变红。
+  - **/simplify 改了**：配置名转 lite-eval 名时去掉开头的非字母数字（`_x`、`.hidden` 原先会被 lite-eval 拒绝）；setup 算查询向量失败时也删 kb；语料每个 loader 只解析一次（原先每个 setup 组各解析一次：两个组时 8 篇文档解析 24 次）；golden 每篇文档只 normalise 一次；去掉 `make()`、可空 store 和 `_owns_store`，工厂改为必填参数；删 kb 失败报 `StoreError`；`--out` 写 lite-eval 的运行记录加逐题排名；表格下逐个打印运行的状态和警告；lite-eval 的错误在 CLI 里变成一行错误。前四条各有先红后绿的测试。
+  - **/simplify 没改的**：lite-eval 公开 `run_suite(targets=…)`（等第二个使用方；lite-rag 按提交锁定 lite-eval，每次升级跑等价测试）；lite-eval 在 setup 失败后也调用 teardown（要改 Target 协议，改为在适配器里处理）；ranx 合并调用、数据集重复拷贝（耗时可忽略）。
+  - **Codex review**：一条成立并已修复（先红后绿）：表格脚注总说"查询向量已算好"，`embedding.cache` 关闭时延迟其实包含查询 embedding，现在按每个运行记录的口径写。一条不采纳：Codex 认为解析计数测试把核对时的 `load_corpus` 也算进去了，实际上 `len(parsed)` 先求值，测试是对的（改坏脚本让它变红）；但写法依赖求值顺序，已改为打补丁前先算好期望值。

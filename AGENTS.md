@@ -21,7 +21,8 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S0–S11 done** (2026-11-08/12; S11: graph retrieval, local mode, PostgreSQL only). The owner's direction
+**S0–S12 done** (2026-11-08/14; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
+lite-eval, numbers identical to before). The owner's direction
 (2026-11-12): lite-rag covers the main RAG techniques side by side, each a stage measured with `literag eval`
 (candidates: graph global mode S11b, query rewriting — HyDE / multi-query, RAPTOR, self-checking retrieval);
 llm-steward's needs still come first.
@@ -68,6 +69,7 @@ uv run pytest                 # unit + integration, fakes only
 uv run pytest -m ollama       # opt-in: real Ollama (bge-m3 / qwen3:8b must be pulled)
 uv run --all-extras pytest -m model   # opt-in: real Hugging Face models (the reranker, ~0.6 GB once)
 uv run --all-extras literag eval -c eval/configs/chunk-markdown.yaml -c eval/configs/mode-vector.yaml   # compare configs
+uv run --with ranx==0.3.21 --all-extras literag eval -c … --crosscheck   # also recompute the metrics with ranx
 uv run ruff check && uv run ruff format --check && uv run mypy
 uv run literag ingest <kb> <path> | search <kb> "<q>" | ask <kb> "<q>" | eval --config a.yaml --config b.yaml
 uv run literag reindex <kb> --into <new-kb>      # rebuild under the current settings (model / chunker)

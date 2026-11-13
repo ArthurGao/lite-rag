@@ -21,7 +21,9 @@ measure.
   OpenAI-compatible endpoint, or Anthropic). No fallback chain; every answer records
   `provider/model`.
 - **Evaluation**: `literag eval` compares configurations side by side (hit@1, hit@5, MRR@10,
-  latency) on a bundled Chinese and English corpus, or your own.
+  latency) on a bundled Chinese and English corpus, or your own. It runs on
+  [lite-eval](https://github.com/ArthurGao/lite-eval): each config is a lite-eval run, so two can
+  be compared with significance (`lite-eval compare`).
 
 Use it as a Python library or as a service (`literag serve`, Docker image, HTTP API with API keys).
 The default stack (Ollama `bge-m3` + `qwen3:8b`, PostgreSQL/pgvector, jieba) runs locally and costs

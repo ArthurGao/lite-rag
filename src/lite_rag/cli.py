@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
 import typer
+from lite_eval.errors import LiteEvalError
 
 from lite_rag import __version__
 from lite_rag.chunking import chunk_context
@@ -43,7 +44,7 @@ def _errors() -> Iterator[None]:
     """A lite-rag error ends the command with its message and exit code 1, not a traceback."""
     try:
         yield
-    except LiteRagError as exc:
+    except (LiteRagError, LiteEvalError) as exc:  # lite-eval runs `literag eval`
         _fail(str(exc))
 
 
@@ -306,10 +307,23 @@ def eval_command(
     ] = "lite_rag_eval",
     out: Annotated[Path | None, typer.Option(help="Also write the full report as JSON")] = None,
     keep: Annotated[bool, typer.Option(help="Keep the evaluation kbs afterwards")] = False,
+    root: Annotated[
+        Path, typer.Option(help="lite-eval evaluation root: generated dataset, suite and runs")
+    ] = Path("eval/lite-eval"),
+    crosscheck: Annotated[
+        bool,
+        typer.Option(
+            help="Recompute the ranking metrics with ranx and warn on any gap (needs ranx: "
+            "`uv run --with ranx==0.3.21 ...`)"
+        ),
+    ] = False,
 ) -> None:
     """Build a kb per index config from the corpus, run the golden questions, compare.
-    Config files outrank LITERAG_* variables and `.env` here."""
-    from lite_rag.eval import load_corpus, load_golden, run_configs, table
+    Each config is a lite-eval run (written under eval/lite-eval/runs/). Config files outrank
+    LITERAG_* variables and `.env` here."""
+    from lite_eval.report.terminal import render_run
+
+    from lite_rag.eval import evaluate, report, table
 
     if not configs:
         raise typer.BadParameter("give at least one --config")
@@ -322,24 +336,29 @@ def eval_command(
     if len({location(s.store, s.database_url) for _, s in loaded}) > 1:
         _fail("all configs must use one database: they are compared on one store")
     with _errors():
-        # One text per PDF loader the configs use; the golden set must hold in every one.
-        corpora = {
-            pdf: load_corpus(corpus, pdf) for pdf in sorted({s.loader.pdf for _, s in loaded})
-        }
-        for docs in corpora.values():
-            questions = load_golden(golden, docs)
         first = loaded[0][1]
         apart = evaluation_store(first.store, schema)
         migrate_store(apart, first.database_url)
         store = open_store(apart, first.database_url)
         try:
-            reports = run_configs(loaded, corpora.__getitem__, questions, store, keep=keep)
+            results = evaluate(
+                loaded,
+                corpus,
+                golden,
+                store,
+                root=root,
+                schema=schema,
+                keep=keep,
+                crosscheck=crosscheck,
+            )
         finally:
             store.close()
-    typer.echo(table(reports))
+    typer.echo(table(results))
+    for r in results:  # status, errors and warnings of each run, not only its numbers
+        typer.echo("\n" + render_run(r.record, str(r.directory)))
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
-            json.dumps([asdict(r) for r in reports], indent=2, ensure_ascii=False), "utf-8"
+            json.dumps([report(r) for r in results], indent=2, ensure_ascii=False), "utf-8"
         )
         typer.echo(f"report: {out}")

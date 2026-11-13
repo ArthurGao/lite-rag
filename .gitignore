@@ -26,3 +26,6 @@ htmlcov/
 # Engine data (Chroma, BM25, document registry) and eval output
 data/
 eval/out/
+
+# lite-eval: the dataset, suite and runs `literag eval` generates
+eval/lite-eval/
