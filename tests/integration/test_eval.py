@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import psycopg
@@ -256,8 +258,9 @@ def test_the_corpus_is_parsed_once_per_loader(
 
 
 def test_a_lite_eval_error_is_a_one_line_cli_error(
-    pg_url: str, pg: psycopg.Connection, tmp_path: Path
+    pg_url: str, pg: psycopg.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)  # CI mode would refuse the unknown-billing config first
     config = tmp_path / "unreachable.yaml"
     config.write_text(
         f"database_url: {pg_url}\n"
@@ -309,3 +312,31 @@ def test_the_table_says_when_latency_includes_embedding_the_query(
     assert "uncached: retrieval (+ rerank), query vector embedded in the timed search" in footnote
     one = table(results[:1]).split("\n\n", 1)[1]
     assert "Latency: retrieval (+ rerank), query vector precomputed." in one
+
+
+_WITHOUT_LITE_EVAL = """
+import sys
+sys.modules["lite_eval"] = None  # as if the `eval` extra were not installed
+from typer.testing import CliRunner
+from lite_rag.cli import app
+print(CliRunner().invoke(app, ["version"]).exit_code)
+result = CliRunner().invoke(app, ["eval", "-c", sys.argv[1]])
+print(result.exit_code, result.output.strip())
+"""
+
+
+def test_the_cli_works_without_the_eval_extra(tmp_path: Path) -> None:
+    """The service image installs no `eval` extra: every other command must still start."""
+    config = tmp_path / "c.yaml"
+    config.write_text("{}\n")
+    done = subprocess.run(
+        [sys.executable, "-c", _WITHOUT_LITE_EVAL, str(config)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines() == [
+        "0",
+        "1 error: install the eval extra: pip install 'lite-rag[eval]'",
+    ]

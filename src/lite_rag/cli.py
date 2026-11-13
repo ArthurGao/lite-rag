@@ -1,6 +1,7 @@
 """`literag` command line. Commands are added as their stage lands (design §12)."""
 
 import json
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -8,7 +9,6 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 
 import typer
-from lite_eval.errors import LiteEvalError
 
 from lite_rag import __version__
 from lite_rag.chunking import chunk_context
@@ -16,6 +16,7 @@ from lite_rag.config import Mode, Settings, load_settings
 from lite_rag.db import redact_conninfo
 from lite_rag.engine import RagEngine, RagRuntime
 from lite_rag.errors import LiteRagError
+from lite_rag.extras import require_extra
 from lite_rag.loaders import find_files
 from lite_rag.stores.factory import evaluation_store, location, migrate_store, open_store
 
@@ -44,8 +45,19 @@ def _errors() -> Iterator[None]:
     """A lite-rag error ends the command with its message and exit code 1, not a traceback."""
     try:
         yield
-    except (LiteRagError, LiteEvalError) as exc:  # lite-eval runs `literag eval`
+    except LiteRagError as exc:
         _fail(str(exc))
+    except Exception as exc:
+        if _is_lite_eval_error(exc):  # lite-eval runs `literag eval`
+            _fail(str(exc))
+        raise
+
+
+def _is_lite_eval_error(exc: Exception) -> bool:
+    """Without importing lite-eval (the optional `eval` extra): one that was never imported
+    cannot have raised."""
+    errors = sys.modules.get("lite_eval.errors")
+    return errors is not None and isinstance(exc, errors.LiteEvalError)
 
 
 def _echo_json(value: Any) -> None:
@@ -321,6 +333,8 @@ def eval_command(
     """Build a kb per index config from the corpus, run the golden questions, compare.
     Each config is a lite-eval run (written under eval/lite-eval/runs/). Config files outrank
     LITERAG_* variables and `.env` here."""
+    with _errors():
+        require_extra("lite_eval", "eval")
     from lite_eval.report.terminal import render_run
 
     from lite_rag.eval import evaluate, report, table
