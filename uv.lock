@@ -1148,8 +1148,8 @@ wheels = [
 
 [[package]]
 name = "lite-eval"
-version = "0.0.0"
-source = { git = "https://github.com/ArthurGao/lite-eval?subdirectory=backend&rev=b1a49a960effc39e1aed147d0d84e4ad01824a66#b1a49a960effc39e1aed147d0d84e4ad01824a66" }
+version = "0.2.0"
+source = { url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.2.0/lite_eval-0.2.0-py3-none-any.whl" }
 dependencies = [
     { name = "httpx2" },
     { name = "jinja2" },
@@ -1159,6 +1159,27 @@ dependencies = [
     { name = "pyyaml" },
     { name = "typer" },
 ]
+wheels = [
+    { url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.2.0/lite_eval-0.2.0-py3-none-any.whl", hash = "sha256:e67df50ee15d0675318ed11429e7c4ee4426b28f181ba13c0fd4a02ec9d6abf5" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.133,<1" },
+    { name = "httpx2", specifier = ">=2.16,<3" },
+    { name = "jinja2", specifier = ">=3.1,<4" },
+    { name = "numpy", specifier = ">=2.0,<3" },
+    { name = "openai", marker = "extra == 'judge'", specifier = ">=3.46,<4" },
+    { name = "pydantic", specifier = ">=2.9,<3" },
+    { name = "pydantic-settings", specifier = ">=2.6,<3" },
+    { name = "pyyaml", specifier = ">=6.0.1,<7" },
+    { name = "ranx", marker = "extra == 'ranking'", specifier = ">=0.3.21,<0.4" },
+    { name = "scipy", marker = "extra == 'ranking'", specifier = ">=1.13,<2" },
+    { name = "starlette", marker = "extra == 'server'", specifier = ">=1.2.0,<2" },
+    { name = "typer", specifier = ">=0.19,<1" },
+    { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.32,<1" },
+]
+provides-extras = ["judge", "ranking", "server"]
 
 [[package]]
 name = "lite-rag"
@@ -1234,7 +1255,7 @@ requires-dist = [
     { name = "httpx2", specifier = ">=2.16" },
     { name = "jieba", specifier = ">=0.42.1" },
     { name = "jinja2", specifier = ">=3.1" },
-    { name = "lite-eval", marker = "extra == 'eval'", git = "https://github.com/ArthurGao/lite-eval?subdirectory=backend&rev=b1a49a960effc39e1aed147d0d84e4ad01824a66" },
+    { name = "lite-eval", marker = "extra == 'eval'", url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.2.0/lite_eval-0.2.0-py3-none-any.whl" },
     { name = "openai", specifier = ">=1.60" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = "==3.3.8" },
     { name = "pydantic", specifier = ">=2.9" },

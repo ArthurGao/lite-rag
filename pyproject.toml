@@ -48,8 +48,9 @@ server = [
     "python-multipart==0.0.33",
     "uvicorn==0.54.0",
 ]
-# `literag eval` runs on lite-eval (design §8), pinned to a commit in [tool.uv.sources]: an
-# upgrade re-runs the eval equivalence tests (tests/integration/test_eval_equivalence.py).
+# `literag eval` runs on lite-eval (design §8), installed from a release wheel in
+# [tool.uv.sources] (it carries the Viewer; a git install does not): an upgrade re-runs the eval
+# equivalence tests (tests/integration/test_eval_equivalence.py).
 eval = [
     "lite-eval",
 ]
@@ -104,4 +105,4 @@ markers = [
 ]
 
 [tool.uv.sources]
-lite-eval = { git = "https://github.com/ArthurGao/lite-eval", subdirectory = "backend", rev = "b1a49a960effc39e1aed147d0d84e4ad01824a66" }
+lite-eval = { url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.2.0/lite_eval-0.2.0-py3-none-any.whl" }
