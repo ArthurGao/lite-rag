@@ -29,3 +29,7 @@ eval/out/
 
 # lite-eval: the dataset, suite and runs `literag eval` generates
 eval/lite-eval/
+
+# lite-eval runs and cache of the grounded judge (the dataset and suites are committed)
+eval/judge-grounded/runs/
+eval/judge-grounded/.lite-eval/

@@ -21,8 +21,9 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S0–S12 done** (2026-11-08/14; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
-lite-eval, numbers identical to before). The owner's direction
+**S0–S13 done** (2026-11-08/14; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
+lite-eval, numbers identical to before; S13: the grounded judge from lite-eval E5 calibrated on a
+constructed set and run on real `literag ask` answers, `literag eval-answers`). The owner's direction
 (2026-11-12): lite-rag covers the main RAG techniques side by side, each a stage measured with `literag eval`
 (candidates: graph global mode S11b, query rewriting — HyDE / multi-query, RAPTOR, self-checking retrieval);
 llm-steward's needs still come first.
@@ -70,6 +71,9 @@ uv run pytest -m ollama       # opt-in: real Ollama (bge-m3 / qwen3:8b must be p
 uv run --all-extras pytest -m model   # opt-in: real Hugging Face models (the reranker, ~0.6 GB once)
 uv run --all-extras literag eval -c eval/configs/chunk-markdown.yaml -c eval/configs/mode-vector.yaml   # compare configs
 uv run --with ranx==0.3.21 --all-extras literag eval -c … --crosscheck   # also recompute the metrics with ranx
+uv run --all-extras lite-eval run eval/judge-grounded/suites/calibrate.yaml --config qwen3-8b-nothink   # calibrate the grounded judge
+uv run --all-extras literag eval-answers -c eval/configs/chunk-markdown.yaml --calibration <run dir> --min-agreement <x>
+uv run python eval/make_judge_grounded.py      # regenerate the judge's calibration set (committed)
 uv run ruff check && uv run ruff format --check && uv run mypy
 uv run literag ingest <kb> <path> | search <kb> "<q>" | ask <kb> "<q>" | eval --config a.yaml --config b.yaml
 uv run literag reindex <kb> --into <new-kb>      # rebuild under the current settings (model / chunker)

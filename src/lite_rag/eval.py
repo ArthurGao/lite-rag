@@ -39,10 +39,11 @@ from lite_eval.store import load_run
 from lite_eval.suite import load_suite
 
 from lite_rag import __version__
-from lite_rag.config import EmbeddingConfig, RerankConfig, Settings
+from lite_rag.config import EmbeddingConfig, LLMConfig, RerankConfig, Settings
 from lite_rag.embedding import Embedder, build_embedder
 from lite_rag.engine import RagEngine, RagRuntime
 from lite_rag.errors import ConfigError, StoreError
+from lite_rag.llm import LLM
 from lite_rag.loaders import PdfLoader, find_files, load_file
 from lite_rag.rerank import Reranker, build_reranker
 from lite_rag.stores.base import CachedStore, KbRef
@@ -142,9 +143,14 @@ _LOCAL_EMBEDDERS = {"ollama", "fastembed", "sentence_transformers"}
 _PAID = {"voyage", "cohere", "gemini", "anthropic"}
 
 
-def billing(settings: Settings) -> Literal["free", "per_token", "unknown"]:
-    """For lite-eval's CI guard: free only when every model the run calls is local."""
+def billing(
+    settings: Settings, *, answers: bool = False
+) -> Literal["free", "per_token", "unknown"]:
+    """For lite-eval's CI guard: free only when every model the run calls is local (`answers`:
+    the run also calls the answer LLM)."""
     used: list[str] = [settings.embedding.provider]
+    if answers:
+        used.append(settings.llm.provider)
     if settings.chunking.contextual.enabled:
         used.append(settings.chunking.contextual.llm.provider)
     if settings.graph.enabled:
@@ -178,6 +184,7 @@ def hit_record(hit: Hit) -> dict[str, Any]:
 
 
 EmbedderFor = Callable[[EmbeddingConfig], Embedder]
+LlmFor = Callable[[LLMConfig], LLM]
 RerankerFor = Callable[[RerankConfig], Reranker]
 CorpusFor = Callable[[PdfLoader], Corpus]
 
@@ -186,6 +193,7 @@ class LiteRagTarget:
     """One lite-rag config as a lite-eval target (lite-eval design §5.3), built by `evaluate`."""
 
     name = "lite-rag"
+    query_key = "query"  # the case input searched for
 
     def __init__(
         self,
@@ -195,12 +203,14 @@ class LiteRagTarget:
         embedder_for: EmbedderFor,
         reranker_for: RerankerFor,
         corpus_for: CorpusFor,
+        llm_for: LlmFor | None = None,  # retrieval never calls an LLM; answers do
         keep: bool = False,
     ) -> None:
         self.settings = settings
         self.store = store
         self._embedder_for = embedder_for
         self._reranker_for = reranker_for
+        self._llm_for = llm_for
         self._corpus_for = corpus_for
         self.keep = keep
         self.kb = kb_for(index_identity(settings))
@@ -227,10 +237,14 @@ class LiteRagTarget:
         self.embedder = embedder
         rerank = self.settings.rerank
         reranker = self._reranker_for(rerank) if rerank.enabled else None
-        self.engine = RagRuntime(self.settings, self.store, embedder, reranker=reranker).engine(
-            NAMESPACE
-        )
+        llm = self._llm_for(self.settings.llm) if self._llm_for else None
+        runtime = RagRuntime(self.settings, self.store, embedder, reranker=reranker, llm=llm)
+        self.engine = runtime.engine(NAMESPACE)
         return self.engine
+
+    def query(self, case: Case) -> str:
+        assert isinstance(case.input, dict)
+        return str(case.input[self.query_key])
 
     async def setup(self, dataset: Dataset) -> None:
         """Build the kb and compute every query vector, untimed. A failure drops what was built:
@@ -242,7 +256,7 @@ class LiteRagTarget:
             for doc_id, (title, text) in self._corpus_for(self.settings.loader.pdf).items():
                 engine.upsert_text(self.kb, doc_id, title, text)
             for case in dataset.cases:  # query vectors, kept by the embedding cache
-                engine.search(self.kb, _query(case), top_k=1, mode="vector")
+                engine.search(self.kb, self.query(case), top_k=1, mode="vector")
         except BaseException as exc:
             problem = self._drop()
             if problem:
@@ -257,7 +271,7 @@ class LiteRagTarget:
     async def run(self, case: Case) -> Output:
         assert self.engine is not None
         start = time.perf_counter()
-        hits = self.engine.search(self.kb, _query(case), top_k=TOP_K)
+        hits = self.engine.search(self.kb, self.query(case), top_k=TOP_K)
         latency_ms = (time.perf_counter() - start) * 1000
         return Output(
             case_id=case.id,
@@ -281,11 +295,6 @@ class LiteRagTarget:
             raise StoreError(f"could not drop evaluation kb {problem}")
 
 
-def _query(case: Case) -> str:
-    assert isinstance(case.input, dict)
-    return str(case.input["query"])
-
-
 def built_in_code(**config: Any) -> LiteRagTarget:
     """The `python:` entry of a suite `literag eval` generates. Its targets are built in code
     (one store, shared embedders), so the suite records the run but cannot rerun it."""
@@ -302,12 +311,37 @@ def slug(name: str) -> str:
     return re.sub(r"^[^a-z0-9]+|[-.]+$", "", s) or "config"
 
 
+def write_generated_dataset(
+    directory: Path, meta: dict[str, Any], cases: Sequence[dict[str, Any]]
+) -> Path:
+    """A generated lite-eval dataset, rewritten whole every time: `dataset.yaml` and
+    `cases.jsonl` (the retrieval eval, the answer eval and the judge's calibration set)."""
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir(parents=True)
+    dump = yaml.safe_dump(meta, sort_keys=False)  # as before S13: the retrieval hash holds
+    (directory / "dataset.yaml").write_text(dump, "utf-8")
+    lines = "".join(json.dumps(c, ensure_ascii=False) + "\n" for c in cases)
+    (directory / "cases.jsonl").write_text(lines, "utf-8")
+    return directory
+
+
+def golden_cases(questions: Sequence[Question], input_key: str) -> list[dict[str, Any]]:
+    """The golden questions as lite-eval cases; the question goes under `input_key` (`query` to
+    search, `question` to answer)."""
+    return [
+        {
+            "id": q.id,
+            "input": {input_key: q.question},
+            "expected": {"doc": q.doc, "evidence": q.evidence},
+            "tags": {"kind": q.kind, **({"lang": q.lang} if q.lang else {})},
+        }
+        for q in questions
+    ]
+
+
 def write_dataset(root: Path, golden: Path, corpus: Path, questions: Sequence[Question]) -> Path:
     """The golden set and its corpus as a lite-eval dataset under `root/datasets/`."""
-    directory = root / "datasets" / slug(golden.stem)
-    if directory.exists():
-        shutil.rmtree(directory)  # generated: rewritten from the golden set every run
-    (directory / "corpus").mkdir(parents=True)
     meta = {
         "name": slug(golden.stem),
         "version": "1",
@@ -315,18 +349,8 @@ def write_dataset(root: Path, golden: Path, corpus: Path, questions: Sequence[Qu
         "description": f"lite-rag golden set {golden.name} over {corpus.name}/ (generated)",
         "license": "Apache-2.0",
     }
-    (directory / "dataset.yaml").write_text(yaml.safe_dump(meta, sort_keys=False), "utf-8")
-    lines = []
-    for q in questions:
-        tags = {"kind": q.kind, **({"lang": q.lang} if q.lang else {})}
-        case = {
-            "id": q.id,
-            "input": {"query": q.question},
-            "expected": {"doc": q.doc, "evidence": q.evidence},
-            "tags": tags,
-        }
-        lines.append(json.dumps(case, ensure_ascii=False))
-    (directory / "cases.jsonl").write_text("\n".join(lines) + "\n", "utf-8")
+    directory = root / "datasets" / slug(golden.stem)
+    write_generated_dataset(directory, meta, golden_cases(questions, "query"))
     for path in find_files([corpus]):
         target = directory / "corpus" / path.relative_to(corpus)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -334,26 +358,35 @@ def write_dataset(root: Path, golden: Path, corpus: Path, questions: Sequence[Qu
     return directory
 
 
-def write_suite(root: Path, golden: Path, names: Sequence[str], schema: str) -> Path:
-    """The suite a run records (lite-eval keeps its path and hash in run.json)."""
+def write_suite(
+    root: Path,
+    name: str,
+    configs: Sequence[str],
+    schema: str,
+    *,
+    pack: str = "retrieval",
+    scorers: Sequence[Any] = SCORERS,
+    **extra: Any,
+) -> Path:
+    """The suite a run records (lite-eval keeps its path and hash in run.json), for the dataset
+    `name` under `root/datasets/`; `extra` adds suite keys (cache, judges, ...)."""
     suite = {
         "schema_version": 1,
-        "name": f"literag-{slug(golden.stem)}",
-        "pack": "retrieval",
-        "dataset": f"../datasets/{slug(golden.stem)}",
+        "name": f"literag-{name}",
+        "pack": pack,
+        "dataset": f"../datasets/{name}",
         "targets": [
             {
                 "python": "lite_rag.eval:built_in_code",
-                "configs": [{"name": name, "schema": schema} for name in names],
+                "configs": [{"name": config, "schema": schema} for config in configs],
             }
         ],
-        "scorers": SCORERS,
-        "concurrency": 1,  # search is synchronous; one at a time keeps latencies honest
-        # Latency is a measurement of this run: a cached output would carry an older run's.
-        "cache": "off",
+        "scorers": list(scorers),
+        "concurrency": 1,  # lite-rag is synchronous; one at a time keeps latencies honest
         "redact": ["api_keys", "connection_strings"],
+        **extra,
     }
-    path = root / "suites" / f"{slug(golden.stem)}.yaml"
+    path = root / "suites" / f"{name}.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(suite, sort_keys=False, allow_unicode=True), "utf-8")
     return path
@@ -382,7 +415,9 @@ def evaluate(
     if len(set(names)) != len(names):
         raise ConfigError(f"config names must differ: {names}")
     write_dataset(root, golden, corpus, questions)
-    suite = load_suite(write_suite(root, golden, names, schema), root)
+    # Latency is a measurement of this run: a cached output would carry an older run's.
+    suite_path = write_suite(root, slug(golden.stem), names, schema, cache="off")
+    suite = load_suite(suite_path, root)
     dataset = load_dataset(suite.dataset_path)
 
     embedders: dict[str, Embedder] = {}

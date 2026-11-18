@@ -376,3 +376,68 @@ def eval_command(
             json.dumps([report(r) for r in results], indent=2, ensure_ascii=False), "utf-8"
         )
         typer.echo(f"report: {out}")
+
+
+@app.command("eval-answers")
+def eval_answers_command(
+    config: Annotated[Path, typer.Option("--config", "-c", help="The YAML config that answers")],
+    calibration: Annotated[
+        Path,
+        typer.Option(help="The lite-eval run that calibrated the grounded judge (its directory)"),
+    ],
+    min_agreement: Annotated[
+        float,
+        typer.Option(help="Refuse the judge if its calibration agreed less often than this"),
+    ],
+    corpus: Annotated[Path, typer.Option(help="Corpus directory")] = Path("eval/corpus"),
+    golden: Annotated[Path, typer.Option(help="Golden questions (JSONL)")] = Path(
+        "eval/golden.jsonl"
+    ),
+    limit: Annotated[int | None, typer.Option(help="Only the first N questions")] = None,
+    schema: Annotated[
+        str, typer.Option(help="Schema for the evaluation kb, apart from application data")
+    ] = "lite_rag_eval",
+    root: Annotated[
+        Path, typer.Option(help="lite-eval evaluation root: generated dataset, suite and runs")
+    ] = Path("eval/lite-eval"),
+) -> None:
+    """Answer the golden questions with `ask` and let the calibrated grounded judge score each
+    answer (design §8, S13): the flag rate on real answers, and every flagged answer to read."""
+    with _errors():
+        require_extra("lite_eval", "eval")
+    from lite_eval.report.terminal import render_run
+
+    from lite_rag.eval_grounded import calibrated_judge, flagged_answers, judge_answers
+
+    try:
+        settings = load_settings(config, file_wins=True, store={"schema": schema})
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    with _errors():
+        calibrated_judge(calibration)  # a bad calibration fails before the store is touched
+        apart = evaluation_store(settings.store, schema)
+        migrate_store(apart, settings.database_url)
+        store = open_store(apart, settings.database_url)
+        try:
+            result = judge_answers(
+                config.stem,
+                settings,
+                corpus,
+                golden,
+                store,
+                root=root,
+                calibration=calibration,
+                min_agreement=min_agreement,
+                schema=schema,
+                limit=limit,
+            )
+        finally:
+            store.close()
+    typer.echo(render_run(result.record, str(result.directory), result.scores))
+    rows = flagged_answers(result)
+    typer.echo(f"\nflagged: {len(rows)} of {len(result.scores)}")
+    for r in rows:
+        typer.echo(f"\n[{r['id']}] {r['question']}\n  answer: {r['answer']}")
+        typer.echo(f"  judge: {r['reason']}")
+        for quote in r["evidence"]:
+            typer.echo(f"  unsupported: {quote}")

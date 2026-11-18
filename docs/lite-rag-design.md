@@ -254,6 +254,10 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 - **语料**：`eval/` 下放一小份语料，中英文各一组，内容是自己写的公开知识。金标问题用 JSONL 存放，每行 `{question, expected_doc_ids[], expected_chunk_ids?[]}`。
 - **对比**：`literag eval --config a.yaml --config b.yaml` 为每个配置建一个临时 kb，再跑全部问题。结果并排列出 hit@1、hit@5、MRR@10，以及检索延迟的 p50 和 p95。
 - **跑在 lite-eval 上**（S12 起）：`literag eval` 把金标集和语料转成 lite-eval 数据集，每个配置是一次 lite-eval 运行（`eval/lite-eval/runs/`，gitignore）。判分（证据句）和指标由 lite-eval 的 retrieval pack 计算，定义和 S12 之前逐字一致（lite-eval 设计 §18.16）。两次运行可以用 `lite-eval compare` 做成对显著性比较；`--crosscheck` 用 ranx 重算排名指标。lite-rag 只保留适配器 `LiteRagTarget`（`src/lite_rag/eval.py`）。
+- **回答有没有依据**（S13 起，lite-eval E5 的模型评审）：检索评测只看找没找到；回答的质量由 lite-eval 的 grounded 评审判断：回答里有没有引用的来源不支持的说法。评审先校准才能用（lite-eval 设计 §9、§18.24）：
+  - **校准集**（`eval/judge-grounded/datasets/grounded-golden/`，提交，`eval/make_judge_grounded.py` 生成，测试核对和生成器一致）：每道金标题的合格回答 = 文档里含证据句的那一句，引用它所在的段落为来源 [1]，按构造是有依据的；再用 lite-eval 的构造工具各改坏一种方式：改一个数字、加一句别的文档的话、换成别题的回答（都是 unsupported），或去掉引用（仍然 grounded，评审不评引用标记）。插入和交换的内容只取同语言（按金标集，不按字符猜）的其他文档。
+  - **校准**：`lite-eval run eval/judge-grounded/suites/calibrate.yaml --config <评审>`，评审本身是 Target，记下一致率和每种改法的识别率；运行在 `eval/judge-grounded/runs/`（gitignore）。
+  - **真实回答**：`literag eval-answers -c <配置> --calibration <校准运行> --min-agreement <阈值>` 对金标题跑 `ask`（`LiteRagAnswerTarget`，输出 `{question, answer, sources, status, dropped}`），用校准运行测过的那个评审判分；评审的配置取自校准 suite 里的那一条，lite-eval 在任何调用之前逐项核对，校准不够就拒绝。最后列出每个被标记的回答，逐条读（评审错了，还是回答真有问题）。
 - **金标集**：每个使用 lite-rag 的项目准备 20–30 个问题，标出正确答案应该来自哪个 chunk。切换任何一层之后都重跑一次，比较 hit rate 和 MRR，用这个回答「换了之后是变好还是变差」。
 - **用法**：这是学习的主循环。每换一种 chunker、加上 BM25、打开 rerank，都跑一次 eval，用数字判断效果有没有变好。
 
@@ -327,6 +331,7 @@ lite-rag/
 | S9 接入 llm-steward | `LiteRagProvider`（in-process 和 HTTP 两种）、合约测试、更新 llm-steward 设计文档 | llm-steward 的 KB 合约测试在两种接入方式下都通过；手动端到端：生效条目能检索到，废弃后检索不到 |
 | S11 Graph RAG（local） | `graph.enabled`：建库时 LLM 抽实体和关系，存进 PG 的三张图表（与 chunk 同一事务）；`graph` 检索路径（问题点名的实体 → 沿共现扩展 → 范围内按向量排序），`mode: graph` 与 `retrieval.hybrid_paths`；多跳评测集 `eval/golden-multihop.jsonl` | 抽取：FakeLLM 单测（合法、带代码块、非法 JSON；端点补实体；名字合并；prompt 不含标题）；扩展按手算核对（跳数、枢纽、每跳上限与排序）；PG 集成：写入、替换、删除后图随文档消失；类别词和单字母不当种子；多跳答案只能经图找到，分数与 vector 路径一致；配置冲突（chroma、未开图、加权融合）报错；kb 身份含抽取模型；`-m ollama` 真实抽取能解析；eval 前后对比记进 KB |
 | S12 评测迁到 lite-eval | `literag eval` 改为 lite-eval 上的薄包装：适配器 `LiteRagTarget`、金标集转数据集、同一索引共用一次 setup；删掉自写的判分和指标；可选 extra `eval` 按提交锁定 lite-eval | 等价：冻结的旧实现（`tests/legacy_eval.py`）和新实现同一进程同一 store，4 套金标集逐题 `answer_rank`、`doc_rank` 相同，整体与分题型的 hit@1、hit@5、MRR@10、doc hit@5 误差 ≤ 1e-9（FakeEmbedder 进 CI，bge-m3 用 `-m ollama`）；随机 2000 组命中上评分器等价；命令参数和表格不变 |
+| S13 回答评审（lite-eval E5b） | 依赖 lite-eval 0.3.0；grounded 评审的校准集（构造法，提交）和校准 suite；`LiteRagAnswerTarget` 与 `literag eval-answers`；数据集和 suite 的生成共用 `write_generated_dataset` / `write_suite` | 校准集：每种改法标签按构造正确、同一种子同一集合、提交的和生成器一致、插入和交换的内容同语言且不在来源里；FakeLLM + FakeJudge：回答被校准过的评审判分、被标记的回答列出、评审就是校准运行测过的那个、校准不够时在生成任何回答之前拒绝；qwen3:8b（思考关和开）的校准一致率和每种改法的识别率、真实回答的标记率和逐条判断记进 KB |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 ## 13. 待确认
@@ -534,3 +539,15 @@ lite-rag/
   - **/simplify 没改的**：lite-eval 公开 `run_suite(targets=…)`（等第二个使用方；lite-rag 按提交锁定 lite-eval，每次升级跑等价测试）；lite-eval 在 setup 失败后也调用 teardown（要改 Target 协议，改为在适配器里处理）；ranx 合并调用、数据集重复拷贝（耗时可忽略）。
   - **Codex review**：一条成立并已修复（先红后绿）：表格脚注总说"查询向量已算好"，`embedding.cache` 关闭时延迟其实包含查询 embedding，现在按每个运行记录的口径写。一条不采纳：Codex 认为解析计数测试把核对时的 `load_corpus` 也算进去了，实际上 `len(parsed)` 先求值，测试是对的（改坏脚本让它变红）；但写法依赖求值顺序，已改为打补丁前先算好期望值。
   - **推送后 CI 发现两处**（都先红后绿）：`cli.py` 在顶层导入 lite_eval，而服务镜像不装 `eval` extra，结果整个 `literag` 都启动不了（镜像冒烟测试失败）。现在 lite-eval 只在 `literag eval` 里导入，没装时给一行 "install the eval extra" 错误；`_errors` 只在 `lite_eval.errors` 已加载时才认 lite-eval 的错误。另一处：CLI 报错测试在 CI 里被 `CI=true` 的计费保护抢先拒绝，测试改为清掉 `CI`。
+- S13 实现说明（2026-11-18，回答的 grounded 评审，lite-eval E5b）：
+  - 依赖 lite-eval 0.3.0（release wheel）；升级后 lite-rag 全部测试（含 S12 的等价测试）不改一行就通过。
+  - **校准集**（`eval_grounded.py`，`eval/make_judge_grounded.py` 生成，提交；测试核对提交的和生成器一致）：
+    - 合格回答 = 证据所在的那一句（分句只认句末的 `.!?` 加空格和 `。！？`，比切块的分句窄：基础回答要是读者会整句引用的一句），引用它的段落为来源 [1]；证据跨句的题（q07）没有干净的基础回答，不用。
+    - 机械改法用 lite-eval 的 `judges/construct.py`：改一个数字、加一句别的文档的话、换成别题的回答、去掉引用。插入和交换只取**同语言**的其他文档：语言取自金标集（文档的语言 = 它的题目的语言），不按字符猜（Codex 发现：英文句子里引一个汉字就会被当成中文）。
+    - 手写改法（`hand-corruptions.jsonl`，每题两条）：把来源说的一件事说反（`contradict_source`），以及加一句听起来合理但没有任何来源说过的话（`plausible_elaboration`）。测试核对手写和插入的内容不在该题的整篇文档里。
+    - 真实回答（`real-answers.jsonl`）：第一次真实回答检查的 32 个回答，带它们拿到的全部来源，逐条读后标注（28 grounded、2 unsupported、2 unclear 留档不用）；标注是模型读的，待 owner 抽查。
+  - **为什么有手写改法和真实回答**：只有机械改法时，qwen3:8b（思考关）262/262 全对；但拿真实回答一读，它放过了两条有问题的回答（q04 加了来源没有的解释，q20 和自己引用的来源矛盾），又把一条忠实的转述（q27）判成 unsupported。构造的标签继承了构造的样子（方法论 §2、lite-eval 设计 §3 L2）：真实模型的错误是看似合理的补充和不起眼的矛盾，不是整句换掉。
+  - **结果**（223 例 × 2 次，温度 0，两次完全一致）：思考关整体 0.955；机械改法、合格回答、说反来源都是 1.000；合理补充 0.774（31 条漏 7 条：都是归因、机制、经验规则，如"SCA 标准""国家规定"）；真实回答 0.900，但两条有问题的真实回答都没判出来。结论：只能做粗筛（找错答、矛盾、编造），**不能做门禁**。思考开：整体 0.982；合理补充 0.968（31 条漏 1 条）；真实回答 0.933，不再误判那条忠实转述，但两条有问题的真实回答仍然都没判出来（它们引用了多个来源，评审认为补充的说法"明示或暗示"有依据）；新增一条误判（去掉引用的 q21，评审把春分那半句读成了惊蛰）；p50 11.8 秒，是思考关的 3.7 倍。结论不变：要用就用思考开，但真实回答里那种跨多个来源的补充说法，两种设置都抓不住，而两条样本也不够量出漏判率。
+  - **`literag eval-answers`**：`LiteRagAnswerTarget`（`LiteRagTarget` 的子类，`query_key = "question"`，构造时给 `llm_for`）对金标题跑 `ask`，输出 `{question, answer, sources, status, dropped}`，延迟含一次回答调用；计费用 `billing(settings, answers=True)`，把回答模型算进去。评审取自校准 suite 里那条配置（含 key 变量、价格、原样的 URL；记录里没有这些），lite-eval 在任何调用之前逐项核对、核对校准的一致率；CLI 在打开 store 之前先检查校准运行。输出缓存开着：同一批回答可以换评审重新判，不用重新生成。
+  - 生成的数据集和 suite 共用 `write_generated_dataset`、`golden_cases`、`write_suite`（检索评测的 `dataset.yaml` 字节不变，所以数据集哈希和以前的运行仍可比；Codex 发现过一次差点改掉）。
+  - **自评偏差**：回答和评审都是 qwen3:8b。换一个模型家族的评审（经 llm-gateway，按 owner 的指示）是下一步的对照。

@@ -1,0 +1,8 @@
+name: grounded-golden
+version: seed20261118
+pack: judging
+description: 'grounded-judge calibration set from golden.jsonl over corpus/ (generated
+  by eval/make_judge_grounded.py, seed 20261118): labels by construction, mechanical
+  and hand-written (hand-corruptions.jsonl), and real answers labelled by reading
+  them (real-answers.jsonl); left out (evidence not in one sentence): q07'
+license: Apache-2.0

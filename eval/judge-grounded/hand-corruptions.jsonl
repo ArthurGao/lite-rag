@@ -1,0 +1,31 @@
+{"question": "q01", "contradict": "Start with a ratio of 1 gram of coffee to 16 grams of water, and grind it as fine as flour. [1]", "elaborate": "This ratio is the standard set by the Specialty Coffee Association for all filter brewing."}
+{"question": "q02", "contradict": "Use water that has just reached a rolling boil, around 100 degrees Celsius. [1]", "elaborate": "Hotter water extracts more caffeine, so the upper end of the range gives a stronger cup."}
+{"question": "q03", "contradict": "Fresh coffee absorbs carbon dioxide during this bloom, which slows the rest of the water down. [1]", "elaborate": "Skipping the bloom makes the coffee taste noticeably more bitter."}
+{"question": "q04", "contradict": "If the drink tastes sour, grind coarser next time, and if it tastes bitter, grind finer. [1]", "elaborate": "A finer grind raises extraction, which turns sour acids into sweeter compounds."}
+{"question": "q05", "contradict": "Run `python -m venv .venv` in your home folder, so every project can share it. [1]", "elaborate": "This works the same on every Python version since 2.7."}
+{"question": "q06", "contradict": "On Windows run `source .venv/bin/activate`, the same command as on macOS and Linux. [1]", "elaborate": "Activation also installs the packages listed in requirements.txt."}
+{"question": "q08", "contradict": "Commit the `.venv` folder to version control so others get the same environment. [1]", "elaborate": "Most hosting services reject repositories that contain a `.venv` folder."}
+{"question": "q09", "contradict": "Mercury is the hottest planet, because it is the closest to the Sun. [1]", "elaborate": "Its surface is hot enough to melt lead, mainly because of its fast rotation."}
+{"question": "q10", "contradict": "It has the tallest volcano in the solar system, Olympus Mons, about half the height of Mount Everest. [1]", "elaborate": "Olympus Mons is still active and last erupted a few thousand years ago."}
+{"question": "q11", "contradict": "Mars looks red because of the red light scattered by its thick atmosphere. [1]", "elaborate": "The rust formed when Mars lost its oceans about a million years ago."}
+{"question": "q12", "contradict": "Uranus rotates almost upright, like Earth, with an axis tilted only a few degrees. [1]", "elaborate": "Because of this tilt, each pole has about 42 years of continuous daylight."}
+{"question": "q13", "contradict": "When one site is breached, attackers guess new passwords at random on other sites; this is called credential stuffing. [1]", "elaborate": "Credential stuffing accounts for most account takeovers on banking websites."}
+{"question": "q14", "contradict": "Text messages are safer than an authenticator app, because they cannot be redirected. [1]", "elaborate": "Authenticator apps also keep working when the phone has no battery."}
+{"question": "q15", "contradict": "A password manager uses one strong password for every account, so you only remember that one. [1]", "elaborate": "Password managers encrypt everything so strongly that they have never been breached."}
+{"question": "q16", "contradict": "Odd symbols matter more than length. [1]", "elaborate": "Each extra character makes a password about a hundred times harder to crack."}
+{"question": "q17", "contradict": "青茶又叫乌龙茶，是不发酵茶，发酵程度比绿茶还低。[1]", "elaborate": "因为半发酵，乌龙茶的咖啡因含量是六大茶类中最高的。"}
+{"question": "q18", "contradict": "白毫银针是绿茶中的代表。[1]", "elaborate": "白毫银针只产于福建福鼎，其他地方产的都不能叫这个名字。"}
+{"question": "q19", "contradict": "黑茶是不发酵茶，不宜长期存放，存放越久味道越差。[1]", "elaborate": "存放十年以上的黑茶，降血脂的效果比新茶高出一倍。"}
+{"question": "q20", "contradict": "采摘后先晒干，让酶继续发酵，所以茶汤保持清绿。[1]", "elaborate": "杀青温度越高，茶叶中的维生素 C 保留得越多。"}
+{"question": "q21", "contradict": "惊蛰时天气转冷，蛰伏的虫子开始冬眠；春分这一天昼夜几乎等长。[1]", "elaborate": "惊蛰这天打雷，预示着当年会有大丰收。"}
+{"question": "q22", "contradict": "它用来指导农事，2016 年被列入世界自然遗产名录。[1]", "elaborate": "二十四节气是中国第一个被列入该名录的项目。"}
+{"question": "q23", "contradict": "夏至是北半球一年中白昼最短的一天。[1]", "elaborate": "夏至之后天气马上开始转凉。"}
+{"question": "q24", "contradict": "冬至是北半球白昼最长、黑夜最短的一天，很多地方有吃粽子的习俗。[1]", "elaborate": "吃饺子的习俗起源于汉代张仲景治冻耳的故事。"}
+{"question": "q25", "contradict": "有害垃圾是可以回收再利用的垃圾，例如废电池、废灯管、过期药品和油漆桶。[1]", "elaborate": "一节废电池可以污染一立方米的土壤长达五十年。"}
+{"question": "q26", "contradict": "湿垃圾即可回收垃圾，包括剩菜剩饭、果皮、菜叶和茶叶渣。[1]", "elaborate": "湿垃圾会被集中运到焚烧厂发电。"}
+{"question": "q27", "contradict": "投放时塑料袋可以一起投放，大骨头属于湿垃圾，和剩菜一起投放。[1]", "elaborate": "大骨头之所以难以腐烂，是因为其中钙的含量超过百分之九十。"}
+{"question": "q28", "contradict": "干垃圾是可以回收的垃圾，例如用过的纸巾、烟头、陶瓷碎片和一次性餐具。[1]", "elaborate": "用过的纸巾不能回收，是因为纸纤维沾水后就会断裂。"}
+{"question": "q29", "contradict": "一线城市住宿不设上限，其他城市每晚上限为 400 元。[1]", "elaborate": "超出上限的部分可以在年底统一补报。"}
+{"question": "q30", "contradict": "出差期间按天发放餐饮补贴，每天 100 元，必须提供餐饮发票。[1]", "elaborate": "餐饮补贴随工资一起发放，并且需要缴纳个人所得税。"}
+{"question": "q31", "contradict": "超过 30 天未提交的，经部门负责人同意后仍可补交。[1]", "elaborate": "这个时限是根据国家财务制度的统一规定制定的。"}
+{"question": "q32", "contradict": "国内出差优先乘坐飞机经济舱；单程超过六小时的，可以选择高铁一等座。[1]", "elaborate": "这样规定是因为高铁的人均碳排放只有飞机的十分之一。"}
