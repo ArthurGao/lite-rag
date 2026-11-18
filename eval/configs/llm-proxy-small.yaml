@@ -3,10 +3,9 @@
 # The rest is chunk-markdown.yaml, the config S13 judged real answers with.
 chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
 retrieval: {mode: hybrid}
+# S15: lite-model's `litellm` backend (127.0.0.1:4400, LITELLM_API_KEY): the answering model is
+# read from the proxy's x-litellm-model-name header, its retries are off per request.
 llm:
-  provider: openai
-  base_url: http://127.0.0.1:4400/v1
-  api_key_env: LITELLM_API_KEY
+  backend: litellm
   model: small
   temperature: 0.0          # as the ollama profile sends by default
-  max_output_tokens: 1024

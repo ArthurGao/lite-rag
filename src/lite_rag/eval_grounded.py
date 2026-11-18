@@ -16,6 +16,7 @@ judge calibrated here is also checked on real `literag ask` answers before it is
 """
 
 import asyncio
+import dataclasses
 import json
 import os
 import random
@@ -46,7 +47,7 @@ from lite_eval.scorers.ranking import normalise
 from lite_eval.store import read_record, root_of
 from lite_eval.suite import load_suite
 
-from lite_rag.config import Settings
+from lite_rag.config import LLMConfig, Settings
 from lite_rag.embedding import build_embedder
 from lite_rag.errors import ConfigError
 from lite_rag.eval import (
@@ -63,7 +64,7 @@ from lite_rag.eval import (
     write_generated_dataset,
     write_suite,
 )
-from lite_rag.llm import build_llm
+from lite_rag.llm import RoleLLM, build_model
 from lite_rag.rerank import build_reranker
 from lite_rag.stores.base import CachedStore
 
@@ -243,9 +244,16 @@ def write_calibration(
 
 # ---------------------------------------------------------------- judging real answers
 
-# LLM settings that never change an answer (how it is fetched, not what it is).
-_LLM_TRANSPORT = {"api_key_env", "timeout_s", "connect_timeout_s", "max_retries"}
+# What an answer run records about its model: the answer role's resolved target, except how it
+# is reached (key variable, timeouts, retries) and priced.
+_NOT_RECORDED = {"role", "api_key_env", "timeout_s", "connect_timeout_s", "max_retries", "prices"}
 JudgeFactory = Callable[[JudgeSpec, float], JudgeClient]
+
+
+def answer_llm(config: LLMConfig) -> RoleLLM:
+    return RoleLLM(build_model(config), "answer")
+
+
 # S14: the answer states the golden question's key fact (case-insensitive regex).
 KEY_FACT = {"field": "answer", "expected": "key_fact", "case_sensitive": False}
 
@@ -265,7 +273,9 @@ class LiteRagAnswerTarget(LiteRagTarget):
     query_key = "question"  # what `ask` searches for and the judge reads
 
     def config(self) -> dict[str, Any]:
-        return {**super().config(), "llm": self.settings.llm.model_dump(exclude=_LLM_TRANSPORT)}
+        answer = dataclasses.asdict(self.settings.llm.target_of("answer"))
+        recorded = {k: v for k, v in answer.items() if k not in _NOT_RECORDED}
+        return {**super().config(), "llm": recorded}
 
     def info(self) -> dict[str, str]:
         return {"latency_scope": "search (+ rerank) and one answer call"}
@@ -289,7 +299,7 @@ class LiteRagAnswerTarget(LiteRagTarget):
             "sources": sources,
             "status": answer.status,
             "dropped": answer.dropped,
-            "response_model": answer.response_model,  # S14: e.g. which model a router chose
+            "model_id": answer.model_id,  # the model that answered, e.g. which one a router chose
         }
         scope = self.info()["latency_scope"]
         return Output(
@@ -372,7 +382,7 @@ def judge_answers(
         embedder_for=embedder_for or (lambda c: build_embedder(c, cache=store)),
         reranker_for=build_reranker,
         corpus_for=lambda pdf: corpus,
-        llm_for=llm_for or build_llm,
+        llm_for=llm_for or answer_llm,
     )
     options = RunOptions(ci=ci_from_env(), judge_factory=judge_factory)
     (result,) = asyncio.run(
@@ -416,7 +426,7 @@ def _rows(result: RunResult, kind: str) -> list[dict[str, Any]]:
                 "id": score.case_id,
                 "question": shown.get("question"),
                 "answer": shown.get("answer"),
-                "response_model": shown.get("response_model"),
+                "model_id": shown.get("model_id"),
                 "reason": score.reason,
                 "evidence": evidence.get("evidence", []),
             }
@@ -438,7 +448,7 @@ def report(flagged: list[dict[str, Any]], missed: list[dict[str, Any]] | None) -
             continue
         lines.append(f"\n{title}: {len(rows)}\n")
         for r in rows:
-            by = f" ({r['response_model']})" if r.get("response_model") else ""
+            by = f" ({r['model_id']})" if r.get("model_id") else ""
             lines.append(f"\n[{r['id']}] {r['question']}{by}\n  answer: {r['answer']}\n")
             if judged:
                 lines.append(f"  judge: {r['reason']}\n")

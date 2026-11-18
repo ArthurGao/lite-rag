@@ -17,9 +17,9 @@ measure.
   each chunk's entities and relations at ingest, and a `graph` path walks them from the entities a
   query names — for questions whose answer is a few documents away from what they mention. Every
   hit carries each stage's score and rank.
-- **Generation**: answers with validated citations through a switchable LLM (Ollama, any
-  OpenAI-compatible endpoint, or Anthropic). No fallback chain; every answer records
-  `provider/model`.
+- **Generation**: answers with validated citations through [lite-model](https://github.com/ArthurGao/lite-model)
+  (Ollama, any OpenAI-compatible endpoint, Anthropic, llm-gateway, a LiteLLM Proxy). No fallback
+  chain; every answer records `backend/model` of the model that actually answered.
 - **Evaluation**: `literag eval` compares configurations side by side (hit@1, hit@5, MRR@10,
   latency) on a bundled Chinese and English corpus, or your own. It runs on
   [lite-eval](https://github.com/ArthurGao/lite-eval): each config is a lite-eval run, so two can
@@ -189,23 +189,28 @@ The compose file runs lite-rag and PostgreSQL (pgvector); Ollama stays on the ho
 ## Configuration
 
 Settings come from `LITERAG_*` environment variables (nested with `__`, e.g.
-`LITERAG_LLM__PROVIDER`), `.env`, or a YAML file passed with `-c`:
+`LITERAG_LLM__MODEL`), `.env`, or a YAML file passed with `-c`:
 
 ```yaml
 store: {backend: postgres, schema: lite_rag}          # or {backend: chroma, data_dir: ./lite_rag_data}
 embedding: {provider: ollama, model: bge-m3}           # ollama | openai | voyage | cohere | gemini | fastembed | sentence_transformers
 chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50}
 retrieval: {mode: hybrid, hybrid_paths: [vector, bm25], top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60}
-graph: {enabled: false, llm: {model: qwen3:8b}, hops: 2, hub_chunks: 5}   # add graph to hybrid_paths, or use mode graph
+graph: {enabled: false, hops: 2, hub_chunks: 5}       # add graph to hybrid_paths, or use mode graph
 rerank: {enabled: false, model: BAAI/bge-reranker-v2-m3-int8, top_n: 20}
-llm: {provider: ollama, model: qwen3:8b}               # ollama | openai | anthropic
+llm:                                                   # lite-model's config (its README)
+  backend: ollama                                      # ollama | openai | anthropic | gateway | litellm
+  model: qwen3:8b                                      # the top level (and its call settings) tunes answers only
+  roles: {graph: {model: qwen3:14b}}                   # contextual / graph: their own model (index identity)
 server: {host: 127.0.0.1, port: 8700}
 loader: {pdf: pypdf}                                   # or docling
 ```
 
-Keep `LITERAG_DATABASE_URL` and API keys in the environment; a provider's key is read from
-`api_key_env` or its usual variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`,
-`CO_API_KEY`, `GEMINI_API_KEY`). See [.env.example](.env.example).
+Keep `LITERAG_DATABASE_URL` and API keys in the environment; a key is read from `api_key_env` or
+its usual variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`, `CO_API_KEY`,
+`GEMINI_API_KEY`). See [.env.example](.env.example). Before S15 the LLM settings had another
+shape (`llm.provider`, `graph.llm`, `chunking.contextual.llm`): those are refused with where they
+went.
 
 ### Extras
 

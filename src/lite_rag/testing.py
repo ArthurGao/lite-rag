@@ -4,9 +4,13 @@ contract tests). They never touch the network or a model (AGENTS.md rule 6)."""
 import hashlib
 import random
 from collections.abc import Callable
+from typing import get_args
+
+from lite_model.testing import FakeCall, FakeModel
 
 from lite_rag.chunking import unit as normalise
-from lite_rag.llm import Completion, Message
+from lite_rag.config import Role
+from lite_rag.llm import Message, RoleLLM
 from lite_rag.model_profiles import Prefixes
 from lite_rag.text import ESTIMATE_TOKEN
 
@@ -65,20 +69,22 @@ class SpreadEmbedder(FakeEmbedder):
         return normalise([rng.gauss(0, 1) for _ in range(self.dim)])
 
 
-class FakeLLM:
-    """Replies with `reply` — a fixed text, or a function of the prompt — and records every
-    prompt."""
-
-    model_id = "fake/fake-llm"
+class FakeLLM(RoleLLM):
+    """lite-rag's LLM over lite-model's `FakeModel`: replies with `reply` — a fixed text, or a
+    function of the prompt — for whichever role calls it, and records every prompt. Its answers
+    say `fake/fake-model`, so a scripted reply is never mistaken for a model's."""
 
     def __init__(self, reply: str | Callable[[list[Message]], str] = "") -> None:
-        self._reply = reply
-        self.calls: list[list[Message]] = []  # every prompt it was sent
+        def script(call: FakeCall) -> str:
+            return reply if isinstance(reply, str) else reply(list(call.messages))
 
-    def complete(self, messages: list[Message]) -> Completion:
-        self.calls.append(list(messages))
-        text = self._reply if isinstance(self._reply, str) else self._reply(messages)
-        return Completion(text, self.model_id, {"input": 10, "output": 5}, "fake-llm")
+        self.fake = FakeModel(**{role: script for role in get_args(Role)})
+        super().__init__(self.fake, "answer")
+
+    @property
+    def calls(self) -> list[list[Message]]:
+        """Every prompt it was sent, from any role."""
+        return [list(c.messages) for c in self.fake.calls]
 
 
 class FakeReranker:

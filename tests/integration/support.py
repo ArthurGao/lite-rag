@@ -25,6 +25,7 @@ def make_runtime(
     llm: LLM | None = None,
     graph: dict[str, Any] | None = None,
     graph_llm: LLM | None = None,
+    llm_settings: dict[str, Any] | None = None,
     **chunking: Any,
 ) -> RagRuntime:
     settings = load_settings(
@@ -33,6 +34,7 @@ def make_runtime(
         retrieval=retrieval or {},
         rerank=rerank or {},
         graph=graph or {},
+        llm=llm_settings or {},
     )
     inner = embedder or FakeEmbedder(dim=8)
     wrapped: Embedder = CachingEmbedder(inner, store) if cache else inner

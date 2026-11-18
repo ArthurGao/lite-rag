@@ -139,9 +139,9 @@ def test_answers_are_judged_by_the_calibrated_judge(store: PgStore, tmp_path: Pa
         "sources",
         "status",
         "dropped",
-        "response_model",
+        "model_id",
     }
-    assert out.value["response_model"] == "fake-llm"  # S14: which model answered
+    assert out.value["model_id"] == "fake/fake-model"  # S15: the model that answered
     assert out.value["status"] == "answered" and out.value["sources"][0]["text"]
     assert out.trace.usage is not None and out.trace.latency_ms is not None
     config = result.record.target.config
@@ -213,9 +213,9 @@ def test_the_key_fact_is_checked_on_every_answer(store: PgStore, tmp_path: Path)
     facts = {s.case_id: s.value for s in stored.scores if s.scorer == KEY_FACT_SCORER}
     assert facts == {"q01": 1.0, "q02": 0.0, "q03": 0.0}
     missed = missed_facts(result)  # listed apart from the judge's flags, to be read
-    assert [(r["id"], r["response_model"]) for r in missed] == [
-        ("q02", "fake-llm"),
-        ("q03", "fake-llm"),
+    assert [(r["id"], r["model_id"]) for r in missed] == [
+        ("q02", "fake/fake-model"),
+        ("q03", "fake/fake-model"),
     ]
     assert [r["id"] for r in flagged_answers(result)] == []  # the judge passed all three
 

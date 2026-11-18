@@ -1,9 +1,11 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from lite_rag.config import load_settings
+from lite_rag.config import LLMConfig, load_settings
+from lite_rag.llm import build_model
 from lite_rag.stores.factory import evaluation_store, location
 
 
@@ -12,7 +14,7 @@ def test_defaults_are_the_local_free_stack() -> None:
     assert (s.store.backend, s.store.schema_name) == ("postgres", "lite_rag")
     assert (s.embedding.provider, s.embedding.model) == ("ollama", "bge-m3:567m")
     assert (s.chunking.strategy, s.chunking.unit, s.chunking.size) == ("recursive", "tokens", 800)
-    assert (s.llm.provider, s.llm.model) == ("ollama", "qwen3:8b")
+    assert s.llm.role_id("answer") == "ollama/qwen3:8b"
 
 
 def test_yaml_file_sets_values_and_the_environment_overrides_it(
@@ -67,22 +69,22 @@ def test_with_file_wins_the_file_outranks_the_environment(
 
 def test_parent_child_needs_parents_larger_than_children() -> None:
     default = load_settings(chunking={"strategy": "parent_child", "size": 200}).chunking
-    assert default.identity()["parent_size"] == 800  # four times size
+    assert default.identity(LLMConfig())["parent_size"] == 800  # four times size
     with pytest.raises(ValidationError, match="parent_size"):
         load_settings(chunking={"strategy": "parent_child", "size": 200, "parent_size": 200})
 
 
 def test_parent_size_joins_the_identity_only_for_parent_child() -> None:
-    plain = load_settings(chunking={"parent_size": 999}).chunking.identity()
+    plain = load_settings(chunking={"parent_size": 999}).chunking.identity(LLMConfig())
     assert "parent_size" not in plain  # existing kbs keep the identity they were built with
     pc = load_settings(chunking={"strategy": "parent_child", "size": 200, "parent_size": 900})
-    assert pc.chunking.identity()["parent_size"] == 900
+    assert pc.chunking.identity(pc.llm)["parent_size"] == 900
 
 
 def test_semantic_threshold_joins_the_identity_only_for_semantic() -> None:
-    assert "semantic_threshold" not in load_settings().chunking.identity()
+    assert "semantic_threshold" not in load_settings().chunking.identity(LLMConfig())
     s = load_settings(chunking={"strategy": "semantic", "semantic_threshold": 90})
-    assert s.chunking.identity()["semantic_threshold"] == 90
+    assert s.chunking.identity(s.llm)["semantic_threshold"] == 90
     with pytest.raises(ValidationError):
         load_settings(chunking={"strategy": "semantic", "semantic_threshold": 100})
 
@@ -132,8 +134,8 @@ def test_graph_is_off_by_default_and_hybrid_keeps_two_paths() -> None:
     assert s.graph.enabled is False
     assert s.retrieval.hybrid_paths == ["vector", "bm25"]
     # extraction on local qwen3 without thinking: the reply is JSON, not a monologue
-    assert (s.graph.llm.provider, s.graph.llm.model) == ("ollama", "qwen3:8b")
-    assert s.graph.llm.reasoning_effort == "none"
+    assert s.llm.role_id("graph") == "ollama/qwen3:8b"
+    assert s.llm.target_of("graph").reasoning_effort == "none"
 
 
 def test_the_graph_needs_the_postgres_backend() -> None:
@@ -169,5 +171,63 @@ def test_weighted_fusion_takes_vector_and_bm25_only() -> None:
 def test_the_graph_identity_names_the_extraction_model_and_prompt() -> None:
     from lite_rag.graph import prompt_digest
 
-    s = load_settings(graph={"enabled": True, "llm": {"model": "qwen3:14b"}})
-    assert s.graph.identity() == {"llm": "ollama/qwen3:14b", "prompt": prompt_digest()}
+    s = load_settings(graph={"enabled": True}, llm={"roles": {"graph": {"model": "qwen3:14b"}}})
+    assert s.graph.identity(s.llm) == {"llm": "ollama/qwen3:14b", "prompt": prompt_digest()}
+
+
+def test_moving_answers_leaves_the_index_roles_on_their_own_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # S15: before lite-model, `llm` configured answers only; contexts and graphs had their own
+    # sections on the local model. Moving answers must not move them (index identity, ingest cost).
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    s = load_settings(llm={"backend": "anthropic", "model": "claude-x", "max_output_tokens": 700})
+    assert s.llm.role_id("answer") == "anthropic/claude-x"
+    assert s.llm.role_id("contextual") == s.llm.role_id("graph") == "ollama/qwen3:8b"
+    graph = s.llm.target_of("graph")
+    assert (graph.reasoning_effort, graph.max_output_tokens) == ("none", 2048)
+    assert s.llm.target_of("contextual").max_output_tokens == 1024
+    build_model(s.llm)  # a valid config: nothing anthropic cannot take lands on it
+    # a role still moves when told to, keeping its other defaults
+    moved = load_settings(llm={"roles": {"graph": {"model": "qwen3:14b"}}})
+    assert moved.llm.role_id("graph") == "ollama/qwen3:14b"
+    assert moved.llm.target_of("graph").reasoning_effort == "none"
+
+
+@pytest.mark.parametrize(
+    ("given", "moved_to"),
+    [
+        ({"graph": {"enabled": True, "llm": {"model": "qwen3:14b"}}}, "llm.roles.graph"),
+        ({"chunking": {"contextual": {"enabled": True, "llm": {"model": "m"}}}},
+         "llm.roles.contextual"),
+        ({"llm": {"provider": "openai"}}, "llm.backend"),
+    ],
+)  # fmt: skip
+def test_the_llm_settings_from_before_s15_are_refused_with_where_they_went(
+    given: dict[str, Any], moved_to: str
+) -> None:
+    # never silently ignored: a graph built by the default model instead of the configured one
+    with pytest.raises(ValidationError, match=moved_to.replace(".", r"\.")):
+        load_settings(**given)
+
+
+def test_top_level_call_settings_tune_answers_only() -> None:
+    # Codex S15: before lite-model `llm` configured answers only; a top-level reasoning effort or
+    # temperature reaching contexts and graphs would change what new chunks get under an index
+    # identity that does not change.
+    s = load_settings(
+        llm={"reasoning_effort": "none", "temperature": 0.3, "max_output_tokens": 300}
+    )
+    answer, contextual, graph = (s.llm.target_of(r) for r in ("answer", "contextual", "graph"))
+    assert (answer.reasoning_effort, answer.temperature, answer.max_output_tokens) == (
+        "none", 0.3, 300
+    )  # fmt: skip
+    assert (contextual.reasoning_effort, contextual.temperature, contextual.max_output_tokens) == (
+        None, 0.0, 1024
+    )  # fmt: skip
+    assert (graph.reasoning_effort, graph.temperature, graph.max_output_tokens) == (
+        "none", 0.0, 2048
+    )  # fmt: skip
+    # the answer role's own setting wins over the top level
+    both = load_settings(llm={"temperature": 0.3, "roles": {"answer": {"temperature": 0.7}}})
+    assert both.llm.target_of("answer").temperature == 0.7

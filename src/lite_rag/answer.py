@@ -42,10 +42,10 @@ class Answer:
     text: str
     citations: list[Citation]
     sources: list[Hit]
-    model_id: str | None  # provider/model; None when the model was not called
+    # backend/model that answered (read from the response, S15); None when no model was called
+    model_id: str | None
     usage: dict[str, int] = field(default_factory=dict)
     dropped: list[int] = field(default_factory=list)
-    response_model: str | None = None  # S14: the `model` the LLM response names (llm.Completion)
 
 
 def prompt(question: str, hits: list[Hit]) -> list[Message]:

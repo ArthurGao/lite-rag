@@ -21,7 +21,7 @@ import unicodedata
 from collections.abc import Callable, Iterable
 from typing import Any
 
-from lite_rag.llm import LLM, BoundedCalls, LLMError
+from lite_rag.llm import LLM, LLMError
 from lite_rag.prompts import digest, render_pair
 from lite_rag.types import Chunk, ChunkGraph, Entity, Relation
 
@@ -118,12 +118,15 @@ class GraphExtractor:
     2026-11-12). Up to `concurrency` calls at once across every ingest sharing the extractor."""
 
     def __init__(self, llm: LLM, concurrency: int = 1) -> None:
-        self._calls = BoundedCalls(llm, concurrency)
+        self._calls = llm.bounded(concurrency)
 
     def extract(self, chunks: list[Chunk]) -> list[ChunkGraph]:
         """One graph per chunk, in chunk order."""
         return self._calls.map(
-            lambda c: parse_graph(self._calls.text(render_pair(*TEMPLATES, passage=c.text))), chunks
+            lambda c: parse_graph(
+                self._calls.complete(render_pair(*TEMPLATES, passage=c.text)).text
+            ),
+            chunks,
         )
 
 

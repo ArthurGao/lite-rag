@@ -5,9 +5,12 @@ Precedence, highest first: explicit arguments, environment, `.env`, the YAML fil
 """
 
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
 
+from lite_model import ModelsConfig, RoleConfig, Target
+from lite_model.config import Name, target
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
@@ -17,8 +20,11 @@ from pydantic_settings import (
 )
 
 from lite_rag.loaders import PdfLoader
+from lite_rag.types import model_id
 
-OLLAMA_URL = "http://127.0.0.1:11434"  # the local Ollama server (embeddings: /api, LLM: /v1)
+OLLAMA_URL = (
+    "http://127.0.0.1:11434"  # the local Ollama server's embeddings (/api); LLMs: lite-model
+)
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
@@ -119,9 +125,10 @@ class ChunkingConfig(BaseModel):
     def effective_parent_size(self) -> int:
         return self.parent_size or 4 * self.size
 
-    def identity(self) -> dict[str, Any]:
+    def identity(self, llm: "LLMConfig") -> dict[str, Any]:
         """What changes the chunks this config produces — recorded on a kb and compared when it
-        is opened. A new field joins only when it changes output (add it here deliberately)."""
+        is opened. A new field joins only when it changes output (add it here deliberately).
+        `llm`: the contextual role's model is identity when contextual headers are on."""
         return {
             "strategy": self.strategy,
             "unit": self.unit,
@@ -135,24 +142,29 @@ class ChunkingConfig(BaseModel):
                 else {}
             ),
             **(self._semantic_identity() if self.strategy == "semantic" else {}),
-            **({"contextual": self.contextual.identity()} if self.contextual.enabled else {}),
+            **({"contextual": self.contextual.identity(llm)} if self.contextual.enabled else {}),
         }
 
 
 class ContextualConfig(BaseModel):
-    """Contextual chunk headers (design §3.1): one LLM call per chunk at ingest. Its own `llm`
-    section (default: local Ollama), so answers and contexts can use different models."""
+    """Contextual chunk headers (design §3.1): one LLM call per chunk at ingest, as the
+    `contextual` role of the `llm` section (default: the same local model as answers)."""
 
     enabled: bool = False
-    llm: "LLMConfig" = Field(default_factory=lambda: LLMConfig())
+
+    @model_validator(mode="before")
+    @classmethod
+    def _llm_moved(cls, value: Any) -> Any:
+        return _moved_llm(value, "chunking.contextual", "contextual")
+
     max_doc_tokens: int = Field(default=6000, gt=0)  # longer documents: a window per chunk
     concurrency: int = Field(default=4, gt=0)  # LLM calls at once while ingesting (not identity)
 
-    def identity(self) -> dict[str, Any]:
+    def identity(self, llm: "LLMConfig") -> dict[str, Any]:
         from lite_rag.contextual import prompt_digest  # imported late: it imports this module
 
         return {
-            "llm": f"{self.llm.provider}/{self.llm.model}",
+            "llm": llm.role_id("contextual"),
             "max_doc_tokens": self.max_doc_tokens,
             "prompt": prompt_digest(),
         }
@@ -196,14 +208,17 @@ class RetrievalConfig(BaseModel):
 
 class GraphConfig(BaseModel):
     """Graph retrieval, local mode (design §5, S11): at ingest an LLM lists each chunk's entities
-    and relations (its own `llm` section, default local qwen3 without thinking); at query time the
-    `graph` path walks them. Only `llm` and the prompt are index identity; the rest tunes the
-    query and may change freely."""
+    and relations (the `graph` role of the `llm` section, default local qwen3 without thinking);
+    at query time the `graph` path walks them. Only the role's model and the prompt are index
+    identity; the rest tunes the query and may change freely."""
 
     enabled: bool = False
-    llm: "LLMConfig" = Field(
-        default_factory=lambda: LLMConfig(reasoning_effort="none", max_output_tokens=2048)
-    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _llm_moved(cls, value: Any) -> Any:
+        return _moved_llm(value, "graph", "graph")
+
     concurrency: int = Field(default=4, gt=0)  # LLM calls at once while ingesting
     hops: int = Field(default=2, ge=0, le=4)  # 2: the answer two documents from the named one
     # An entity in more chunks than this is a hub (a company name, a running theme): the walk
@@ -211,15 +226,15 @@ class GraphConfig(BaseModel):
     hub_chunks: int = Field(default=5, gt=0)
     max_neighbors: int = Field(default=20, gt=0, le=1000)  # new entities kept per hop
 
-    def identity(self) -> dict[str, Any]:
+    def identity(self, llm: "LLMConfig") -> dict[str, Any]:
         from lite_rag.graph import prompt_digest  # imported late: it imports this module
 
-        return {"llm": f"{self.llm.provider}/{self.llm.model}", "prompt": prompt_digest()}
+        return {"llm": llm.role_id("graph"), "prompt": prompt_digest()}
 
-    def index_identity(self) -> dict[str, Any]:
+    def index_identity(self, llm: "LLMConfig") -> dict[str, Any]:
         """What a graph adds to a kb's identity: nothing when off, so kbs built without one keep
         theirs (the engine's kb record and the evaluation's kb names both use this)."""
-        return {"graph": self.identity()} if self.enabled else {}
+        return {"graph": self.identity(llm)} if self.enabled else {}
 
 
 class RerankConfig(BaseModel):
@@ -233,41 +248,79 @@ class RerankConfig(BaseModel):
     cache_dir: str | None = None
 
 
-class LLMConfig(BaseModel):
-    """Design §6. `ollama` and `openai` share the OpenAI-compatible client (Ollama serves /v1,
-    so do llm-gateway, DeepSeek, DashScope…); `anthropic` uses Anthropic's SDK (extra). What
-    each provider accepts is the `PROVIDERS` table in llm.py; a setting a provider cannot honour
-    is refused here rather than silently dropped."""
+def _moved_llm(value: Any, section: str, role: str) -> Any:
+    """A role's own `llm` section is gone (S15): refused with where it went, never ignored (a
+    graph would silently be built by the default model)."""
+    if isinstance(value, dict) and "llm" in value:
+        raise ValueError(f"{section}.llm moved to llm.roles.{role} (lite-rag S15, design §6)")
+    return value
 
-    provider: Literal["ollama", "openai", "anthropic"] = "ollama"
-    model: str = "qwen3:8b"
-    base_url: str | None = None  # None: the provider's own (Ollama: local /v1)
-    api_key_env: str | None = None  # None: the provider's usual variable, e.g. OPENAI_API_KEY
-    temperature: float | None = None  # None: the provider profile's default (Ollama: 0)
-    max_output_tokens: int = Field(default=1024, gt=0)
-    # The request field carrying max_output_tokens, when an OpenAI-compatible endpoint wants the
-    # other one than its provider's default (`max_tokens` for ollama, `max_completion_tokens` for
-    # openai).
-    max_tokens_param: Literal["max_tokens", "max_completion_tokens"] | None = None
-    # "none" turns qwen3's thinking off on Ollama (7 vs ~350 tokens for a one-line answer,
-    # measured 2026-11-08). None: not sent.
-    reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
-    timeout_s: float = Field(default=120.0, gt=0)
+
+# Call settings a top-level `llm` value gives the answer role only (S15).
+_ANSWER_ONLY = ("temperature", "reasoning_effort", "max_output_tokens")
+
+# lite-rag's LLM roles (design §6). `contextual` and `graph` are index identity: never routed.
+Role = Literal["answer", "contextual", "graph"]
+
+
+class LLMConfig(ModelsConfig):
+    """Design §6, S15: lite-model's configuration (its design §4: `backend`, `model`, `roles`,
+    `backends`, …) with lite-rag's defaults: every role on the local Ollama (qwen3:8b), at most
+    1024 output tokens, a stopped server failing fast (5 s), one retry of the same model.
+
+    The top-level `backend` / `model` move answers only; `contextual` and `graph` keep their own
+    (graph: no thinking, 2048 tokens) until `roles` names them, field by field. Backends are
+    named after their type, so a role's id (`ollama/qwen3:8b`), recorded in index identity and on
+    every answer, is the same as before lite-model."""
+
+    # The index roles keep their own model, as their own sections did before lite-model: moving
+    # answers (the top-level `backend` / `model`) must not move them — their model is index
+    # identity, and ingest would start calling it (S15).
+    host_roles: ClassVar[Mapping[str, RoleConfig]] = {
+        "contextual": RoleConfig(backend="ollama", model="qwen3:8b", max_output_tokens=1024),
+        # "none" turns qwen3's thinking off on Ollama (7 vs ~350 tokens for a one-line answer,
+        # measured 2026-11-08)
+        "graph": RoleConfig(
+            backend="ollama", model="qwen3:8b", reasoning_effort="none", max_output_tokens=2048
+        ),
+    }
+    backend: Name = "ollama"
+    model: Name = "qwen3:8b"
+    max_output_tokens: int | None = Field(default=1024, gt=0)
     connect_timeout_s: float = Field(default=5.0, gt=0)  # a stopped server fails fast
-    max_retries: int = Field(default=1, ge=0)  # the same model only; then LLMError
 
-    @model_validator(mode="after")
-    def _supported_by_provider(self) -> "LLMConfig":
-        if self.provider == "anthropic":
-            unsupported = {
-                "temperature": self.temperature,
-                "reasoning_effort": self.reasoning_effort,
-                "max_tokens_param": self.max_tokens_param,
-            }
-            given = [name for name, value in unsupported.items() if value is not None]
-            if given:
-                raise ValueError(f"llm.{', llm.'.join(given)}: not supported by anthropic")
-        return self
+    @model_validator(mode="before")
+    @classmethod
+    def _before_s15(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        old = sorted({"provider", "base_url", "api_key_env", "max_tokens_param"} & set(value))
+        if old:
+            raise ValueError(
+                f"llm.{', llm.'.join(old)}: moved in lite-rag S15 — llm.backend names a backend, "
+                "and its base_url / api_key_env go under llm.backends.<name> (design §6)"
+            )
+        # The top level tunes answers, as `llm` did before S15: its call settings go to the answer
+        # role (whose own wins), so contexts and graphs stay as their index was built.
+        moved = {k: value[k] for k in _ANSWER_ONLY if k in value}
+        if not moved:
+            return value
+        roles = dict(value.get("roles") or {})
+        answer = roles.get("answer") or {}
+        if isinstance(answer, BaseModel):
+            answer = answer.model_dump(exclude_unset=True)
+        roles["answer"] = {**moved, **answer}
+        return {**{k: v for k, v in value.items() if k not in moved}, "roles": roles}
+
+    def target_of(self, role: Role) -> Target:
+        """Where the role's calls go, resolved without checks or a call (lite-model's own
+        resolution; the one place lite-rag reaches it)."""
+        return target(self, role)
+
+    def role_id(self, role: Role) -> str:
+        """`backend/model` the role is configured with (index identity)."""
+        t = self.target_of(role)
+        return model_id(t.backend, t.model)
 
 
 ChunkingConfig.model_rebuild()

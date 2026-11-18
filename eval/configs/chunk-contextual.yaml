@@ -4,5 +4,6 @@ chunking:
   size: 120
   overlap: 20
   min_size: 20
-  contextual: {enabled: true, llm: {reasoning_effort: none}}
+  contextual: {enabled: true}
 retrieval: {mode: hybrid}
+llm: {roles: {contextual: {reasoning_effort: none}}}  # S15: the contextual role

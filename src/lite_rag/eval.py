@@ -39,7 +39,7 @@ from lite_eval.store import load_run
 from lite_eval.suite import load_suite
 
 from lite_rag import __version__
-from lite_rag.config import EmbeddingConfig, LLMConfig, RerankConfig, Settings
+from lite_rag.config import EmbeddingConfig, LLMConfig, RerankConfig, Role, Settings
 from lite_rag.embedding import Embedder, build_embedder
 from lite_rag.engine import RagEngine, RagRuntime
 from lite_rag.errors import ConfigError, StoreError
@@ -129,9 +129,9 @@ def index_identity(settings: Settings) -> dict[str, Any]:
     serving "the same" model is a different index until shown otherwise."""
     return {
         "loader": settings.loader.model_dump(),  # another loader: another text
-        "chunking": settings.chunking.identity(),
+        "chunking": settings.chunking.identity(settings.llm),
         "embedding": settings.embedding.model_dump(exclude=_TRANSPORT_ONLY),
-        **settings.graph.index_identity(),  # a graph is built into the index
+        **settings.graph.index_identity(settings.llm),  # a graph is built into the index
     }
 
 
@@ -149,26 +149,26 @@ def effective_settings(settings: Settings) -> dict[str, Any]:
 
 
 _LOCAL_EMBEDDERS = {"ollama", "fastembed", "sentence_transformers"}
-_PAID = {"voyage", "cohere", "gemini", "anthropic"}
+_PAID = {"voyage", "cohere", "gemini"}  # embedding providers
 
 
 def billing(
     settings: Settings, *, answers: bool = False
 ) -> Literal["free", "per_token", "unknown"]:
     """For lite-eval's CI guard: free only when every model the run calls is local (`answers`:
-    the run also calls the answer LLM)."""
-    used: list[str] = [settings.embedding.provider]
-    if answers:
-        used.append(settings.llm.provider)
-    if settings.chunking.contextual.enabled:
-        used.append(settings.chunking.contextual.llm.provider)
-    if settings.graph.enabled:
-        used.append(settings.graph.llm.provider)
-    if any(p in _PAID for p in used):
+    the run also calls the answer LLM). An LLM role counts by the channel lite-model resolves
+    for it (S15): local, api (paid per token) or subscription."""
+    on: dict[Role, bool] = {
+        "answer": answers,
+        "contextual": settings.chunking.contextual.enabled,
+        "graph": settings.graph.enabled,
+    }
+    channels = {settings.llm.target_of(role).channel for role, used in on.items() if used}
+    if settings.embedding.provider in _PAID or "api" in channels:
         return "per_token"
-    if settings.embedding.provider in _LOCAL_EMBEDDERS and all(p == "ollama" for p in used[1:]):
+    if settings.embedding.provider in _LOCAL_EMBEDDERS and channels <= {"local"}:
         return "free"
-    return "unknown"  # an OpenAI-compatible endpoint may be local or paid
+    return "unknown"  # an OpenAI-compatible embedder, or a subscription
 
 
 def latency_scope(settings: Settings) -> str:

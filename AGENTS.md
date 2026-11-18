@@ -21,7 +21,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S0–S14 done** (2026-11-08/18; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
+**S0–S15 done** (2026-11-08/18; S15: every LLM call goes through lite-model 0.2.0 — roles `answer` / `contextual` / `graph`, request bodies and index identity unchanged, design §12 S15 record; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
 lite-eval, numbers identical to before; S13: the grounded judge from lite-eval E5 calibrated on a
 constructed set and run on real `literag ask` answers, `literag eval-answers`; S14: answer correctness (`key_fact`), `response_model`, and the measured effect of
 LiteLLM auto-routing on answers — design §12 S14 record). The owner's direction
@@ -33,7 +33,8 @@ Decided (2026-11-08): separate public repo; library + optional HTTP service (`li
 `RagEngine`; storage is PostgreSQL + pgvector by default (vectors, own BM25 postings and the document registry in one
 transaction), Chroma + SQLite optional; own BM25 with jieba;
 Ollama for local embedding (`bge-m3`) and chat (`qwen3:8b`); LLM switchable between `ollama`, `openai`
-(any OpenAI-compatible endpoint, including llm-gateway) and `anthropic`.
+(any OpenAI-compatible endpoint, including llm-gateway) and `anthropic` — through lite-model since S15 (also
+`gateway`, `litellm`).
 
 ## Rules
 
@@ -47,7 +48,10 @@ Ollama for local embedding (`bge-m3`) and chat (`qwen3:8b`); LLM switchable betw
 4. **Ids are stable**: chunk id = `"{doc_id}#{n}"`; `upsert_text` replaces a document's chunks in both indexes;
    `delete` removes them from both. On PostgreSQL a document write is one transaction. An unchanged document (same hash and chunker config) is a no-op.
 5. **No silent fallbacks**: a failed model call raises. No fallback chain between LLMs or embedders. Every answer
-   records `provider:model`; citations are validated against the retrieved chunks.
+   records `backend/model` of the model that answered; citations are validated against the retrieved chunks.
+   LLM calls go through lite-model (S15; `llm.py` is lite-rag's side): its rules apply — retries on the same model
+   only, errors without upstream text, keys only through `api_key_env`. `contextual` and `graph` are index
+   identity: never routable, and the top-level `llm` settings tune answers only.
 6. **Prompts live in `src/lite_rag/prompts/*.j2`**, never inline strings.
 7. **Secrets only from environment variables.** Never commit `.env*` except `.env.example`.
 8. **Tests never call a real model or a paid API.** Unit and integration tests use `FakeEmbedder` / `FakeLLM`.
@@ -61,8 +65,8 @@ Ollama for local embedding (`bge-m3`) and chat (`qwen3:8b`); LLM switchable betw
 
 ## Tech stack
 
-Python 3.12, uv, pydantic / pydantic-settings, Typer, PostgreSQL + pgvector, chromadb (extra), FastAPI (extra), jieba, OpenAI SDK (OpenAI-compatible LLMs and
-Ollama `/v1`), Anthropic SDK (extra), Jinja2, pytest, ruff, mypy. Ollama on the host (`127.0.0.1:11434`).
+Python 3.12, uv, pydantic / pydantic-settings, Typer, PostgreSQL + pgvector, chromadb (extra), FastAPI (extra), jieba, lite-model (every LLM call;
+it pins the OpenAI and Anthropic SDKs), Jinja2, pytest, ruff, mypy. Ollama on the host (`127.0.0.1:11434`).
 
 ## Commands
 

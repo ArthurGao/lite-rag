@@ -12,7 +12,7 @@ from lite_rag.config import load_settings
 from lite_rag.contextual import Contextualizer
 from lite_rag.engine import RagRuntime
 from lite_rag.errors import ConfigError
-from lite_rag.llm import Completion, Message
+from lite_rag.llm import Message
 from lite_rag.stores.base import CachedStore
 from lite_rag.testing import FakeEmbedder, FakeLLM
 from lite_rag.text import CharCounter
@@ -50,7 +50,7 @@ def test_a_model_is_built_once_even_when_requests_ask_at_the_same_time(
         built.append(config)
         return object()
 
-    monkeypatch.setattr(engine_module, "build_llm", slow_build)
+    monkeypatch.setattr(engine_module, "build_model", slow_build)
     rt = _runtime()
     with ThreadPoolExecutor(8) as pool:
         models = list(pool.map(lambda _: rt.llm(), range(8)))
@@ -58,21 +58,20 @@ def test_a_model_is_built_once_even_when_requests_ask_at_the_same_time(
 
 
 def test_context_calls_stay_within_the_bound_across_concurrent_ingests() -> None:
-    class Counting:
-        model_id = "fake/counting"
-
+    class Counting(FakeLLM):
         def __init__(self) -> None:
             self.running = self.peak = 0
             self._lock = threading.Lock()
+            super().__init__(self._answer)
 
-        def complete(self, messages: list[Message]) -> Completion:
+        def _answer(self, messages: list[Message]) -> str:
             with self._lock:
                 self.running += 1
                 self.peak = max(self.peak, self.running)
             time.sleep(0.02)
             with self._lock:
                 self.running -= 1
-            return Completion("context", self.model_id, {})
+            return "context"
 
     llm = Counting()
     contextualizer = Contextualizer(llm, CharCounter(), 6000, concurrency=2)

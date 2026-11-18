@@ -3,7 +3,7 @@ chunk in its document; they are prepended to what is embedded and BM25-indexed â
 text a hit returns. One LLM call per chunk, at ingest, up to `concurrency` at once; a failed
 call fails the upsert (nothing is written, no fallback model)."""
 
-from lite_rag.llm import LLM, BoundedCalls, Message
+from lite_rag.llm import LLM, Message
 from lite_rag.prompts import digest, render_pair
 from lite_rag.text import TokenCounter
 from lite_rag.types import Chunk, Document
@@ -39,7 +39,7 @@ class Contextualizer:
     def __init__(
         self, llm: LLM, counter: TokenCounter, max_doc_tokens: int, concurrency: int = 1
     ) -> None:
-        self._calls = BoundedCalls(llm, concurrency)
+        self._calls = llm.bounded(concurrency)
         self._counter = counter
         self._max = max_doc_tokens
 
@@ -50,7 +50,7 @@ class Contextualizer:
 
         def one(chunk: Chunk) -> str:
             shown = window(doc.text, chunk, total, self._max)
-            reply = self._calls.text(context_prompt(doc, chunk, shown))
+            reply = self._calls.complete(context_prompt(doc, chunk, shown)).text
             return " ".join(reply.split())
 
         return self._calls.map(one, chunks)

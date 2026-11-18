@@ -1,0 +1,100 @@
+{
+ "answer": {
+  "auth": "Bearer unused",
+  "body": {
+   "max_tokens": 1024,
+   "messages": [
+    {
+     "content": "只根据下面的资料回答，并标出处 [n]。",
+     "role": "system"
+    },
+    {
+     "content": "资料：\n[1] 咖啡粉和水的比例是 1:16。\n\n问题：手冲咖啡的粉水比是多少？",
+     "role": "user"
+    }
+   ],
+   "model": "qwen3:8b",
+   "temperature": 0.0
+  },
+  "method": "POST",
+  "url": "http://127.0.0.1:11434/v1/chat/completions"
+ },
+ "anthropic": {
+  "auth": "Bearer anthropic-key",
+  "body": {
+   "max_tokens": 700,
+   "messages": [
+    {
+     "content": "资料：\n[1] 咖啡粉和水的比例是 1:16。\n\n问题：手冲咖啡的粉水比是多少？",
+     "role": "user"
+    }
+   ],
+   "model": "claude-x",
+   "system": "只根据下面的资料回答，并标出处 [n]。"
+  },
+  "method": "POST",
+  "url": "http://anthropic.test/v1/messages"
+ },
+ "contextual": {
+  "auth": "Bearer unused",
+  "body": {
+   "max_tokens": 1024,
+   "messages": [
+    {
+     "content": "只根据下面的资料回答，并标出处 [n]。",
+     "role": "system"
+    },
+    {
+     "content": "资料：\n[1] 咖啡粉和水的比例是 1:16。\n\n问题：手冲咖啡的粉水比是多少？",
+     "role": "user"
+    }
+   ],
+   "model": "qwen3:8b",
+   "temperature": 0.0
+  },
+  "method": "POST",
+  "url": "http://127.0.0.1:11434/v1/chat/completions"
+ },
+ "graph": {
+  "auth": "Bearer unused",
+  "body": {
+   "max_tokens": 2048,
+   "messages": [
+    {
+     "content": "只根据下面的资料回答，并标出处 [n]。",
+     "role": "system"
+    },
+    {
+     "content": "资料：\n[1] 咖啡粉和水的比例是 1:16。\n\n问题：手冲咖啡的粉水比是多少？",
+     "role": "user"
+    }
+   ],
+   "model": "qwen3:8b",
+   "reasoning_effort": "none",
+   "temperature": 0.0
+  },
+  "method": "POST",
+  "url": "http://127.0.0.1:11434/v1/chat/completions"
+ },
+ "vendor": {
+  "auth": "Bearer vendor-key",
+  "body": {
+   "max_completion_tokens": 512,
+   "messages": [
+    {
+     "content": "只根据下面的资料回答，并标出处 [n]。",
+     "role": "system"
+    },
+    {
+     "content": "资料：\n[1] 咖啡粉和水的比例是 1:16。\n\n问题：手冲咖啡的粉水比是多少？",
+     "role": "user"
+    }
+   ],
+   "model": "vendor-model",
+   "reasoning_effort": "low",
+   "temperature": 0.3
+  },
+  "method": "POST",
+  "url": "http://vendor.test/v1/chat/completions"
+ }
+}

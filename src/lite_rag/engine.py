@@ -23,15 +23,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lite_model import Model
+
 from lite_rag.answer import Answer, check_citations, prompt
 from lite_rag.chunking import build_chunker, chunk_context, embedding_text
-from lite_rag.config import Mode, RetrievalPath, Settings
+from lite_rag.config import Mode, RetrievalPath, Role, Settings
 from lite_rag.contextual import Contextualizer
 from lite_rag.embedding import Embedder, build_embedder
 from lite_rag.errors import ConfigError, InvalidRequest, KbMismatch, KbNotFound, StoreError
 from lite_rag.fusion import rrf, weighted
 from lite_rag.graph import GraphExtractor, entity_key, seeds, walk
-from lite_rag.llm import LLM, build_llm
+from lite_rag.llm import LLM, RoleLLM, build_model
 from lite_rag.loaders import doc_id_for, file_doc_id, load_file
 from lite_rag.ranking import Key, ranked
 from lite_rag.rerank import Reranker, build_reranker
@@ -103,6 +105,7 @@ class RagRuntime:
         # semantic chunking embeds sentences with the kb's own embedder (and its cache)
         self.chunker = build_chunker(settings.chunking, self.counter, embedder.embed_documents)
         self._reranker = reranker
+        self._model: Model | None = None  # lite-model, for every role not given
         self._llm = llm
         self._context_llm = context_llm
         self._contextualizer: Contextualizer | None = None
@@ -152,8 +155,15 @@ class RagRuntime:
     def llm(self) -> LLM:
         with self._lock:
             if self._llm is None:
-                self._llm = build_llm(self.settings.llm)
+                self._llm = self._role("answer")
             return self._llm
+
+    def _role(self, role: Role) -> LLM:
+        """`role` of the runtime's one lite-model, built (and its whole config checked) on first
+        use; the caller holds the lock."""
+        if self._model is None:
+            self._model = build_model(self.settings.llm)
+        return RoleLLM(self._model, role)
 
     def contextualizer(self) -> Contextualizer:
         """One for the runtime: its `concurrency` bounds the context calls of every ingest
@@ -161,7 +171,7 @@ class RagRuntime:
         with self._lock:
             if self._contextualizer is None:
                 cfg = self.settings.chunking.contextual
-                llm = self._context_llm or build_llm(cfg.llm)
+                llm = self._context_llm or self._role("contextual")
                 self._contextualizer = Contextualizer(
                     llm, self.counter, cfg.max_doc_tokens, cfg.concurrency
                 )
@@ -172,7 +182,7 @@ class RagRuntime:
         with self._lock:
             if self._graph_extractor is None:
                 cfg = self.settings.graph
-                llm = self._graph_llm or build_llm(cfg.llm)
+                llm = self._graph_llm or self._role("graph")
                 self._graph_extractor = GraphExtractor(llm, cfg.concurrency)
             return self._graph_extractor
 
@@ -221,9 +231,9 @@ class RagEngine:
             self._embedder.prefixes.query,
             self._embedder.prefixes.document,
             {
-                **self._settings.chunking.identity(),
+                **self._settings.chunking.identity(self._settings.llm),
                 "counter": self._counter.identity,
-                **self._settings.graph.index_identity(),
+                **self._settings.graph.index_identity(self._settings.llm),
             },
         )
 
@@ -543,7 +553,6 @@ class RagEngine:
             model_id=completion.model_id,
             usage=completion.usage,
             dropped=dropped,
-            response_model=completion.response_model,
         )
 
     def _rerank(

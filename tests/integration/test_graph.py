@@ -52,12 +52,14 @@ def engine(
     llm: FakeLLM | None = None,
     *,
     graph: dict[str, Any] | None = None,
+    graph_role: dict[str, Any] | None = None,
     **retrieval: Any,
 ) -> RagEngine:
     return make_engine(
         store,
         retrieval=retrieval,
         graph={"enabled": True, **(graph or {})},
+        llm_settings={"roles": {"graph": graph_role}} if graph_role else None,
         graph_llm=llm or FakeLLM(extract),
         size=60,  # one sentence per chunk: paragraph chunks merge short paragraphs up to `size`
     )
@@ -203,7 +205,7 @@ def test_the_graph_mode_needs_a_kb_built_with_the_graph(store: PgStore) -> None:
 
 def test_a_kb_refuses_another_extraction_model(store: PgStore) -> None:
     ingest(engine(store))
-    other = engine(store, graph={"llm": {"model": "qwen3:14b"}})
+    other = engine(store, graph_role={"model": "qwen3:14b"})
     with pytest.raises(KbMismatch, match="graph"):
         other.search("kb", "Project Atlas", mode="graph")
 

@@ -39,14 +39,16 @@ def test_one_context_per_chunk_whitespace_collapsed() -> None:
 
 
 def test_the_kb_identity_records_the_context_model_and_prompt() -> None:
-    from lite_rag.config import load_settings
+    from lite_rag.config import LLMConfig, load_settings
     from lite_rag.contextual import prompt_digest
     from lite_rag.prompts import digest
 
-    off = load_settings().chunking.identity()
+    off = load_settings().chunking.identity(LLMConfig())
     assert "contextual" not in off  # existing kbs keep their identity
-    on = load_settings(chunking={"contextual": {"enabled": True, "llm": {"model": "m1"}}})
-    assert on.chunking.identity()["contextual"] == {
+    on = load_settings(
+        chunking={"contextual": {"enabled": True}}, llm={"roles": {"contextual": {"model": "m1"}}}
+    )
+    assert on.chunking.identity(on.llm)["contextual"] == {
         "llm": "ollama/m1",
         "max_doc_tokens": 6000,
         "prompt": prompt_digest(),
@@ -62,26 +64,25 @@ def test_contexts_are_written_concurrently_and_returned_in_chunk_order() -> None
     import threading
     import time
 
-    from lite_rag.llm import Completion, Message
+    from lite_rag.llm import Message
+    from lite_rag.testing import FakeLLM
 
-    class SlowLLM:
+    class SlowLLM(FakeLLM):
         """Answers with the passage it was shown, slowly, counting calls in flight."""
-
-        model_id = "fake/slow"
 
         def __init__(self) -> None:
             self.running = self.peak = 0
             self._lock = threading.Lock()
+            super().__init__(self._answer)
 
-        def complete(self, messages: list[Message]) -> Completion:
+        def _answer(self, messages: list[Message]) -> str:
             with self._lock:
                 self.running += 1
                 self.peak = max(self.peak, self.running)
             time.sleep(0.05 if "passage 0" in messages[-1].content else 0.01)  # first ends last
             with self._lock:
                 self.running -= 1
-            passage = re.findall(r"passage \d", messages[-1].content)[-1]
-            return Completion(passage, self.model_id, {})
+            return re.findall(r"passage \d", messages[-1].content)[-1]
 
     doc = Document("d", "Policy", " ".join(f"passage {i}." for i in range(5)))
     chunks = [Chunk(f"d#{i}", "d", i, f"passage {i}.", i * 11, i * 11 + 10, 3) for i in range(5)]

@@ -181,9 +181,9 @@ def index_identity(settings: Settings) -> dict[str, Any]:
     serving "the same" model is a different index until shown otherwise."""
     return {
         "loader": settings.loader.model_dump(),  # another loader: another text
-        "chunking": settings.chunking.identity(),
+        "chunking": settings.chunking.identity(settings.llm),  # S15: roles live in `llm`
         "embedding": settings.embedding.model_dump(exclude=_TRANSPORT_ONLY),
-        **settings.graph.index_identity(),  # a graph is built into the index
+        **settings.graph.index_identity(settings.llm),  # a graph is built into the index
     }
 
 

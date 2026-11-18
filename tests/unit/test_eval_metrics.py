@@ -147,7 +147,9 @@ def test_a_graph_is_part_of_the_index_so_it_gets_its_own_kb() -> None:
     plain = load_settings(chunking={"strategy": "markdown"})
     graph = load_settings(chunking={"strategy": "markdown"}, graph={"enabled": True})
     graph_bigger = load_settings(
-        chunking={"strategy": "markdown"}, graph={"enabled": True, "llm": {"model": "qwen3:14b"}}
+        chunking={"strategy": "markdown"},
+        graph={"enabled": True},
+        llm={"roles": {"graph": {"model": "qwen3:14b"}}},
     )
     graph_deeper = load_settings(
         chunking={"strategy": "markdown"}, graph={"enabled": True, "hops": 3}
@@ -165,7 +167,17 @@ def test_a_graph_is_part_of_the_index_so_it_gets_its_own_kb() -> None:
         ({"embedding": {"provider": "fastembed", "model": "m"}}, "free"),
         ({"embedding": {"provider": "voyage", "model": "m"}}, "per_token"),
         ({"embedding": {"provider": "openai", "model": "m"}}, "unknown"),
-        ({"graph": {"enabled": True, "llm": {"provider": "anthropic", "model": "m"}}}, "per_token"),
+        (
+            {
+                "graph": {"enabled": True},
+                "llm": {
+                    "roles": {
+                        "graph": {"backend": "anthropic", "model": "m", "reasoning_effort": None}
+                    }
+                },
+            },
+            "per_token",
+        ),
     ],
 )
 def test_billing_is_free_only_when_every_model_is_local(

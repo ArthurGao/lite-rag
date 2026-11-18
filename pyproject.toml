@@ -15,7 +15,8 @@ dependencies = [
     # The default store (design §4). Pinned exactly: an upgrade re-runs `-m ollama` and the eval.
     "psycopg[binary,pool]==3.3.8",
     "tokenizers>=0.21",
-    "openai>=1.60",
+    # Every LLM call (design §6, S15), from a release wheel in [tool.uv.sources]; it pins the SDKs.
+    "lite-model",
 ]
 
 [project.scripts]
@@ -26,7 +27,7 @@ fastembed = [
     "fastembed==0.9.1",
 ]
 anthropic = [
-    "anthropic>=0.40",
+    "lite-model[anthropic]",
 ]
 pdf = [
     "pypdf==7.0.0",
@@ -105,4 +106,5 @@ markers = [
 ]
 
 [tool.uv.sources]
+lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.2.0/lite_model-0.2.0-py3-none-any.whl" }
 lite-eval = { url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.4.1/lite_eval-0.4.1-py3-none-any.whl" }

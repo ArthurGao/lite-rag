@@ -2,4 +2,4 @@
 # same model through the proxy (llm-proxy-workhorse.yaml). The rest is chunk-markdown.yaml.
 chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
 retrieval: {mode: hybrid}
-llm: {provider: ollama, model: qwen3:8b}
+llm: {backend: ollama, model: qwen3:8b}

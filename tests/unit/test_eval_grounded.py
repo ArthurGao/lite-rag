@@ -172,9 +172,15 @@ def test_an_answer_run_counts_the_answer_model_in_its_billing() -> None:
 
     local = load_settings()
     assert billing(local) == billing(local, answers=True) == "free"
-    gateway = load_settings(llm={"provider": "openai", "base_url": "http://127.0.0.1:8787/v1"})
+    # S15: by the channel lite-model resolves for the answer role
+    gateway = load_settings(llm={"backend": "gateway", "model": "gpt-sub"})  # a subscription
     assert billing(gateway) == "free" and billing(gateway, answers=True) == "unknown"
-    anthropic = load_settings(llm={"provider": "anthropic", "model": "m"})
+    vendor = load_settings(llm={"backend": "openai", "model": "gpt-x"})  # channel api
+    assert billing(vendor, answers=True) == "per_token"
+    # an Ollama endpoint declared paid (a hosted one) is not free because its type is ollama
+    hosted = load_settings(llm={"backends": {"ollama": {"channel": "api"}}})
+    assert billing(hosted) == "free" and billing(hosted, answers=True) == "per_token"
+    anthropic = load_settings(llm={"backend": "anthropic", "model": "m"})
     assert billing(anthropic, answers=True) == "per_token"
 
 
@@ -257,7 +263,7 @@ def test_the_report_lists_judge_flags_and_missed_facts_apart() -> None:
             "id": "q01",
             "question": "Ratio?",
             "answer": "1:16 and cheese",
-            "response_model": "m-8b",
+            "model_id": "ollama/m-8b",
             "reason": "adds cheese",
             "evidence": ["and cheese"],
         }
@@ -267,14 +273,14 @@ def test_the_report_lists_judge_flags_and_missed_facts_apart() -> None:
             "id": "q02",
             "question": "Temperature?",
             "answer": "Hot.",
-            "response_model": None,
+            "model_id": None,
             "reason": "no match",
             "evidence": [],
         }
     ]
     assert report(flagged, missed) == (
         "\nflagged by the judge: 1\n"
-        "\n[q01] Ratio? (m-8b)\n  answer: 1:16 and cheese\n  judge: adds cheese\n"
+        "\n[q01] Ratio? (ollama/m-8b)\n  answer: 1:16 and cheese\n  judge: adds cheese\n"
         "  unsupported: and cheese\n"
         "\nmissing the key fact: 1\n"
         "\n[q02] Temperature?\n  answer: Hot.\n"

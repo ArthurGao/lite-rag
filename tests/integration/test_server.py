@@ -279,7 +279,7 @@ def test_a_server_misconfiguration_is_a_500_without_its_detail(
     from lite_rag.testing import FakeEmbedder
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    settings = load_settings(chunking=CHUNKING, llm={"provider": "openai", "model": "gpt-x"})
+    settings = load_settings(chunking=CHUNKING, llm={"backend": "openai", "model": "gpt-x"})
     runtime = RagRuntime(settings, store, CachingEmbedder(FakeEmbedder(dim=8), store))
     with TestClient(create_app(settings, runtime), base_url="http://localhost") as c:
         h = {"X-LiteRag-Namespace": NS}

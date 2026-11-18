@@ -120,11 +120,12 @@ def test_real_contextual_headers_are_written_and_indexed(
     pg: psycopg.Connection, pg_url: str
 ) -> None:
     migrate(pg, TEST_SCHEMA)
-    contextual = {"enabled": True, "llm": {"reasoning_effort": "none"}}
+    contextual = {"enabled": True}
     settings = load_settings(
         database_url=pg_url,
         store={"schema": TEST_SCHEMA},
         chunking={"strategy": "paragraph", "size": 60, "overlap": 0, "contextual": contextual},
+        llm={"roles": {"contextual": {"reasoning_effort": "none"}}},
     )
     text = "# 员工手册\n\n## 差旅\n\n出差住宿每晚不超过五百元。\n\n## 休假\n\n年假每年十五天。"
     engine = RagEngine.from_settings(settings, namespace="e2e")
@@ -140,12 +141,12 @@ def test_real_contextual_headers_are_written_and_indexed(
 
 
 def test_real_graph_extraction_parses_and_links_two_documents() -> None:
-    from lite_rag.config import GraphConfig
+    from lite_rag.config import LLMConfig
     from lite_rag.graph import GraphExtractor
-    from lite_rag.llm import build_llm
+    from lite_rag.llm import RoleLLM, build_model
     from lite_rag.types import Chunk
 
-    extractor = GraphExtractor(build_llm(GraphConfig().llm))
+    extractor = GraphExtractor(RoleLLM(build_model(LLMConfig()), "graph"))
     found = []
     for doc_id, text in (
         ("projects", "北辰项目负责建设新的结算系统。负责人是李明。"),

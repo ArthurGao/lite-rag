@@ -1,3 +1,5 @@
+from typing import Any
+
 import psycopg
 import pytest
 
@@ -17,7 +19,8 @@ CONTEXT = "Situated in the handbook's money chapter."
 
 def _engine(store: PgStore, llm: FakeLLM, embedder: FakeEmbedder, model: str = "qwen3:8b"):
     settings = load_settings(
-        chunking={**CHUNKING, "contextual": {"enabled": True, "llm": {"model": model}}}
+        chunking={**CHUNKING, "contextual": {"enabled": True}},
+        llm={"roles": {"contextual": {"model": model}}},
     )
     return RagRuntime(settings, store, CachingEmbedder(embedder, store), context_llm=llm).engine(NS)
 
@@ -38,12 +41,13 @@ def test_the_context_is_indexed_but_never_returned(store: PgStore, pg: psycopg.C
 
 
 def test_a_failed_context_call_writes_nothing(store: PgStore, pg: psycopg.Connection) -> None:
-    class Broken(FakeLLM):
-        def complete(self, messages):  # type: ignore[no-untyped-def]
-            raise LLMError("model went away")
+    def broken(messages: list[Any]) -> str:
+        raise LLMError("model went away")
 
     with pytest.raises(LLMError):
-        _engine(store, Broken(), FakeEmbedder(dim=8)).upsert_text("kb", "d", "Handbook", TEXT)
+        _engine(store, FakeLLM(broken), FakeEmbedder(dim=8)).upsert_text(
+            "kb", "d", "Handbook", TEXT
+        )
     assert pg.execute(f"SELECT count(*) FROM {TEST_SCHEMA}.chunks").fetchone() == (0,)
 
 

@@ -208,24 +208,33 @@ engine.stats(kb)
 - **`Answer` 包含**：
   - 回答正文；
   - `citations`：引用了哪些 chunk id，代码会核对每个编号都在检索结果里；
-  - `provenance`：`provider:model`；
-  - `response_model`（S14）：LLM 响应体里 `model` 写的名字，端点写什么就是什么：直连 Ollama 是模型名，
-    LiteLLM 的路由别名（开了 `return_raw_model_name`）是它选中的模型，普通 LiteLLM 别名只是别名本身；没写为
-    `None`。过渡字段：迁到 lite-model（lite-model 设计 §12）后由按后端读取的来源取代。随 `POST .../ask` 返回；
+  - `model_id`：`backend/model`，**实际回答的模型**（S15 起从响应里读，由 lite-model 按后端读取：直连 Ollama 是
+    模型名，经 LiteLLM 是 `x-litellm-model-name`）；没有调用模型时为 `None`。S14 的过渡字段 `response_model` 删除；
   - token 用量。
-- **没有回退链**：一次调用失败就抛出错误。
-- **LLM 配置**：
+- **没有回退链**：一次调用失败就抛出 `LLMError`（HTTP 502），只在同一个模型上重试；错误信息不带上游原文。
+  回答被截断（到了 `max_output_tokens`）也是 `LLMError`，不再把半个回答当完整的返回（S15，主人定）。
+- **LLM 调用由 lite-model 完成**（S15，lite-model 设计 §12）：三个 role——`answer`、`contextual`、`graph`——是同一份
+  lite-model 配置 `llm` 的三个 role。`contextual` 和 `graph` 是索引身份的一部分，**不可路由**（LiteLLM 的路由别名在
+  启动时被拒绝）；`answer` 可以。
 
 ```yaml
-llm:
-  provider: ollama        # ollama | openai | anthropic
-  model: qwen3:8b
-  base_url: http://127.0.0.1:11434/v1   # 仅 openai 兼容类；llm-gateway 用 http://127.0.0.1:8787/v1
-  api_key_env: null       # openai: OPENAI_API_KEY；anthropic: ANTHROPIC_API_KEY
-  temperature: 0
+llm:                      # lite-model 的 ModelsConfig（它的设计 §4），带 lite-rag 的默认值
+  backend: ollama         # ollama | openai | anthropic | gateway | litellm，或自己命名的 backend
+  model: qwen3:8b         # 顶层的 backend、model 和调用参数只调 answer（和 S15 之前的 `llm` 一样）
+  max_output_tokens: 1024
+  connect_timeout_s: 5
+  roles:                  # contextual、graph 默认固定在 ollama/qwen3:8b（graph 不思考、2048 token），逐字段可改
+    graph: {model: qwen3:14b}
+  backends:               # 同名逐字段改：openai 兼容厂商用 openai 这个名字，记录仍是 openai/<model>
+    openai: {base_url: "https://api.deepseek.com/v1", api_key_env: DEEPSEEK_API_KEY}
 ```
 
-  `ollama` 走 Ollama 的 OpenAI 兼容接口，和 `openai` 共用一个实现；`anthropic` 用官方 SDK。key 只从环境变量读取。
+  顶层的 `temperature`、`reasoning_effort`、`max_output_tokens` 移到 `roles.answer`（answer 自己写的优先）：contextual、
+  graph 只从 `llm.roles` 取值，否则同一个索引身份下新 chunk 的上下文和图会换一种方式生成（Codex S15）。
+  role 的 id 是 `backend/model`（配置的模型），写进索引身份（`chunking.contextual`、`graph`），和 S15 之前的
+  `provider/model` 逐字节相同，已有的 kb 不用重建。S15 之前的形状（`llm.provider`、`llm.base_url`、
+  `llm.api_key_env`、`llm.max_tokens_param`、`chunking.contextual.llm`、`graph.llm`）启动时被拒绝，并说明搬到了哪里。
+  key 只从环境变量读取。
 
 ## 7. HTTP 服务（`literag serve`）
 
@@ -240,7 +249,7 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 | `DELETE /v1/kbs/{kb}/documents/{doc_id}` | 删除文档 |
 | `POST /v1/kbs/{kb}/search` | `{query, top_k, mode, rerank, where}` → hits（带各阶段分数） |
 | `POST /v1/search` | `{kbs, query, top_k, mode, rerank, where}` → 几个 kb 一起查（S10）；key 必须覆盖每一个 kb，否则 403 |
-| `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer（带引用和出处；S14 起多一个 `response_model`，见 §6） |
+| `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer（带引用和出处；`model_id` 是实际回答的模型，S15，见 §6；S14 的 `response_model` 已删除） |
 
 - **鉴权**（S6，KB web-authz：默认拒绝）：`Authorization: Bearer lrk_<prefix>_<secret>`。服务端只保存 key 的 `sha256`，配置在 `server.keys`（YAML，或 `LITERAG_SERVER__KEYS` 设为 JSON 列表）。每个 key 有 `namespaces`、`kbs` 两组 glob（`*` 可以跨 `/`，例如 `steward/*`）和 `mode`（`read` / `write`）；没有默认 namespace，不写就没有访问权限。`literag key create` 生成新 key，只打印一次，同时给出要加进配置的那一条；**没有任何 HTTP 路由能创建 key**。不配 key 时服务完全开放，所以 `serve` 只允许绑定回环地址。
 - **namespace**：每个请求用 `X-LiteRag-Namespace` 头指定（namespace 本身含 `/`，放进路径不干净）。缺这个头返回 400；key 不覆盖这个 namespace 或这个 kb 返回 403，只读 key 写入也是 403；没有 key 或 key 不认识返回 401，带 `WWW-Authenticate: Bearer`。服务端持有一个 `RagRuntime`，每个请求用 `runtime.engine(namespace)` 取一个引擎，共用 store、embedder、chunker 和模型。
@@ -343,7 +352,44 @@ lite-rag/
 | S12 评测迁到 lite-eval | `literag eval` 改为 lite-eval 上的薄包装：适配器 `LiteRagTarget`、金标集转数据集、同一索引共用一次 setup；删掉自写的判分和指标；可选 extra `eval` 按提交锁定 lite-eval | 等价：冻结的旧实现（`tests/legacy_eval.py`）和新实现同一进程同一 store，4 套金标集逐题 `answer_rank`、`doc_rank` 相同，整体与分题型的 hit@1、hit@5、MRR@10、doc hit@5 误差 ≤ 1e-9（FakeEmbedder 进 CI，bge-m3 用 `-m ollama`）；随机 2000 组命中上评分器等价；命令参数和表格不变 |
 | S13 回答评审（lite-eval E5b） | 依赖 lite-eval 0.3.0；grounded 评审的校准集（构造法，提交）和校准 suite；`LiteRagAnswerTarget` 与 `literag eval-answers`；数据集和 suite 的生成共用 `write_generated_dataset` / `write_suite` | 校准集：每种改法标签按构造正确、同一种子同一集合、提交的和生成器一致、插入和交换的内容同语言且不在来源里；FakeLLM + FakeJudge：回答被校准过的评审判分、被标记的回答列出、评审就是校准运行测过的那个、校准不够时在生成任何回答之前拒绝；qwen3:8b（思考关和开）的校准一致率和每种改法的识别率、真实回答的标记率和逐条判断记进 KB |
 | S14 回答对不对与自动路由 | 金标题的 `key_fact` 和 `eval-answers` 的 `regex` 评分器；`response_model`（LLM 响应写的模型）一路带到 `ask` 和评测输出；`eval-answers` 关掉输出缓存；四个对比配置（直连 Ollama 8b，经 LiteLLM Proxy 的 small / workhorse / smart-router） | `key_fact` 标签按构造（匹配合格回答、不匹配题目、不匹配改数字和换答案的回答）；全有或全无；缓存关闭（第二次运行重新回答）；FakeLLM：`response_model` 取自响应、评测输出带上、未检查时报告写明；四个配置 × 2 次真实运行，逐条读未通过的回答，结果记进 KB 和 lite-model 设计 §15 |
+| S15 迁到 lite-model | LLM 调用改由 lite-model 0.2.0 完成：三处 LLM 配置变成 `answer` / `contextual` / `graph` 三个 role（后两个不可路由、模型固定在 `host_roles`）；`RoleLLM`；`model_id` 改成实际回答的模型，`response_model` 删除；截断算错误；旧配置键拒绝并说明去处；删掉旧客户端 | 迁移前录下的 5 个请求（三个 role 的默认、OpenAI 兼容厂商全参数、Anthropic）逐字段相同；索引身份（评测 kb 名）不变；`literag eval`（contextual、graph）和 `eval-answers` 前后一致；`-m ollama` 通过 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
+
+- **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
+  - 先发了 lite-model 0.2.0（主人选）：宿主在 `ModelsConfig` 子类上设 `host_backends` / `host_roles`，配置逐字段叠在上面。
+    没有它，任何 `LITERAG_LLM__ROLES` 都会把 graph 的默认值（不思考、2048 token）整个顶掉。
+  - `llm.py` 只留 `RoleLLM`（一个 role 对着共享的 lite-model）、`Completion`、`LLMError`（502）；删掉 `PROVIDERS`、`ProviderProfile`、
+    `_Client`、`OpenAICompatLLM`、`AnthropicLLM`、`BoundedCalls`、`build_llm`。`Message` 用 lite-model 的。`FakeLLM` 基于 lite-model
+    的 `FakeModel`，记录变成 `fake/fake-model`。并发上限改用 lite-model 的 `Bounded`（`RoleLLM.bounded()`）。依赖里去掉 `openai`、
+    `anthropic`（由 lite-model 锁定）。
+  - 请求体：迁移前用旧客户端录下 5 个请求（answer、contextual、graph 的默认，OpenAI 兼容厂商全参数，Anthropic），存在
+    `tests/fixtures/llm_requests.json`（`tests/data/` 被 `.gitignore` 的 `data/` 挡住，差点没提交上去）；迁移后逐字段相同。
+  - 索引身份：role 的 id 仍是 `ollama/qwen3:8b`；旧代码和新代码算出的评测 kb 名（索引身份的哈希）对 4 个配置完全相同，已有的
+    kb 不用重建。
+  - 迁移中发现并修掉的：①顶层 `backend`/`model` 以前只管 answer，现在会移动所有 role——`host_roles` 把 contextual、graph 固定在
+    `ollama/qwen3:8b`；②旧键 `graph.llm`、`chunking.contextual.llm` 被**悄悄忽略**（图会用默认模型建）——现在拒绝并说明去处，
+    `llm.provider` 等同样；③Codex：顶层的 `temperature`、`reasoning_effort` 也会传到 contextual、graph（同一个索引身份下内容换了
+    生成方式）——顶层调用参数移到 `roles.answer`，和 S15 之前 `llm` 只管回答一致。都先写失败的测试。
+  - 行为变化（主人定）：截断的回答是 `LLMError`；`Answer.model_id` 是实际回答的模型（从响应读，经 LiteLLM 是
+    `x-litellm-model-name`），S14 的 `response_model` 删除；`max_tokens_param` 删除（lite-model 的 profile 决定）。
+  - eval（本机 Ollama）：
+    - `eval-answers`（llm-ollama-8b，think 校准的评审）：两次都是 grounded 1.000、key fact 0.969、"答对" 0.969，0 个错误，没有一个
+      回答被截断；S14 迁移前两次是 0.938。差的一题两次都是 q12（"资料里没有"）。
+    - `literag eval`：graph-hybrid 迁移前 0.875 / 0.938 / 0.915（hit@1 / hit@5 / mrr@10，3 次相同），迁移后成功的那次完全相同；
+      chunk-contextual 0.875 / 0.969 / 0.912 → 0.906 / 0.969 / 0.928（差一题）。
+    - **图抽取偶尔返回坏 JSON，整个 ingest 失败**：迁移后 3 次里 2 次，迁移前 3 次 0 次。逐条对照（并发 1，49 个 chunk）：旧客户端
+      自己跑两次就有 22 条回复不同，新旧之间也是 22 条——qwen3 在 Ollama 上 temperature 0 也不确定，新客户端发的一样。不是迁移的
+      问题，是一直存在的风险：一个 chunk 的坏 JSON 让整份文档的 ingest 失败。后续：图抽取遇到解析错误重试一次（单独一个阶段，
+      改的是行为）。
+  - 变异：13 处（role 固定、graph 不思考、token 上限、错误转换、model_id、可路由、旧键拒绝、billing、两个身份、记录、FakeLLM），
+    全部被抓到。
+  - /simplify 采纳：`test_ollama.py` 还在用删掉的 `build_llm`（只在 `-m ollama` 下跑，默认跑不到）；billing 按 lite-model 解析出的
+    channel 判断（ollama 类型但 `channel: api` 的不再算免费）；`LLMConfig.target_of()` 是唯一调用 lite-model `target()` 的地方；
+    answer 运行记录按排除法记 target 的字段；过时注释。没采纳：合并 `LLM` / `RoleLLM` 两个名字和 `BoundedLLM`（类型已通过）、
+    把索引身份收到 `Settings` 一处（拼装重复早于这次改动）、eval-answers 在 contextual / graph 开着时建两次 lite-model（少见）、
+    每次读都重算 role id（几十微秒）、合并测试里的 helper 和旧键校验（小）。
+  - Codex 采纳 1 条（顶层调用参数只给 answer，见上）；核实后不成立 1 条："`llm` 下的拼写错误被悄悄忽略"——lite-model 的配置禁止
+    多余字段，`llm.reasining_effort` 启动时就报错。
 
 ## 13. 待确认
 
