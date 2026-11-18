@@ -209,6 +209,9 @@ engine.stats(kb)
   - 回答正文；
   - `citations`：引用了哪些 chunk id，代码会核对每个编号都在检索结果里；
   - `provenance`：`provider:model`；
+  - `response_model`（S14）：LLM 响应体里 `model` 写的名字，端点写什么就是什么：直连 Ollama 是模型名，
+    LiteLLM 的路由别名（开了 `return_raw_model_name`）是它选中的模型，普通 LiteLLM 别名只是别名本身；没写为
+    `None`。过渡字段：迁到 lite-model（lite-model 设计 §12）后由按后端读取的来源取代。随 `POST .../ask` 返回；
   - token 用量。
 - **没有回退链**：一次调用失败就抛出错误。
 - **LLM 配置**：
@@ -237,7 +240,7 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 | `DELETE /v1/kbs/{kb}/documents/{doc_id}` | 删除文档 |
 | `POST /v1/kbs/{kb}/search` | `{query, top_k, mode, rerank, where}` → hits（带各阶段分数） |
 | `POST /v1/search` | `{kbs, query, top_k, mode, rerank, where}` → 几个 kb 一起查（S10）；key 必须覆盖每一个 kb，否则 403 |
-| `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer（带引用和出处） |
+| `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer（带引用和出处；S14 起多一个 `response_model`，见 §6） |
 
 - **鉴权**（S6，KB web-authz：默认拒绝）：`Authorization: Bearer lrk_<prefix>_<secret>`。服务端只保存 key 的 `sha256`，配置在 `server.keys`（YAML，或 `LITERAG_SERVER__KEYS` 设为 JSON 列表）。每个 key 有 `namespaces`、`kbs` 两组 glob（`*` 可以跨 `/`，例如 `steward/*`）和 `mode`（`read` / `write`）；没有默认 namespace，不写就没有访问权限。`literag key create` 生成新 key，只打印一次，同时给出要加进配置的那一条；**没有任何 HTTP 路由能创建 key**。不配 key 时服务完全开放，所以 `serve` 只允许绑定回环地址。
 - **namespace**：每个请求用 `X-LiteRag-Namespace` 头指定（namespace 本身含 `/`，放进路径不干净）。缺这个头返回 400；key 不覆盖这个 namespace 或这个 kb 返回 403，只读 key 写入也是 403；没有 key 或 key 不认识返回 401，带 `WWW-Authenticate: Bearer`。服务端持有一个 `RagRuntime`，每个请求用 `runtime.engine(namespace)` 取一个引擎，共用 store、embedder、chunker 和模型。
@@ -258,6 +261,13 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
   - **校准集**（`eval/judge-grounded/datasets/grounded-golden/`，提交，`eval/make_judge_grounded.py` 生成，测试核对和生成器一致）：每道金标题的合格回答 = 文档里含证据句的那一句，引用它所在的段落为来源 [1]，按构造是有依据的；再用 lite-eval 的构造工具各改坏一种方式：改一个数字、加一句别的文档的话、换成别题的回答（都是 unsupported），或去掉引用（仍然 grounded，评审不评引用标记）。插入和交换的内容只取同语言（按金标集，不按字符猜）的其他文档。
   - **校准**：`lite-eval run eval/judge-grounded/suites/calibrate.yaml --config <评审>`，评审本身是 Target，记下一致率和每种改法的识别率；运行在 `eval/judge-grounded/runs/`（gitignore）。
   - **真实回答**：`literag eval-answers -c <配置> --calibration <校准运行> --min-agreement <阈值>` 对金标题跑 `ask`（`LiteRagAnswerTarget`，输出 `{question, answer, sources, status, dropped}`），用校准运行测过的那个评审判分；评审的配置取自校准 suite 里的那一条，lite-eval 在任何调用之前逐项核对，校准不够就拒绝。最后列出每个被标记的回答，逐条读（评审错了，还是回答真有问题）。
+- **回答对不对**（S14 起）：金标题各有一个 `key_fact`（不分大小写的正则，回答必须说出的那件事），`eval-answers`
+  在 grounded 评审旁边加 lite-eval 的 `regex` 评分器。标签按构造：`key_fact` 匹配该题的合格回答（校准集里的证据句），
+  不匹配题目本身（`load_golden` 拒绝），也不匹配校准集里改了数字、换成别题答案的回答（测试）。它看不出方向（"磨粗"
+  和"磨细"都提到了"细"），所以**主指标是 `key_fact` 且 grounded 都过**，不单看 `key_fact`。`key_fact` 全有或全无：
+  只有一部分题有，`eval-answers` 拒绝（否则这一项会悄悄关掉）；都没有，报告写"not checked"。
+- **不用输出缓存**（S14 起）：`eval-answers` 的 suite 写 `cache: off`，每次运行都重新回答（S13 时第二次运行会直接
+  复用第一次的回答和延迟，重复就测不到东西）。`literag eval` 从 S12 起就是 off。
 - **金标集**：每个使用 lite-rag 的项目准备 20–30 个问题，标出正确答案应该来自哪个 chunk。切换任何一层之后都重跑一次，比较 hit rate 和 MRR，用这个回答「换了之后是变好还是变差」。
 - **用法**：这是学习的主循环。每换一种 chunker、加上 BM25、打开 rerank，都跑一次 eval，用数字判断效果有没有变好。
 
@@ -332,6 +342,7 @@ lite-rag/
 | S11 Graph RAG（local） | `graph.enabled`：建库时 LLM 抽实体和关系，存进 PG 的三张图表（与 chunk 同一事务）；`graph` 检索路径（问题点名的实体 → 沿共现扩展 → 范围内按向量排序），`mode: graph` 与 `retrieval.hybrid_paths`；多跳评测集 `eval/golden-multihop.jsonl` | 抽取：FakeLLM 单测（合法、带代码块、非法 JSON；端点补实体；名字合并；prompt 不含标题）；扩展按手算核对（跳数、枢纽、每跳上限与排序）；PG 集成：写入、替换、删除后图随文档消失；类别词和单字母不当种子；多跳答案只能经图找到，分数与 vector 路径一致；配置冲突（chroma、未开图、加权融合）报错；kb 身份含抽取模型；`-m ollama` 真实抽取能解析；eval 前后对比记进 KB |
 | S12 评测迁到 lite-eval | `literag eval` 改为 lite-eval 上的薄包装：适配器 `LiteRagTarget`、金标集转数据集、同一索引共用一次 setup；删掉自写的判分和指标；可选 extra `eval` 按提交锁定 lite-eval | 等价：冻结的旧实现（`tests/legacy_eval.py`）和新实现同一进程同一 store，4 套金标集逐题 `answer_rank`、`doc_rank` 相同，整体与分题型的 hit@1、hit@5、MRR@10、doc hit@5 误差 ≤ 1e-9（FakeEmbedder 进 CI，bge-m3 用 `-m ollama`）；随机 2000 组命中上评分器等价；命令参数和表格不变 |
 | S13 回答评审（lite-eval E5b） | 依赖 lite-eval 0.3.0；grounded 评审的校准集（构造法，提交）和校准 suite；`LiteRagAnswerTarget` 与 `literag eval-answers`；数据集和 suite 的生成共用 `write_generated_dataset` / `write_suite` | 校准集：每种改法标签按构造正确、同一种子同一集合、提交的和生成器一致、插入和交换的内容同语言且不在来源里；FakeLLM + FakeJudge：回答被校准过的评审判分、被标记的回答列出、评审就是校准运行测过的那个、校准不够时在生成任何回答之前拒绝；qwen3:8b（思考关和开）的校准一致率和每种改法的识别率、真实回答的标记率和逐条判断记进 KB |
+| S14 回答对不对与自动路由 | 金标题的 `key_fact` 和 `eval-answers` 的 `regex` 评分器；`response_model`（LLM 响应写的模型）一路带到 `ask` 和评测输出；`eval-answers` 关掉输出缓存；四个对比配置（直连 Ollama 8b，经 LiteLLM Proxy 的 small / workhorse / smart-router） | `key_fact` 标签按构造（匹配合格回答、不匹配题目、不匹配改数字和换答案的回答）；全有或全无；缓存关闭（第二次运行重新回答）；FakeLLM：`response_model` 取自响应、评测输出带上、未检查时报告写明；四个配置 × 2 次真实运行，逐条读未通过的回答，结果记进 KB 和 lite-model 设计 §15 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 ## 13. 待确认
@@ -559,3 +570,38 @@ lite-rag/
   - **`literag eval-answers`**：`LiteRagAnswerTarget`（`LiteRagTarget` 的子类，`query_key = "question"`，构造时给 `llm_for`）对金标题跑 `ask`，输出 `{question, answer, sources, status, dropped}`，延迟含一次回答调用；计费用 `billing(settings, answers=True)`，把回答模型算进去。评审取自校准 suite 里那条配置（含 key 变量、价格、原样的 URL；记录里没有这些），lite-eval 在任何调用之前逐项核对、核对校准的一致率；CLI 在打开 store 之前先检查校准运行。输出缓存开着：同一批回答可以换评审重新判，不用重新生成。
   - 生成的数据集和 suite 共用 `write_generated_dataset`、`golden_cases`、`write_suite`（检索评测的 `dataset.yaml` 字节不变，所以数据集哈希和以前的运行仍可比；Codex 发现过一次差点改掉）。
   - **自评偏差**：回答和评审都是 qwen3:8b。换一个模型家族的评审（经 llm-gateway，按 owner 的指示）是下一步的对照。
+- S14 实现说明（2026-11-18，回答对不对、自动路由的效果；lite-model 设计 §15 的那一项）：
+  - **为什么**：lite-model 的路由（LiteLLM Proxy 的 `smart-router`）要量"自动路由值不值"。grounded 评审只判"有没有
+    依据"，而且漏掉真实回答最常见的错；所以先加"答对没"（`key_fact`），再把实际回答的模型记下来（`response_model`）。
+  - **`key_fact`**：32 题各一个正则。第一版太宽（独立 review 发现：数字没边界，`16` 匹配"7 gram … 16 grams"，
+    `不予受理` 不带天数，q08 的 `not|no` 几乎匹配任何英文回答），收紧后加了反例测试（改数字、换别题答案都不能匹配；
+    q12 的改数字改的是倾角，问的是哪颗行星，答案仍对，列为例外）。说反方向的回答正则看不出，交给评审。
+  - **`eval-answers` 的缓存缺陷（S13 起就有）**：suite 没写 `cache`，lite-eval 默认 `auto` 会复用上次的输出，第二次
+    运行 32 个全命中，延迟也是上次的。这次实验的第 2 次运行因此作废重跑；修为 `cache: off`，回归测试先红。
+  - **`response_model`**：先叫 `answered`；独立 review 指出它和 lite-model 的 `Provenance.answered`、`status:
+    "answered"` 撞名，而且普通 LiteLLM 别名时只是别名，改名并写明是过渡字段（§6）。
+  - **结果**（32 题 × 2 次真实运行，温度 0；"对" = `key_fact` 且 grounded；评审 qwen3:8b 思考开，校准一致率 0.982）：
+
+    | 配置 | 对（两次 / 平均） | grounded 平均 | 延迟 p50 |
+    | --- | --- | --- | --- |
+    | 直连 Ollama qwen3:8b | 0.938 / 0.938 / 0.938 | 0.969 | 12.0 s |
+    | Proxy workhorse（qwen3:8b） | 0.938 / 0.938 / 0.938 | 0.969 | 11.9 s |
+    | Proxy small（qwen3:1.7b） | 0.719 / 0.781 / 0.750 | 0.781 | 3.8 s |
+    | Proxy smart-router | 0.875 / 0.812 / 0.844 | 0.891 | 5.2 s |
+
+  - **路由按语言分，不按难度分**：两次都是 16 道中文题全部去 1.7b，去 8b 的 10 题全是英文（启发式分类器看的是英文技术词、
+    代码和推理词，中文提示在它眼里都"简单"）。选 8b 的 10 题全对（其中 2 题 1.7b 单独会错）；选 1.7b 的题比全用 8b 少对
+    2–3 题，损失都在中文题。第 2 次 q31 的 1.7b 把 1024 个输出 token 全用在思考上，回答为空。
+  - **逐条读过每个未通过的回答**：8b 的都是轻微补充（如"磨细会提高萃取、降低酸度"）；1.7b 的有真实错误（说惊蛰是"第二个"
+    节气、命令里多一个 `*`、说用过的餐巾纸可回收、来源有却说没有、第 2 次把"磨细"说成"磨粗"）。`key_fact` 单看会放过这些，
+    所以只报"对"。q12 每个配置都答"资料没有"：是检索没找到，不是模型的问题。
+  - **经 Proxy 不改变质量**：直连和 workhorse 两次都相同。
+  - **局限**：32 道单文档事实题；评审也是 qwen3:8b；路由和评审共用一台 Ollama，模型切换的加载时间算进了路由的延迟。
+  - 实验期间另一个会话把 lite-eval 升到 0.4.1（`3eec810`）：只多了"目标错误占多数时警告"和报告里一行，判分和评审不变，两次运行可比。
+  - **收尾 review**：`/simplify`（4 个角度）：改用 lite-eval 的 `parse_scorer_id` / `spec_name`，legacy `Question` 直接带
+    `key_fact`，金标测试走 `load_golden`，`key_fact` 全有或全无，未检查时报告写明；跳过：`_send` 改返回 `Completion`、
+    四个配置合并（`load_settings` 没有 include）。Codex 不可用（额度用完，到 2026-12-03），由一个独立的 Claude agent 做同样
+    的只读 review：`key_fact` 太宽（高，已修，见上）、`answered` 撞名且未写进设计（中，已改名并写进 §6）、两条路径的
+    `max_tokens` 参数名和思考默认不同（中，**不改**：lite-model S0 实测 LiteLLM 1.108.9 经 `ollama_chat/` 两个参数名都生效、
+    不设 `reasoning_effort` 时两边都开思考且思考不进回答正文，两次实验的输出 token 也接近）、路由延迟含模型切换（低，记为局限）。
+

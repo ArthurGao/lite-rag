@@ -63,6 +63,8 @@ class Question:
     # A free label; reports group by it (keyword | paraphrase | exact | multihop).
     kind: str = "keyword"
     lang: str = ""
+    # S14: a case-insensitive regex a correct answer matches (`literag eval-answers` checks it).
+    key_fact: str | None = None
 
 
 Corpus = dict[str, tuple[str, str]]  # doc id (file stem) -> (title, text)
@@ -97,6 +99,13 @@ def load_golden(path: Path, corpus: Corpus) -> list[Question]:
             documents[q.doc] = normalise(corpus[q.doc][1])
         if normalise(q.evidence) not in documents[q.doc]:
             raise ConfigError(f"{path}:{n}: {q.id}: evidence is not in {q.doc!r}: {q.evidence!r}")
+        if q.key_fact is not None:
+            try:
+                fact = re.compile(q.key_fact, re.IGNORECASE)
+            except re.error as exc:
+                raise ConfigError(f"{path}:{n}: {q.id}: key_fact is not a regex: {exc}") from exc
+            if fact.search(q.question):  # restating the question would pass
+                raise ConfigError(f"{path}:{n}: {q.id}: key_fact matches the question itself")
         questions.append(q)
     if not questions:
         raise ConfigError(f"{path}: no questions")
@@ -333,7 +342,11 @@ def golden_cases(questions: Sequence[Question], input_key: str) -> list[dict[str
         {
             "id": q.id,
             "input": {input_key: q.question},
-            "expected": {"doc": q.doc, "evidence": q.evidence},
+            "expected": {
+                "doc": q.doc,
+                "evidence": q.evidence,
+                **({"key_fact": q.key_fact} if q.key_fact else {}),
+            },
             "tags": {"kind": q.kind, **({"lang": q.lang} if q.lang else {})},
         }
         for q in questions

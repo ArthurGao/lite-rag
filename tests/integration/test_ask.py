@@ -33,6 +33,7 @@ def test_ask_answers_from_the_hits_and_maps_citations_to_chunks(store: PgStore) 
     assert [c.chunk_id for c in answer.citations] == [answer.sources[0].chunk_id]
     assert answer.sources[0].doc_id == "refunds"
     assert (answer.model_id, answer.dropped) == ("fake/fake-llm", [])
+    assert answer.response_model == "fake-llm"  # S14: the model the reply names
     [messages] = llm.calls
     assert re.search(
         r'<source-[0-9a-f]{12} id="1" from="Refunds">\nRefunds are processed within seven days',

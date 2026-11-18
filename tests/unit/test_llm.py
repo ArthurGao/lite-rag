@@ -14,10 +14,13 @@ MESSAGES = [Message("system", "Be brief."), Message("user", "Hi")]
 
 
 class FakeOpenAI:
-    def __init__(self, fail: bool = False, content: str | None = "Hello [1]") -> None:
+    def __init__(
+        self, fail: bool = False, content: str | None = "Hello [1]", model: str = "qwen3:8b"
+    ) -> None:
         self.sent: dict[str, Any] = {}
         self.fail = fail
         self.content = content
+        self.model = model  # the model the response names
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs: Any) -> Any:
@@ -26,7 +29,9 @@ class FakeOpenAI:
         self.sent = kwargs
         message = SimpleNamespace(content=self.content)
         usage = SimpleNamespace(prompt_tokens=12, completion_tokens=3)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message)], usage=usage, model=self.model
+        )
 
 
 class FakeAnthropic:
@@ -42,7 +47,9 @@ class FakeAnthropic:
             SimpleNamespace(type="text", text="[1]"),
         ]
         return SimpleNamespace(
-            content=blocks, usage=SimpleNamespace(input_tokens=9, output_tokens=2)
+            content=blocks,
+            usage=SimpleNamespace(input_tokens=9, output_tokens=2),
+            model="claude-x-20261101",
         )
 
 
@@ -151,3 +158,19 @@ def test_an_anthropic_reply_without_text_blocks_is_a_failure() -> None:
     )
     with pytest.raises(LLMError, match="empty"):
         AnthropicLLM(LLMConfig(provider="anthropic", model="c"), client).complete(MESSAGES)
+
+
+def test_the_model_that_answered_is_read_from_the_response() -> None:
+    # S14: through a router (LiteLLM's smart-router with return_raw_model_name) the response
+    # names the model it chose; model_id stays provider/model from config.
+    client = FakeOpenAI(model="ollama_chat/qwen3:1.7b")
+    config = LLMConfig(provider="openai", model="smart-router", base_url="http://127.0.0.1:4400/v1")
+    out = OpenAICompatLLM(config, client).complete(MESSAGES)
+    assert (out.model_id, out.response_model) == ("openai/smart-router", "ollama_chat/qwen3:1.7b")
+    silent = OpenAICompatLLM(config, FakeOpenAI(model="")).complete(MESSAGES)
+    assert silent.response_model is None  # the endpoint did not say: not a guess
+
+
+def test_anthropic_records_the_answering_model() -> None:
+    llm = AnthropicLLM(LLMConfig(provider="anthropic", model="claude-x"), FakeAnthropic())
+    assert llm.complete(MESSAGES).response_model == "claude-x-20261101"

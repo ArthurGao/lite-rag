@@ -1,0 +1,12 @@
+# S14 (lite-model §15): the answer model through the local LiteLLM Proxy (lite-model deploy/litellm/,
+# Ollama-only tiers: small = qwen3:1.7b, workhorse = qwen3:8b, smart-router picks one per prompt).
+# The rest is chunk-markdown.yaml, the config S13 judged real answers with.
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+retrieval: {mode: hybrid}
+llm:
+  provider: openai
+  base_url: http://127.0.0.1:4400/v1
+  api_key_env: LITELLM_API_KEY
+  model: smart-router
+  temperature: 0.0          # as the ollama profile sends by default
+  max_output_tokens: 1024

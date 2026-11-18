@@ -543,6 +543,7 @@ class RagEngine:
             model_id=completion.model_id,
             usage=completion.usage,
             dropped=dropped,
+            response_model=completion.response_model,
         )
 
     def _rerank(

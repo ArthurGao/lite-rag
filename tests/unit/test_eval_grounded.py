@@ -6,6 +6,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
+import pytest
 from lite_eval.scorers.ranking import normalise
 
 from lite_rag.eval import load_corpus, load_golden
@@ -226,3 +227,65 @@ def test_every_real_row_with_a_label_becomes_one_case() -> None:
     ]
     ids = [c["id"] for c in real_cases(rows)]
     assert ids == [f"{r['id']}-real" for r in rows if r["label"] != "unclear"]
+
+
+def test_a_key_fact_must_compile_and_must_not_match_its_question(tmp_path: Path) -> None:
+    from lite_rag.errors import ConfigError
+    from lite_rag.eval import load_corpus, load_golden
+
+    corpus = load_corpus(Path(__file__).resolve().parents[2] / "eval" / "corpus")
+    base = {
+        "id": "x",
+        "doc": "coffee-brewing",
+        "question": "What ratio for coffee?",
+        "evidence": "1 gram of coffee to 16 grams of water",
+    }
+    for fact, problem in [("(16", "key_fact is not a regex"), ("ratio", "matches the question")]:
+        path = tmp_path / f"{problem[:6]}.jsonl"
+        path.write_text(json.dumps(base | {"key_fact": fact}) + "\n")
+        with pytest.raises(ConfigError, match=problem):
+            load_golden(path, corpus)
+
+
+def test_the_report_lists_judge_flags_and_missed_facts_apart() -> None:
+    # S14: both lists, each answer with the model that gave it; the judge's reason and quotes
+    # under its flags only (an empty list prints its count, nothing else).
+    from lite_rag.eval_grounded import report
+
+    flagged = [
+        {
+            "id": "q01",
+            "question": "Ratio?",
+            "answer": "1:16 and cheese",
+            "response_model": "m-8b",
+            "reason": "adds cheese",
+            "evidence": ["and cheese"],
+        }
+    ]
+    missed = [
+        {
+            "id": "q02",
+            "question": "Temperature?",
+            "answer": "Hot.",
+            "response_model": None,
+            "reason": "no match",
+            "evidence": [],
+        }
+    ]
+    assert report(flagged, missed) == (
+        "\nflagged by the judge: 1\n"
+        "\n[q01] Ratio? (m-8b)\n  answer: 1:16 and cheese\n  judge: adds cheese\n"
+        "  unsupported: and cheese\n"
+        "\nmissing the key fact: 1\n"
+        "\n[q02] Temperature?\n  answer: Hot.\n"
+    )
+    assert report([], []) == "\nflagged by the judge: 0\n\nmissing the key fact: 0\n"
+
+
+def test_a_run_without_key_facts_says_they_were_not_checked() -> None:
+    from lite_rag.eval_grounded import report
+
+    assert report([], None) == (
+        "\nflagged by the judge: 0\n"
+        "\nmissing the key fact: not checked (no key_fact in the golden set)\n"
+    )

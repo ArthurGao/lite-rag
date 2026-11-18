@@ -407,7 +407,13 @@ def eval_answers_command(
         require_extra("lite_eval", "eval")
     from lite_eval.report.terminal import render_run
 
-    from lite_rag.eval_grounded import calibrated_judge, flagged_answers, judge_answers
+    from lite_rag.eval_grounded import (
+        calibrated_judge,
+        flagged_answers,
+        judge_answers,
+        missed_facts,
+        report,
+    )
 
     try:
         settings = load_settings(config, file_wins=True, store={"schema": schema})
@@ -434,10 +440,4 @@ def eval_answers_command(
         finally:
             store.close()
     typer.echo(render_run(result.record, str(result.directory), result.scores))
-    rows = flagged_answers(result)
-    typer.echo(f"\nflagged: {len(rows)} of {len(result.scores)}")
-    for r in rows:
-        typer.echo(f"\n[{r['id']}] {r['question']}\n  answer: {r['answer']}")
-        typer.echo(f"  judge: {r['reason']}")
-        for quote in r["evidence"]:
-            typer.echo(f"  unsupported: {quote}")
+    typer.echo(report(flagged_answers(result), missed_facts(result)), nl=False)

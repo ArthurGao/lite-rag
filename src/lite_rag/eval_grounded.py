@@ -41,6 +41,7 @@ from lite_eval.judges.construct import (
 )
 from lite_eval.judges.spec import JudgeSpec
 from lite_eval.runner import RunOptions, RunResult, execute
+from lite_eval.scorers.compose import parse_scorer_id
 from lite_eval.scorers.ranking import normalise
 from lite_eval.store import read_record, root_of
 from lite_eval.suite import load_suite
@@ -245,6 +246,14 @@ def write_calibration(
 # LLM settings that never change an answer (how it is fetched, not what it is).
 _LLM_TRANSPORT = {"api_key_env", "timeout_s", "connect_timeout_s", "max_retries"}
 JudgeFactory = Callable[[JudgeSpec, float], JudgeClient]
+# S14: the answer states the golden question's key fact (case-insensitive regex).
+KEY_FACT = {"field": "answer", "expected": "key_fact", "case_sensitive": False}
+
+
+def _kind(scorer: str) -> str:
+    """A score's scorer kind, read from the name lite-eval gives it (its spec)."""
+    spec = parse_scorer_id(scorer)
+    return spec if isinstance(spec, str) else next(iter(spec))
 
 
 class LiteRagAnswerTarget(LiteRagTarget):
@@ -280,6 +289,7 @@ class LiteRagAnswerTarget(LiteRagTarget):
             "sources": sources,
             "status": answer.status,
             "dropped": answer.dropped,
+            "response_model": answer.response_model,  # S14: e.g. which model a router chose
         }
         scope = self.info()["latency_scope"]
         return Output(
@@ -337,18 +347,23 @@ def judge_answers(
     }
     write_generated_dataset(root / "datasets" / dataset, meta, golden_cases(questions, "question"))
     run = os.path.relpath(calibration.resolve(), root.resolve())
-    scorer = {
-        "judge": {"rubric": "grounded", "calibration": {"run": run, "min_agreement": min_agreement}}
-    }
+    calibrated = {"run": run, "min_agreement": min_agreement}
+    scorers: list[dict[str, Any]] = [{"judge": {"rubric": "grounded", "calibration": calibrated}}]
+    without = [q.id for q in questions if not q.key_fact]
+    if len(without) < len(questions):  # S14: did the answer state the fact asked for?
+        if without:  # all or none: a gap would switch the check off without a word
+            raise ConfigError(f"{golden.name}: no key_fact for {', '.join(without)}")
+        scorers.append({"regex": KEY_FACT})
     suite_path = write_suite(
         root,
         dataset,
         [slug(name)],
         schema,
         pack="grounded",
-        scorers=[scorer],
+        scorers=scorers,
         judges={"grounded": calibrated_judge(calibration)},
         judge_timeout_s=300,
+        cache="off",  # S14: every run answers anew (a repeat, and its latency, are measured)
     )
     suite = load_suite(suite_path, root)
     target = LiteRagAnswerTarget(
@@ -370,7 +385,21 @@ def flagged_answers(result: RunResult) -> list[dict[str, Any]]:
     """Every answer the judge did not pass (a scoring error included), with what it quoted as
     unsupported, in case order: each one is read before the judge is trusted (methodology §3:
     is the judge wrong, or the answer?)."""
-    failed = (s for s in result.scores if not s.passed)
+    return _rows(result, "judge")
+
+
+def missed_facts(result: RunResult) -> list[dict[str, Any]] | None:
+    """Every answer that does not state its key fact (S14), in case order: each one is read
+    before the number is reported (methodology §1: a paraphrase the regex misses, or a wrong
+    answer?). None when the run did not check key facts."""
+    if not any(_kind(ref.name) == "regex" for ref in result.record.scorers):
+        return None
+    return _rows(result, "regex")
+
+
+def _rows(result: RunResult, kind: str) -> list[dict[str, Any]]:
+    """The failed scores of one scorer kind, with the answer each one scored."""
+    failed = (s for s in result.scores if not s.passed and _kind(s.scorer) == kind)
     flagged = sorted(failed, key=lambda s: (s.case_id, s.repeat))
     if not flagged:
         return []
@@ -387,8 +416,31 @@ def flagged_answers(result: RunResult) -> list[dict[str, Any]]:
                 "id": score.case_id,
                 "question": shown.get("question"),
                 "answer": shown.get("answer"),
+                "response_model": shown.get("response_model"),
                 "reason": score.reason,
                 "evidence": evidence.get("evidence", []),
             }
         )
     return rows
+
+
+def report(flagged: list[dict[str, Any]], missed: list[dict[str, Any]] | None) -> str:
+    """What `literag eval-answers` prints after the table: the judge's flags with its reason and
+    quotes, then the answers missing their key fact (S14; `None`: the golden set has no key
+    facts, so nothing was checked); each with the model its response named."""
+    lines: list[str] = []
+    for title, rows, judged in (
+        ("flagged by the judge", flagged, True),
+        ("missing the key fact", missed, False),
+    ):
+        if rows is None:
+            lines.append(f"\n{title}: not checked (no key_fact in the golden set)\n")
+            continue
+        lines.append(f"\n{title}: {len(rows)}\n")
+        for r in rows:
+            by = f" ({r['response_model']})" if r.get("response_model") else ""
+            lines.append(f"\n[{r['id']}] {r['question']}{by}\n  answer: {r['answer']}\n")
+            if judged:
+                lines.append(f"  judge: {r['reason']}\n")
+                lines += [f"  unsupported: {quote}\n" for quote in r["evidence"]]
+    return "".join(lines)

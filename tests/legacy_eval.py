@@ -37,6 +37,7 @@ class Question:
     evidence: str  # a verbatim quote from that document
     kind: str = "keyword"  # free label; reports group by it (keyword | paraphrase)
     lang: str = ""
+    key_fact: str | None = None  # S14 golden field; the legacy retrieval eval ignores it
 
 
 @dataclass(frozen=True)

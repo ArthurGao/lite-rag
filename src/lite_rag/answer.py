@@ -45,6 +45,7 @@ class Answer:
     model_id: str | None  # provider/model; None when the model was not called
     usage: dict[str, int] = field(default_factory=dict)
     dropped: list[int] = field(default_factory=list)
+    response_model: str | None = None  # S14: the `model` the LLM response names (llm.Completion)
 
 
 def prompt(question: str, hits: list[Hit]) -> list[Message]:

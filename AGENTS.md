@@ -21,9 +21,10 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S0–S13 done** (2026-11-08/14; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
+**S0–S14 done** (2026-11-08/18; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
 lite-eval, numbers identical to before; S13: the grounded judge from lite-eval E5 calibrated on a
-constructed set and run on real `literag ask` answers, `literag eval-answers`). The owner's direction
+constructed set and run on real `literag ask` answers, `literag eval-answers`; S14: answer correctness (`key_fact`), `response_model`, and the measured effect of
+LiteLLM auto-routing on answers — design §12 S14 record). The owner's direction
 (2026-11-12): lite-rag covers the main RAG techniques side by side, each a stage measured with `literag eval`
 (candidates: graph global mode S11b, query rewriting — HyDE / multi-query, RAPTOR, self-checking retrieval);
 llm-steward's needs still come first.

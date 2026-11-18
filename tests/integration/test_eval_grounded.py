@@ -14,15 +14,18 @@ from lite_eval.errors import ConfigError as LiteEvalConfigError
 from lite_eval.judges.fake import FakeJudge, by_marker
 from lite_eval.judges.target import JudgeTarget
 from lite_eval.runner import RunOptions, RunResult, execute
+from lite_eval.scorers.base import spec_name
 from lite_eval.store import load_run
 from lite_eval.suite import load_suite
 
 from lite_rag.config import load_settings
-from lite_rag.eval_grounded import flagged_answers, judge_answers
+from lite_rag.errors import ConfigError
+from lite_rag.eval_grounded import KEY_FACT, flagged_answers, judge_answers, missed_facts
 from lite_rag.stores.pg import PgStore
 from lite_rag.testing import FakeEmbedder, FakeLLM
 
 REPO = Path(__file__).resolve().parents[2]
+KEY_FACT_SCORER = spec_name({"regex": KEY_FACT})  # how lite-eval names the S14 scorer
 CORPUS, GOLDEN = REPO / "eval" / "corpus", REPO / "eval" / "golden.jsonl"
 SETTINGS = load_settings(chunking={"unit": "chars", "size": 300, "overlap": 30})
 MARK = "and the moon is made of cheese"  # what the fake answer model adds to some answers
@@ -53,11 +56,17 @@ def calibrate(root: Path, judge: Any = fake_judge) -> RunResult:
     (dataset / "dataset.yaml").write_text("name: cal\nversion: '1'\npack: judging\n")
     sources = [{"text": "Wellington is the capital."}]
     cases = [
-        {"id": "a", "input": {"question": "q", "answer": "Wellington [1]", "sources": sources},
-         "expected": {"label": "grounded"}},
-        {"id": "b", "input": {"question": "q", "answer": f"x {MARK}", "sources": sources},
-         "expected": {"label": "unsupported"}},
-    ]  # fmt: skip
+        {
+            "id": "a",
+            "input": {"question": "q", "answer": "Wellington [1]", "sources": sources},
+            "expected": {"label": "grounded"},
+        },
+        {
+            "id": "b",
+            "input": {"question": "q", "answer": f"x {MARK}", "sources": sources},
+            "expected": {"label": "unsupported"},
+        },
+    ]
     (dataset / "cases.jsonl").write_text("".join(json.dumps(c) + "\n" for c in cases))
     suite_path = root / "suites" / "cal.yaml"
     suite_path.parent.mkdir()
@@ -115,14 +124,24 @@ def test_answers_are_judged_by_the_calibrated_judge(store: PgStore, tmp_path: Pa
     result = run(store, tmp_path, limit=8)
     stored = load_run(result.directory)
     assert result.record.summary.n_cases == 8 and result.record.status == "complete"
-    (ref,) = result.record.scorers
-    assert ref.calibrated is True
+    # S14: the calibrated judge and the key-fact check (golden `key_fact`)
+    ref, fact = result.record.scorers
+    assert ref.calibrated is True and fact.name == KEY_FACT_SCORER
     assert all(w.code != "judge_uncalibrated" for w in result.record.warnings)
-    flagged = {s.case_id for s in stored.scores if s.value == 0.0}
+    judged = [s for s in stored.scores if s.scorer == ref.name]
+    flagged = {s.case_id for s in judged if s.value == 0.0}
     coffee = {o.case_id for o in stored.outputs if MARK in o.value["answer"]}
     assert flagged == coffee == {"q01", "q02"}  # of the first eight, these name coffee
     out = stored.outputs[0]
-    assert set(out.value) == {"question", "answer", "sources", "status", "dropped"}
+    assert set(out.value) == {
+        "question",
+        "answer",
+        "sources",
+        "status",
+        "dropped",
+        "response_model",
+    }
+    assert out.value["response_model"] == "fake-llm"  # S14: which model answered
     assert out.value["status"] == "answered" and out.value["sources"][0]["text"]
     assert out.trace.usage is not None and out.trace.latency_ms is not None
     config = result.record.target.config
@@ -139,8 +158,9 @@ def test_the_judge_is_the_one_the_calibration_run_measured(store: PgStore, tmp_p
     suite = yaml.safe_load((tmp_path / "answers" / "suites" / "answers-golden.yaml").read_text())
     judge = suite["judges"]["grounded"]
     assert judge == {k: v for k, v in JUDGE.items() if k != "rubric"}  # as the calibration had it
-    (scorer,) = suite["scorers"]
+    scorer, fact = suite["scorers"]  # S14: the key-fact check next to the judge
     assert scorer["judge"]["calibration"]["min_agreement"] == 1.0
+    assert fact == {"regex": {"field": "answer", "expected": "key_fact", "case_sensitive": False}}
     assert result.record.scorers[0].calibrated is True
 
 
@@ -166,8 +186,88 @@ def test_the_command_refuses_a_calibration_that_is_not_a_run(tmp_path: Path) -> 
     config.write_text("chunking: {unit: chars, size: 300, overlap: 30}\n")
     done = CliRunner().invoke(
         app,
-        ["eval-answers", "-c", str(config), "--calibration", str(tmp_path / "nope"),
-         "--min-agreement", "0.9", "--root", str(tmp_path / "answers")],
-    )  # fmt: skip
+        [
+            "eval-answers",
+            "-c",
+            str(config),
+            "--calibration",
+            str(tmp_path / "nope"),
+            "--min-agreement",
+            "0.9",
+            "--root",
+            str(tmp_path / "answers"),
+        ],
+    )
     assert done.exit_code == 1, done.output  # lite-rag reports every error with exit 1
     assert "not a finished run directory" in done.output
+
+
+def test_the_key_fact_is_checked_on_every_answer(store: PgStore, tmp_path: Path) -> None:
+    # S14: "did it answer?" next to "is it grounded?". The fake states q01's fact only.
+    def answer_q01(messages: list[Any]) -> str:
+        question = str(messages[-1].content).rsplit("Question:", 1)[1]
+        return "Use 1 gram to 16 grams [1]." if "ratio" in question else "From the sources [1]."
+
+    result = run(store, tmp_path, limit=3, llm=FakeLLM(answer_q01))
+    stored = load_run(result.directory)
+    facts = {s.case_id: s.value for s in stored.scores if s.scorer == KEY_FACT_SCORER}
+    assert facts == {"q01": 1.0, "q02": 0.0, "q03": 0.0}
+    missed = missed_facts(result)  # listed apart from the judge's flags, to be read
+    assert [(r["id"], r["response_model"]) for r in missed] == [
+        ("q02", "fake-llm"),
+        ("q03", "fake-llm"),
+    ]
+    assert [r["id"] for r in flagged_answers(result)] == []  # the judge passed all three
+
+
+def test_answers_are_generated_every_run_not_cached(store: PgStore, tmp_path: Path) -> None:
+    # S14: a second run reused the first one's answers (lite-eval's output cache, "auto"), so a
+    # repeat measured nothing new and its latency was the first run's. Off, as `literag eval` has
+    # it since S12.
+    calibration = calibrate(tmp_path / "judge").directory
+    run(store, tmp_path, calibration=calibration, limit=1)
+    suite = yaml.safe_load((tmp_path / "answers" / "suites" / "answers-golden.yaml").read_text())
+    assert suite["cache"] == "off"
+    llm = FakeLLM(answer)
+    second = run(store, tmp_path, calibration=calibration, limit=1, llm=llm)
+    assert len(llm.calls) == 2  # lite-eval's warm-up, then the answer itself, again
+    assert second.record.cache.hits == 0
+
+
+def test_key_facts_are_all_or_none(store: PgStore, tmp_path: Path) -> None:
+    # S14: one question without a key fact would switch the check off without a word.
+    rows = [json.loads(line) for line in GOLDEN.read_text().splitlines()][:3]
+    partial = tmp_path / "golden.jsonl"
+    rows[1].pop("key_fact")
+    partial.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    with pytest.raises(ConfigError, match=f"no key_fact for {rows[1]['id']}"):
+        judge_answers(
+            "x",
+            SETTINGS,
+            CORPUS,
+            partial,
+            store,
+            root=tmp_path / "answers",
+            calibration=calibrate(tmp_path / "judge").directory,
+            min_agreement=1.0,
+            embedder_for=lambda c: FakeEmbedder(dim=16),
+            llm_for=lambda c: FakeLLM(answer),
+            judge_factory=fake_judge,
+        )
+    for row in rows:
+        row.pop("key_fact", None)
+    partial.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    result = judge_answers(
+        "x",
+        SETTINGS,
+        CORPUS,
+        partial,
+        store,
+        root=tmp_path / "none",
+        calibration=calibrate(tmp_path / "judge2").directory,
+        min_agreement=1.0,
+        embedder_for=lambda c: FakeEmbedder(dim=16),
+        llm_for=lambda c: FakeLLM(answer),
+        judge_factory=fake_judge,
+    )
+    assert len(result.record.scorers) == 1 and missed_facts(result) is None

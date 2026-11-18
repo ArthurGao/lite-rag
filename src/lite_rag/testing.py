@@ -78,7 +78,7 @@ class FakeLLM:
     def complete(self, messages: list[Message]) -> Completion:
         self.calls.append(list(messages))
         text = self._reply if isinstance(self._reply, str) else self._reply(messages)
-        return Completion(text, self.model_id, {"input": 10, "output": 5})
+        return Completion(text, self.model_id, {"input": 10, "output": 5}, "fake-llm")
 
 
 class FakeReranker:

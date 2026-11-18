@@ -34,6 +34,11 @@ class Completion:
     text: str
     model_id: str  # provider/model — recorded with every answer
     usage: dict[str, int] = field(default_factory=dict)
+    # S14: the `model` the response body names, whatever the endpoint puts there: Ollama the
+    # model, a LiteLLM routing alias (`return_raw_model_name`) the model it chose, a plain
+    # LiteLLM alias only the alias. None when the endpoint names none. Interim: the lite-model
+    # migration (design §12) replaces it with provenance read per backend.
+    response_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,12 +100,12 @@ class _Client:
 
     def complete(self, messages: list[Message]) -> Completion:
         try:
-            text, usage = self._send(messages)
+            text, usage, response_model = self._send(messages)
         except Exception as exc:
             raise LLMError(f"{self.model_id} failed: {type(exc).__name__}: {exc}") from exc
         if not text.strip():  # e.g. the whole token budget went to thinking
             raise LLMError(f"{self.model_id} returned an empty reply (usage {usage})")
-        return Completion(text, self.model_id, usage)
+        return Completion(text, self.model_id, usage, response_model or None)
 
     def _key(self) -> str | None:
         section = f"llm ({self._config.provider})"
@@ -113,7 +118,8 @@ class _Client:
     def _connect(self) -> Any:
         raise NotImplementedError
 
-    def _send(self, messages: list[Message]) -> tuple[str, dict[str, int]]:
+    def _send(self, messages: list[Message]) -> tuple[str, dict[str, int], str | None]:
+        """The reply's text, its token usage, and the model the response names."""
         raise NotImplementedError
 
 
@@ -130,7 +136,7 @@ class OpenAICompatLLM(_Client):
             max_retries=self._config.max_retries,
         )
 
-    def _send(self, messages: list[Message]) -> tuple[str, dict[str, int]]:
+    def _send(self, messages: list[Message]) -> tuple[str, dict[str, int], str | None]:
         c, profile = self._config, self._profile
         limit = c.max_tokens_param or profile.max_tokens_param
         params: dict[str, Any] = {limit: c.max_output_tokens}
@@ -146,7 +152,7 @@ class OpenAICompatLLM(_Client):
         )
         usage = response.usage
         tokens = {"input": usage.prompt_tokens, "output": usage.completion_tokens} if usage else {}
-        return response.choices[0].message.content or "", tokens
+        return response.choices[0].message.content or "", tokens, getattr(response, "model", None)
 
 
 class AnthropicLLM(_Client):
@@ -161,7 +167,7 @@ class AnthropicLLM(_Client):
             max_retries=self._config.max_retries,
         )
 
-    def _send(self, messages: list[Message]) -> tuple[str, dict[str, int]]:
+    def _send(self, messages: list[Message]) -> tuple[str, dict[str, int], str | None]:
         system = "\n\n".join(m.content for m in messages if m.role == "system")
         chat = [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
         response = self._client.messages.create(
@@ -171,7 +177,8 @@ class AnthropicLLM(_Client):
             **({"system": system} if system else {}),
         )
         text = "".join(block.text for block in response.content if block.type == "text")
-        return text, {"input": response.usage.input_tokens, "output": response.usage.output_tokens}
+        usage = {"input": response.usage.input_tokens, "output": response.usage.output_tokens}
+        return text, usage, getattr(response, "model", None)
 
 
 def build_llm(config: LLMConfig) -> LLM:
