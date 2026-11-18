@@ -105,4 +105,4 @@ markers = [
 ]
 
 [tool.uv.sources]
-lite-eval = { url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.3.0/lite_eval-0.3.0-py3-none-any.whl" }
+lite-eval = { url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.3.1/lite_eval-0.3.1-py3-none-any.whl" }
