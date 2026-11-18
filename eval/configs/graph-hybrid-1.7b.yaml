@@ -1,0 +1,5 @@
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+graph: {enabled: true}
+retrieval: {mode: hybrid, hybrid_paths: [vector, bm25, graph]}
+# the graph role on the small model (2026-11-19: is a fixed small model enough for extraction?)
+llm: {roles: {graph: {model: "qwen3:1.7b"}}}
