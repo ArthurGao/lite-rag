@@ -1,0 +1,33 @@
+# The grounded judge from another model family (S13 follow-up, owner 2026-11-18): the same
+# calibration set as calibrate.yaml, judged through llm-gateway's subscription profiles.
+#   uv run lite-eval run eval/judge-grounded/suites/calibrate-gateway.yaml --config gpt-sub
+# Needs llm-gateway on 127.0.0.1:8787, started by the owner; it spends ChatGPT plan quota, so
+# never run it unasked (KB global/llm-gateway, rule 1).
+schema_version: 1
+name: grounded-judge-calibration-gateway
+pack: judging
+dataset: ../datasets/grounded-golden
+targets:
+  - python: lite_eval.judges.target:judge_target
+    configs:
+      - name: gpt-sub
+        rubric: grounded
+        provider: openai
+        model: gpt-sub  # the gateway profile; the channel records that it is not the API (L20)
+        channel: llm-gateway:gpt-sub
+        base_url: http://127.0.0.1:8787/v1
+        billing: subscription
+repeats: 1  # owner 2026-11-18: one pass first; repeat if the result is close
+concurrency: 2
+timeout_s: 300
+kb:
+  eval: 2026-11-18-lite-rag-grounded-judge
+  project: lite-rag
+  timezone: Pacific/Auckland
+  task: judging
+  dataset: "223 answers to 31 golden questions (en and zh): 193 constructed (the evidence sentence citing its paragraph; one mechanical corruption each, one hand-written contradiction of the source and one plausible elaboration; or the citation dropped) and 30 real `literag ask` answers labelled by reading"
+  grader: constructed
+  effort: default  # no reasoning_effort sent: the profile's model decides
+  metrics:
+    label_agreement: accuracy
+  notes: "gpt-sub (ChatGPT subscription through llm-gateway) as the grounded judge of lite-rag answers: another model family than the qwen3:8b that wrote them"
