@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import lite_model
 from lite_model import Bounded, Message, RolePolicy, RoleSpec
+from pydantic import BaseModel
 
 from lite_rag.config import LLMConfig, Role
 from lite_rag.errors import ConfigError, LiteRagError
@@ -20,7 +21,7 @@ from lite_rag.types import model_id
 if TYPE_CHECKING:
     import httpx2
 
-__all__ = ["ROLES", "Completion", "LLMError", "Message", "RoleLLM", "build_model"]
+__all__ = ["ROLES", "BadReply", "Completion", "LLMError", "Message", "RoleLLM", "build_model"]
 
 # Only answers may go through a routing alias: contexts and graphs are index identity, and an
 # index built by whichever model a router picked could not be rebuilt the same (design §6).
@@ -35,6 +36,10 @@ class LLMError(LiteRagError):
     """The model call failed."""
 
     status = 502
+
+
+class BadReply(LLMError):
+    """The model answered, but not in the shape asked for (a structured reply off its schema)."""
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,15 @@ class RoleLLM:
         # lite-model's Provenance.tag with lite-rag's `/`: answers have recorded `x/y` since S0
         answered = model_id(p.backend, p.answered or f"{p.requested}?")
         return Completion(reply.text, answered, usage)
+
+    def structured[T: BaseModel](self, messages: Sequence[Message], schema: type[T]) -> T:
+        """A reply constrained to `schema` (lite-model sends it as a strict JSON schema)."""
+        try:
+            return self._model.structured(self._role, messages, schema).value
+        except lite_model.BadStructuredReply as exc:
+            raise BadReply(str(exc)) from exc
+        except lite_model.ModelError as exc:
+            raise LLMError(str(exc)) from exc
 
     def bounded(self, concurrency: int) -> "BoundedLLM":
         """The same role with at most `concurrency` calls in flight through it, from any thread

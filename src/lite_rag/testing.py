@@ -6,7 +6,9 @@ import random
 from collections.abc import Callable
 from typing import get_args
 
+from lite_model import BadStructuredReply
 from lite_model.testing import FakeCall, FakeModel
+from pydantic import BaseModel, ValidationError
 
 from lite_rag.chunking import unit as normalise
 from lite_rag.config import Role
@@ -71,12 +73,22 @@ class SpreadEmbedder(FakeEmbedder):
 
 class FakeLLM(RoleLLM):
     """lite-rag's LLM over lite-model's `FakeModel`: replies with `reply` — a fixed text, or a
-    function of the prompt — for whichever role calls it, and records every prompt. Its answers
-    say `fake/fake-model`, so a scripted reply is never mistaken for a model's."""
+    function of the prompt — for whichever role calls it, and records every prompt. A structured
+    call gets the text as JSON validated against its schema; text off the schema raises lite-model's
+    `BadStructuredReply`, as a real endpoint's would. Its answers say `fake/fake-model`, so a
+    scripted reply is never mistaken for a model's."""
 
     def __init__(self, reply: str | Callable[[list[Message]], str] = "") -> None:
-        def script(call: FakeCall) -> str:
-            return reply if isinstance(reply, str) else reply(list(call.messages))
+        def script(call: FakeCall) -> str | BaseModel | BaseException:
+            text = reply if isinstance(reply, str) else reply(list(call.messages))
+            if call.schema is None:
+                return text
+            try:
+                return call.schema.model_validate_json(text)
+            except ValidationError as exc:
+                bad = BadStructuredReply(f"role {call.role} (fake:fake-model): ValidationError")
+                bad.__cause__ = exc
+                return bad
 
         self.fake = FakeModel(**{role: script for role in get_args(Role)})
         super().__init__(self.fake, "answer")

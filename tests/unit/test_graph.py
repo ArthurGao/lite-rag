@@ -1,22 +1,27 @@
-import json
 import threading
+from typing import Any
 
 import pytest
+from lite_model import strict_schema
+from pydantic import ValidationError
 
 from lite_rag.graph import (
     ChunkGraph,
     Entity,
     GraphError,
     GraphExtractor,
+    GraphReply,
     Relation,
     entity_key,
-    parse_graph,
     seeds,
+    to_graph,
     walk,
 )
-from lite_rag.llm import Message
+from lite_rag.llm import LLMError, Message
 from lite_rag.testing import FakeLLM
 from lite_rag.types import Chunk
+
+EMPTY = '{"entities": [], "relations": []}'
 
 
 def test_entity_names_merge_across_case_width_and_spacing() -> None:
@@ -26,19 +31,21 @@ def test_entity_names_merge_across_case_width_and_spacing() -> None:
     assert entity_key("李明") == "李明"
 
 
-def test_a_reply_parses_into_entities_and_relations() -> None:
-    reply = json.dumps(
-        {
-            "entities": [
-                {"name": "Project Atlas", "type": "project"},
-                {"name": "Maria Keller", "type": "person"},
-            ],
-            "relations": [
-                {"source": "Project Atlas", "target": "Maria Keller", "description": "led by"}
-            ],
-        }
-    )
-    assert parse_graph(reply) == ChunkGraph(
+def _graph(reply: dict[str, Any]) -> ChunkGraph:
+    return to_graph(GraphReply.model_validate(reply))
+
+
+def test_a_reply_becomes_entities_and_relations() -> None:
+    reply = {
+        "entities": [
+            {"name": "Project Atlas", "type": "project"},
+            {"name": "Maria Keller", "type": "person"},
+        ],
+        "relations": [
+            {"source": "Project Atlas", "target": "Maria Keller", "description": "led by"}
+        ],
+    }
+    assert _graph(reply) == ChunkGraph(
         (
             Entity("project atlas", "Project Atlas", "project"),
             Entity("maria keller", "Maria Keller", "person"),
@@ -47,41 +54,31 @@ def test_a_reply_parses_into_entities_and_relations() -> None:
     )
 
 
-def test_a_reply_in_a_code_fence_with_text_around_it_still_parses() -> None:
-    body = '{"entities": [{"name": "李明", "type": "人物"}], "relations": []}'
-    reply = f"Here you go:\n```json\n{body}\n```"
-    assert parse_graph(reply).entities == (Entity("李明", "李明", "人物"),)
-
-
 def test_relation_ends_missing_from_the_entities_become_entities() -> None:
-    reply = json.dumps(
-        {
-            "entities": [{"name": "Tom Osei", "type": "person"}],
-            "relations": [{"source": "Tom Osei", "target": "Berlin office"}],
-        }
-    )
-    graph = parse_graph(reply)
+    reply = {
+        "entities": [{"name": "Tom Osei", "type": "person"}],
+        "relations": [{"source": "Tom Osei", "target": "Berlin office"}],
+    }
+    graph = _graph(reply)
     assert [e.key for e in graph.entities] == ["tom osei", "berlin office"]
     assert graph.entities[1].type == ""
     assert graph.relations == (Relation("tom osei", "berlin office", ""),)
 
 
 def test_duplicates_blank_names_and_self_relations_are_dropped() -> None:
-    reply = json.dumps(
-        {
-            "entities": [
-                {"name": "Atlas", "type": "project"},
-                {"name": "ATLAS", "type": "system"},
-                {"name": "  ", "type": "x"},
-            ],
-            "relations": [
-                {"source": "Atlas", "target": "atlas", "description": "is"},
-                {"source": "Atlas", "target": "Maria", "description": "led by"},
-                {"source": "atlas", "target": "MARIA", "description": "again"},
-            ],
-        }
-    )
-    graph = parse_graph(reply)
+    reply = {
+        "entities": [
+            {"name": "Atlas", "type": "project"},
+            {"name": "ATLAS", "type": "system"},
+            {"name": "  ", "type": "x"},
+        ],
+        "relations": [
+            {"source": "Atlas", "target": "atlas", "description": "is"},
+            {"source": "Atlas", "target": "Maria", "description": "led by"},
+            {"source": "atlas", "target": "MARIA", "description": "again"},
+        ],
+    }
+    graph = _graph(reply)
     assert graph.entities == (Entity("atlas", "Atlas", "project"), Entity("maria", "Maria", ""))
     assert graph.relations == (Relation("atlas", "maria", "led by"),)
 
@@ -93,17 +90,25 @@ def test_duplicates_blank_names_and_self_relations_are_dropped() -> None:
         "{not json}",
         '["a list"]',
         '{"entities": "Atlas"}',
-        '{"entities": [{"type": "person"}]}',
+        '{"entities": [{"type": "person"}], "relations": []}',
         '{"entities": [], "relations": [{"source": "a"}]}',
-        '{"entities": [{"name": 7}]}',
+        '{"entities": [{"name": 7}], "relations": []}',
         "{}",  # an empty object is not "nothing found": the model ignored the shape
         '{"entities": [{"name": "Atlas"}]}',  # relations missing
         '{"relations": []}',  # entities missing
+        '{"entities": [], "relations": [], "notes": "x"}',  # nothing else
     ],
 )
-def test_a_malformed_reply_raises(reply: str) -> None:
-    with pytest.raises(GraphError):
-        parse_graph(reply)
+def test_a_reply_off_the_schema_is_refused(reply: str) -> None:
+    with pytest.raises(ValidationError):
+        GraphReply.model_validate_json(reply)
+
+
+def test_the_schema_the_model_is_held_to_requires_both_lists() -> None:
+    # sent with every graph call (S16): without it a local model wrote invalid JSON
+    schema = strict_schema(GraphReply)
+    assert schema["required"] == ["entities", "relations"]
+    assert schema["additionalProperties"] is False
 
 
 # A small graph as (entity, chunk) mentions: atlas → maria → safety council → its meeting chunk,
@@ -187,8 +192,12 @@ def test_the_extractor_calls_the_llm_once_per_chunk_with_the_passage_fenced() ->
     llm = FakeLLM(reply=reply)
     graphs = GraphExtractor(llm).extract(_chunks(["Maria leads Atlas.", "Tom leads Beacon."]))
 
-    assert graphs == [parse_graph(reply)] * 2
+    assert (
+        graphs
+        == [_graph({"entities": [{"name": "Maria Keller", "type": "person"}], "relations": []})] * 2
+    )
     assert len(llm.calls) == 2
+    assert all(c.schema is GraphReply for c in llm.fake.calls)  # constrained to the schema
     user = llm.calls[1][-1]
     assert isinstance(user, Message) and "Tom leads Beacon." in user.content
     assert "Maria leads Atlas." not in user.content  # one chunk per call
@@ -197,17 +206,57 @@ def test_the_extractor_calls_the_llm_once_per_chunk_with_the_passage_fenced() ->
 
 
 def test_the_extractor_runs_calls_concurrently_up_to_its_limit() -> None:
-    class Together(FakeLLM):
-        """Each call waits for the other: one at a time would time out."""
+    barrier = threading.Barrier(2, timeout=5)
 
-        barrier = threading.Barrier(2, timeout=5)
+    def together(messages: list[Message]) -> str:
+        barrier.wait()  # each call waits for the other: one at a time would time out
+        return EMPTY
 
-        def complete(self, messages):  # type: ignore[no-untyped-def]
-            self.barrier.wait()
-            return super().complete(messages)
-
-    llm = Together(reply='{"entities": [], "relations": []}')
+    llm = FakeLLM(reply=together)
     assert len(GraphExtractor(llm, concurrency=2).extract(_chunks(["a", "b"]))) == 2
+    assert len(llm.calls) == 2
+
+
+def _replies(*replies: str) -> FakeLLM:
+    """A FakeLLM that answers with `replies` in turn."""
+    it = iter(replies)
+    return FakeLLM(reply=lambda messages: next(it))
+
+
+def test_a_reply_that_is_not_a_graph_is_asked_for_once_more() -> None:
+    # S16: a local model at temperature 0 still samples; one bad reply must not fail the ingest
+    llm = _replies("not json {", '{"entities": [{"name": "Atlas"}], "relations": []}')
+    assert GraphExtractor(llm).extract(_chunks(["Atlas."])) == [
+        ChunkGraph((Entity("atlas", "Atlas", ""),), ())
+    ]
+    assert len(llm.calls) == 2 and llm.calls[0] == llm.calls[1]  # the same prompt again
+
+
+def test_asking_again_is_logged_without_the_reply(caplog: pytest.LogCaptureFixture) -> None:
+    # how often the model fails the shape stays visible; the reply itself is not logged
+    llm = _replies("secret text {", EMPTY)
+    with caplog.at_level("WARNING", logger="lite_rag.graph"):
+        GraphExtractor(llm).extract(_chunks(["Atlas."]))
+    [record] = caplog.records
+    assert record.getMessage() == "graph reply for chunk d#0 is not a graph; asking once more"
+
+
+def test_a_second_reply_that_is_not_a_graph_fails() -> None:
+    llm = _replies("not json {", '{"entities": []}', EMPTY)
+    with pytest.raises(GraphError, match=r"chunk d#0: role answer \(fake:fake-model\)"):
+        GraphExtractor(llm).extract(_chunks(["Atlas."]))
+    assert len(llm.calls) == 2  # once more, not until it parses
+
+
+def test_a_failed_call_is_not_asked_again_here() -> None:
+    # a call that failed was already retried by lite-model; only an unparsable reply is repeated
+    def fail(messages: list[Message]) -> str:
+        raise LLMError("role graph (ollama:qwen3:8b): ConnectError")
+
+    llm = FakeLLM(reply=fail)
+    with pytest.raises(LLMError) as caught:
+        GraphExtractor(llm).extract(_chunks(["Atlas."]))
+    assert not isinstance(caught.value, GraphError) and len(llm.calls) == 1
 
 
 def test_an_entity_linked_by_more_chunks_goes_first_whatever_its_name() -> None:

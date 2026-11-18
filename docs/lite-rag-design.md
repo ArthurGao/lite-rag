@@ -185,7 +185,7 @@ engine.stats(kb)
 - **模式**：`vector`、`bm25`、`hybrid`。每个 `Hit` 都带各阶段的分数 `scores={vector, bm25, fused, rerank}` 和排名，方便对比和调试。
 - **多个 kb 一起查**（S10，2026-11-09，为 llm-steward 的联合检索）：`RagEngine.search_kbs(kbs, query, …)` 把同一 namespace 里的几个 kb 当成一个来查。query 只嵌入一次；每一路（向量、BM25）在各 kb 取前 n 条，按分数合并成一张表，再只融合一次、只 rerank 一次。结果的 `Hit.kb` 标明来源（chunk id 只在 kb 内唯一，内部用"kb 序号/chunk id"作键）。向量分数在 kb 之间可比（一个引擎只有一个模型）；BM25 的 IDF 是各 kb 自己统计的，合并后的 BM25 表是近似的：小 kb 里同一个词的 IDF 更高，分数偏大，在默认路径（rerank 关）上会占到合并后 BM25 表的前排。开 rerank 时最终顺序完全可比。查询次数随 kb 数增长（每一轮每个 kb 两路各一次，加深时每个 kb 都重查）。留到以后：偏差成问题时，让 Store 返回每个 kb 的 (N, df(t), avgdl)，由引擎算统一的 IDF；kb 多时把各 kb 的查询并行，或在 PG 上一条 SQL 查多个 kb 的向量。还没写过文档（不存在）的 kb 跳过；名字不合法仍是 `InvalidRequest`。单 kb 的 `search` 走同一套流程，结果不变。
 - **图检索**（S11，2026-11-12，只做 local、只支持 PG）：
-  - **建库**：kb 开了 `graph.enabled` 时，每个 chunk 调一次 LLM（`graph.llm`，默认本地 qwen3、关闭思考），按 `prompts/graph_*.j2` 抽出实体（名字、类型）和关系（两端实体、一句描述），回复是 JSON。只给 LLM 看 chunk 正文，不给文档标题：给了标题，本地模型会把标题当成每个 chunk 的实体，成为连接一切的枢纽（实测）。回复不是合法 JSON、缺了 `entities` 或 `relations` 列表（没找到就是空列表，不是缺字段）、或字段类型不对，整篇写入失败，不重试别的模型（规则 5）。关系端点不在实体列表里时补成实体。实体按规范化的名字合并（NFKC、casefold、合并空白），所以同一个人在不同文档里是同一个节点。图和 chunk 在同一个事务里写；抽取模型和 prompt 记进 kb 的身份（`chunker.graph`），换了就要新 kb。Chroma 后端不支持，配置时就报错。
+  - **建库**：kb 开了 `graph.enabled` 时，每个 chunk 调一次 LLM（role `graph`，默认本地 qwen3、关闭思考），按 `prompts/graph_*.j2` 抽出实体（名字、类型）和关系（两端实体、一句描述），回复受 JSON schema 约束（S16 起，`GraphReply`：`entities`、`relations` 两个列表都要有，没找到就是空列表）。只给 LLM 看 chunk 正文，不给文档标题：给了标题，本地模型会把标题当成每个 chunk 的实体，成为连接一切的枢纽（实测）。回复仍不合 schema 时用同一个 prompt 再要一次，第二次还不合就整篇写入失败，不换别的模型（规则 5）。关系端点不在实体列表里时补成实体。实体按规范化的名字合并（NFKC、casefold、合并空白），所以同一个人在不同文档里是同一个节点。图和 chunk 在同一个事务里写；抽取模型和 prompt 记进 kb 的身份（`chunker.graph`），换了就要新 kb。Chroma 后端不支持，配置时就报错。
   - **查询**（`graph` 路径，不调 LLM）：**图圈范围，向量排序。**
     1. **种子**：名字（规范化后）是 query 子串的实体，至少 2 个字符；名字被包含在 2 个以上其他实体名里的不算（"委员会"、"council" 这类类别词）。
     2. **扩展**：沿"同一个 chunk 里同时被提到"走：实体 → 提到它的 chunk → 这些 chunk 里的其他实体，共 `graph.hops` 跳（默认 2，即答案离问题点名的实体隔两篇文档）。被超过 `graph.hub_chunks` 个 chunk（默认 5）提到的实体是枢纽（公司名、贯穿全文的主题）：不经过它扩展，也不通过它把 chunk 纳入范围。每跳只留连接 chunk 最多的 `graph.max_neighbors` 个新实体。
@@ -353,6 +353,7 @@ lite-rag/
 | S13 回答评审（lite-eval E5b） | 依赖 lite-eval 0.3.0；grounded 评审的校准集（构造法，提交）和校准 suite；`LiteRagAnswerTarget` 与 `literag eval-answers`；数据集和 suite 的生成共用 `write_generated_dataset` / `write_suite` | 校准集：每种改法标签按构造正确、同一种子同一集合、提交的和生成器一致、插入和交换的内容同语言且不在来源里；FakeLLM + FakeJudge：回答被校准过的评审判分、被标记的回答列出、评审就是校准运行测过的那个、校准不够时在生成任何回答之前拒绝；qwen3:8b（思考关和开）的校准一致率和每种改法的识别率、真实回答的标记率和逐条判断记进 KB |
 | S14 回答对不对与自动路由 | 金标题的 `key_fact` 和 `eval-answers` 的 `regex` 评分器；`response_model`（LLM 响应写的模型）一路带到 `ask` 和评测输出；`eval-answers` 关掉输出缓存；四个对比配置（直连 Ollama 8b，经 LiteLLM Proxy 的 small / workhorse / smart-router） | `key_fact` 标签按构造（匹配合格回答、不匹配题目、不匹配改数字和换答案的回答）；全有或全无；缓存关闭（第二次运行重新回答）；FakeLLM：`response_model` 取自响应、评测输出带上、未检查时报告写明；四个配置 × 2 次真实运行，逐条读未通过的回答，结果记进 KB 和 lite-model 设计 §15 |
 | S15 迁到 lite-model | LLM 调用改由 lite-model 0.2.0 完成：三处 LLM 配置变成 `answer` / `contextual` / `graph` 三个 role（后两个不可路由、模型固定在 `host_roles`）；`RoleLLM`；`model_id` 改成实际回答的模型，`response_model` 删除；截断算错误；旧配置键拒绝并说明去处；删掉旧客户端 | 迁移前录下的 5 个请求（三个 role 的默认、OpenAI 兼容厂商全参数、Anthropic）逐字段相同；索引身份（评测 kb 名）不变；`literag eval`（contextual、graph）和 `eval-answers` 前后一致；`-m ollama` 通过 |
+| S16 图抽取用结构化输出 | graph role 的回复受 JSON schema 约束（lite-model `structured()`，`GraphReply`）；仍不合 schema 的回复用同一个 prompt 再要一次，第二次仍不合就整篇失败；`CODE_VERSION` 2（图 kb 的身份变了） | 单测：请求带 schema、不合 schema 再要一次且只一次、调用失败不重复、日志不带回复；请求体录制只多 `response_format`；之前 10 次里 7 次坏 JSON 的 chunk 用结构化输出 10 次都合法；`literag eval` graph-hybrid 3 次全部完成 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -390,6 +391,33 @@ lite-rag/
     每次读都重算 role id（几十微秒）、合并测试里的 helper 和旧键校验（小）。
   - Codex 采纳 1 条（顶层调用参数只给 answer，见上）；核实后不成立 1 条："`llm` 下的拼写错误被悄悄忽略"——lite-model 的配置禁止
     多余字段，`llm.reasining_effort` 启动时就报错。
+
+- **S16 图抽取用结构化输出（2026-11-19）**：S15 记下的后续。
+  - 起因：graph-hybrid 迁移后 3 次里 2 次 ingest 失败（坏 JSON）。先按计划只加"解析失败再要一次"：3 次里仍有 1 次失败——
+    同一个 chunk（`茶叶分类#1`）两次都坏。单独问这个 chunk 10 次，7 次是坏 JSON（`{"source": "中国, "target": …`，模型漏了
+    一个引号，回复只有两三种），S15 的三次录制恰好都是好的。重试一次只能把这个 chunk 的失败率从 70% 降到约 50%，不是修复。
+  - 改为根因：graph role 用 lite-model 的 `structured()`，`GraphReply`（`entities[{name, type}]`、`relations[{source,
+    target, description}]`）作为 strict JSON schema 发给模型（Ollama 按 schema 约束解码）。同一个 chunk 10 次全部合法。
+    模型的同一个笔误还在，只是落进了字符串里（10 次里 4 次多出一个叫"中国,"的实体）：内容错一个节点，而不是整篇失败。
+  - 仍保留一次重试：回复不合 schema（lite-model 的 `BadStructuredReply` → `BadReply`）时用同一个 prompt 再要一次，第二次
+    仍不合抛 `GraphError`、整篇失败；调用失败（`LLMError`）不在这里重复（lite-model 已经按 `max_retries` 重试过）。每次重试记
+    一条 warning（chunk id，不带回复内容）。
+  - 删掉了宽松解析（代码块、前后文字、手写的字段检查）：schema 保证形状，`to_graph` 只做规范化（去空名、合并、补端点）。
+    提示词不变（`prompt_digest` 的模板部分不变），`CODE_VERSION` 1 → 2：请求多了 `response_format`，已有的图 kb 身份不再
+    匹配，要重建（llm-steward 不用图检索；评测 kb 每次重建）。
+  - `FakeLLM`（`lite_rag.testing`）支持结构化调用：脚本文本按 schema 校验，不合时抛 lite-model 的 `BadStructuredReply`，
+    和真实端点一样（lite-model 也用 `model_validate_json`）。
+  - 顺带修：S15 的并发测试覆盖了 `complete()`，而 `bounded()` 不经过它——测试什么都没验证。改成脚本里等 barrier（并发 1
+    时超时，先红）。
+  - 变异 4 处（去掉重试、对任何 `LLMError` 重试、`BadStructuredReply` 映射成 `LLMError`、schema 不再要求 `relations`），
+    全部被抓到。
+  - eval（本机 Ollama，`literag eval` graph-hybrid）：只加重试时 3 次里 1 次失败（重试后仍坏）、另 2 次 0.875 / 0.938 / 0.915；
+    结构化输出 3 次全部完成，三次都是 0.875 / 0.938 / 0.915（hit@1 / hit@5 / mrr@10，和 S15 前后一样），一次重试都没用上。
+    `-m ollama` 8 个通过。（中间一次重跑和仍在跑的上一组撞了同一个 schema，互相删了 kb；那两组不算。）
+  - /simplify：采纳——去掉 `PARSE_ATTEMPTS` 和循环（固定一次）；altitude 指出根因是没约束输出（即上面的改动）。不采纳——把
+    `_replies` 挪进 `FakeLLM`（只有一个测试文件用）。
+  - Codex：第一轮 1 条（重试改变了图的生成方式，应该进身份）——改成结构化输出后 `CODE_VERSION` 已升；第二轮 1 条不成立：
+    "fake 的校验比发给模型的 schema 宽"——真实路径也是 `model_validate_json`，两边一样宽。
 
 ## 13. 待确认
 

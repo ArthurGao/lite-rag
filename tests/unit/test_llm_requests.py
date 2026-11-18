@@ -10,8 +10,10 @@ from typing import Any
 
 import httpx2
 import pytest
+from lite_model import strict_schema
 
 from lite_rag.config import Settings
+from lite_rag.graph import GraphReply
 from lite_rag.llm import LLM, Message, RoleLLM, build_model
 
 RECORDED = Path(__file__).parents[1] / "fixtures" / "llm_requests.json"
@@ -51,10 +53,12 @@ def _reply(request: httpx2.Request) -> httpx2.Response:
             "content": [{"type": "text", "text": "1:16 [1]"}],
             "usage": {"input_tokens": 1, "output_tokens": 1},
         })  # fmt: skip
+    structured = "response_format" in json.loads(request.content)
+    content = '{"entities": [], "relations": []}' if structured else "1:16 [1]"
     return httpx2.Response(200, json={
         "id": "c", "object": "chat.completion", "created": 0, "model": "qwen3:8b",
         "choices": [{"index": 0, "finish_reason": "stop",
-                     "message": {"role": "assistant", "content": "1:16 [1]"}}],
+                     "message": {"role": "assistant", "content": content}}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
     })  # fmt: skip
 
@@ -78,10 +82,11 @@ def record(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             sent.append(request)
             return _reply(request)
 
-        completion = _llm(case, httpx2.Client(transport=httpx2.MockTransport(handler))).complete(
-            MESSAGES
-        )
-        assert completion.text == "1:16 [1]"
+        llm = _llm(case, httpx2.Client(transport=httpx2.MockTransport(handler)))
+        if case == "graph":  # the graph's reply is constrained to its schema (S16)
+            assert llm.structured(MESSAGES, GraphReply) == GraphReply(entities=[], relations=[])
+        else:
+            assert llm.complete(MESSAGES).text == "1:16 [1]"
         [request] = sent  # one request per call: no retry, no second call
         seen[case] = {
             "method": request.method,
@@ -94,6 +99,9 @@ def record(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 def test_every_role_sends_the_recorded_request(monkeypatch: pytest.MonkeyPatch) -> None:
     recorded = json.loads(RECORDED.read_text(encoding="utf-8"))
+    # S16 asks the graph role for a reply held to a JSON schema: the one change since the recording
+    schema = {"name": "GraphReply", "schema": strict_schema(GraphReply), "strict": True}
+    recorded["graph"]["body"]["response_format"] = {"type": "json_schema", "json_schema": schema}
     seen = record(monkeypatch)
     assert sorted(seen) == sorted(recorded)
     for case in recorded:

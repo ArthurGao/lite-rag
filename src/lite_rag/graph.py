@@ -2,8 +2,10 @@
 
 Ingest: an LLM reads each chunk once and lists the entities it names and the relations it states
 between them (`GraphExtractor`, prompts `graph_*.j2`). Entities merge across chunks and documents
-by a normalised name (`entity_key`). A reply that is not the expected JSON fails the upsert — no
-retry with another model, no partial graph.
+by a normalised name (`entity_key`). The reply is constrained to a JSON schema (`GraphReply`,
+S16): a local model left free wrote invalid JSON for some chunks in most runs (a dropped quote),
+and that failed the whole upsert. A reply still off the schema is asked for once more with the
+same prompt; a second one fails the upsert — no other model, no partial graph.
 
 Query: the graph narrows, the query vector orders. Seed entities are the ones the query names
 (not category words such as "council", which sit inside several other names) → `walk` goes from
@@ -15,28 +17,31 @@ relations it could have stated (eval, 2026-11-12). The walk lives here; the stor
 lookups (an entity's chunks, a chunk's entities).
 """
 
-import json
-import re
+import logging
 import unicodedata
 from collections.abc import Callable, Iterable
-from typing import Any
 
-from lite_rag.llm import LLM, LLMError
+from pydantic import BaseModel, ConfigDict
+
+from lite_rag.llm import LLM, BadReply
 from lite_rag.prompts import digest, render_pair
 from lite_rag.types import Chunk, ChunkGraph, Entity, Relation
 
+log = logging.getLogger("lite_rag.graph")
+
 TEMPLATES = ("graph_system.j2", "graph_user.j2")
 
-# Bump when the code that turns a reply into a graph changes (`parse_graph`, `entity_key`):
-# stored graphs then no longer match, and the kb identity says so.
-CODE_VERSION = "1"
+# Bump when what is asked for or how a reply becomes a graph changes (`GraphReply`, `to_graph`,
+# `entity_key`): stored graphs then no longer match, and the kb identity says so.
+# 2 (S16): the reply is constrained to `GraphReply`'s schema.
+CODE_VERSION = "2"
 
 MIN_SEED_CHARS = 2  # an entity name matched inside the query: shorter ones match by accident
 GENERIC_INSIDE = 2  # a name inside this many other entity names is a category word, not a seed
 
 
-class GraphError(LLMError):
-    """The model's reply is not a graph in the expected shape."""
+class GraphError(BadReply):
+    """The model's reply was not a graph, twice."""
 
 
 def prompt_digest() -> str:
@@ -50,65 +55,47 @@ def entity_key(name: str) -> str:
 
 # --- ingest ---------------------------------------------------------------------------------------
 
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+class EntityReply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    type: str = ""
 
 
-def _json_object(reply: str) -> dict[str, Any]:
-    fenced = _FENCE.search(reply)
-    text = fenced.group(1) if fenced else reply
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end < start:
-        raise GraphError(f"no JSON object in the reply: {reply[:200]!r}")
-    try:
-        value = json.loads(text[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise GraphError(f"the reply is not valid JSON ({exc}): {reply[:200]!r}") from exc
-    if not isinstance(value, dict):
-        raise GraphError(f"the reply is not a JSON object: {reply[:200]!r}")
-    return value
+class RelationReply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source: str
+    target: str
+    description: str = ""
 
 
-def _items(value: dict[str, Any], field: str) -> list[dict[str, Any]]:
-    if field not in value:  # "nothing found" is an empty list, not a missing field
-        raise GraphError(f"the reply has no {field!r} list: {value!r:.200}")
-    items = value[field]
-    if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
-        raise GraphError(f"{field!r} must be a list of objects, got {items!r:.200}")
-    return items
+class GraphReply(BaseModel):
+    """What the model is asked for, as a strict JSON schema (S16): both lists, possibly empty."""
+
+    model_config = ConfigDict(extra="forbid")
+    entities: list[EntityReply]
+    relations: list[RelationReply]
 
 
-def _text(item: dict[str, Any], field: str, *, required: bool) -> str:
-    value = item.get(field)
-    if value is None and not required:
-        return ""
-    if not isinstance(value, str):
-        raise GraphError(f"{field!r} must be a string, got {item!r:.200}")
-    return value.strip()
-
-
-def parse_graph(reply: str) -> ChunkGraph:
-    """The graph in a model's reply: `{"entities": [{name, type}], "relations": [{source,
-    target, description}]}` — both lists present, possibly empty — perhaps in a code fence. Blank
-    names, repeated entities and
-    relations, and relations from an entity to itself are dropped; a relation end that is not
-    among the entities is added as one (without a type). Anything else malformed raises."""
-    value = _json_object(reply)
+def to_graph(reply: GraphReply) -> ChunkGraph:
+    """The graph in a model's reply. Blank names, repeated entities and relations, and relations
+    from an entity to itself are dropped; a relation end that is not among the entities is added
+    as one (without a type)."""
     entities: dict[str, Entity] = {}
-    for item in _items(value, "entities"):
-        name = _text(item, "name", required=True)
+    for e in reply.entities:
+        name = e.name.strip()
         key = entity_key(name)
         if key and key not in entities:
-            entities[key] = Entity(key, name, _text(item, "type", required=False))
+            entities[key] = Entity(key, name, e.type.strip())
     relations: dict[tuple[str, str], Relation] = {}
-    for item in _items(value, "relations"):
-        ends = [_text(item, "source", required=True), _text(item, "target", required=True)]
+    for r in reply.relations:
+        ends = [r.source.strip(), r.target.strip()]
         source, target = (entity_key(e) for e in ends)
         if not source or not target or source == target or (source, target) in relations:
             continue
         for key, name in ((source, ends[0]), (target, ends[1])):
             entities.setdefault(key, Entity(key, name, ""))
-        description = _text(item, "description", required=False)
-        relations[(source, target)] = Relation(source, target, description)
+        relations[(source, target)] = Relation(source, target, r.description.strip())
     return ChunkGraph(tuple(entities.values()), tuple(relations.values()))
 
 
@@ -122,12 +109,20 @@ class GraphExtractor:
 
     def extract(self, chunks: list[Chunk]) -> list[ChunkGraph]:
         """One graph per chunk, in chunk order."""
-        return self._calls.map(
-            lambda c: parse_graph(
-                self._calls.complete(render_pair(*TEMPLATES, passage=c.text)).text
-            ),
-            chunks,
-        )
+        return self._calls.map(self._one, chunks)
+
+    def _one(self, chunk: Chunk) -> ChunkGraph:
+        """A reply off the schema is asked for once more; a failed call is not (lite-model
+        already retried it)."""
+        messages = render_pair(*TEMPLATES, passage=chunk.text)
+        try:
+            return to_graph(self._calls.structured(messages, GraphReply))
+        except BadReply:
+            log.warning("graph reply for chunk %s is not a graph; asking once more", chunk.chunk_id)
+        try:
+            return to_graph(self._calls.structured(messages, GraphReply))
+        except BadReply as exc:
+            raise GraphError(f"chunk {chunk.chunk_id}: {exc}") from exc
 
 
 # --- query ----------------------------------------------------------------------------------------

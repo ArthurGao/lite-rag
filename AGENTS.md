@@ -21,7 +21,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S0–S15 done** (2026-11-08/18; S15: every LLM call goes through lite-model 0.2.0 — roles `answer` / `contextual` / `graph`, request bodies and index identity unchanged, design §12 S15 record; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
+**S0–S16 done** (2026-11-08/19; S16: graph extraction asks for a reply held to a JSON schema (`GraphReply`), once more if still off it — design §12 S16 record; S15: every LLM call goes through lite-model 0.2.0 — roles `answer` / `contextual` / `graph`, request bodies and index identity unchanged, design §12 S15 record; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
 lite-eval, numbers identical to before; S13: the grounded judge from lite-eval E5 calibrated on a
 constructed set and run on real `literag ask` answers, `literag eval-answers`; S14: answer correctness (`key_fact`), `response_model`, and the measured effect of
 LiteLLM auto-routing on answers — design §12 S14 record). The owner's direction
