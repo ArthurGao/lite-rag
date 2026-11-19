@@ -355,6 +355,7 @@ lite-rag/
 | S15 迁到 lite-model | LLM 调用改由 lite-model 0.2.0 完成：三处 LLM 配置变成 `answer` / `contextual` / `graph` 三个 role（后两个不可路由、模型固定在 `host_roles`）；`RoleLLM`；`model_id` 改成实际回答的模型，`response_model` 删除；截断算错误；旧配置键拒绝并说明去处；删掉旧客户端 | 迁移前录下的 5 个请求（三个 role 的默认、OpenAI 兼容厂商全参数、Anthropic）逐字段相同；索引身份（评测 kb 名）不变；`literag eval`（contextual、graph）和 `eval-answers` 前后一致；`-m ollama` 通过 |
 | S16 图抽取用结构化输出 | graph role 的回复受 JSON schema 约束（lite-model `structured()`，`GraphReply`）；仍不合 schema 的回复用同一个 prompt 再要一次，第二次仍不合就整篇失败；`CODE_VERSION` 2（图 kb 的身份变了） | 单测：请求带 schema、不合 schema 再要一次且只一次、调用失败不重复、日志不带回复；请求体录制只多 `response_format`；之前 10 次里 7 次坏 JSON 的 chunk 用结构化输出 10 次都合法；`literag eval` graph-hybrid 3 次全部完成 |
 | S17 索引角色默认用小模型 | `contextual`、`graph` 默认 `ollama/qwen3:1.7b`、不思考；`eval/configs/*-8b.yaml` 写回 8b 作对照 | 单测：两个索引角色的默认 id 和参数、顶层设置不影响它们；8b 对照配置解析到 S17 之前的设置；检索和回答评测（KB 2026-11-19）不比 8b 差 |
+| S18 接 lite-cache L1 | `cache` extra（lite-cache v0.1.0 release wheel，默认关）；`cache` 配置（`enabled`、`roles`、`ttl_s`、`schema`、`question_log`），用 lite-rag 的 `database_url`、只支持 PG；开着时 runtime 的 lite-model 注册 `CacheHook`；`contextual`、`graph`、`answer` 的调用都在 `call_context(scope="literag/<namespace>")` 里（lite-cache 设计 §0、§9）；`BoundedLLM.map` 按项 `copy_context()`（lite-model 0.2.1 的 `Bounded.map` 线程不继承 contextvar）；`Completion` / `Answer` 带 `cached`，CLI 标出缓存答案；`ask()` 可选的提问日志（JSONL） | 关闭时与之前等价（请求体、索引身份、回答都不变，不建 lite-cache 的 schema）；开启时：换 embedding 后 `reindex --into` 新 kb，`contextual` / `graph` 不发请求，产出的上下文和图与第一次逐字相同；同一问题第二次 `ask` 不调用 LLM，`cached` 为真；两个 namespace 互不命中；`contextual` 并发大于 1 时也命中；`roles` 里没有的 role 不缓存；store 不是 PG 时开启报 `ConfigError`；提问日志关闭时不写文件 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -691,3 +692,28 @@ lite-rag/
     `max_tokens` 参数名和思考默认不同（中，**不改**：lite-model S0 实测 LiteLLM 1.108.9 经 `ollama_chat/` 两个参数名都生效、
     不设 `reasoning_effort` 时两边都开思考且思考不进回答正文，两次实验的输出 token 也接近）、路由延迟含模型切换（低，记为局限）。
 
+**S18（2026-11-19）接 lite-cache L1。**
+- `cache` extra（lite-cache v0.1.0 release wheel）与 `cache` 配置（`enabled` 默认关、`roles`、`ttl_s`、`schema`、`question_log`、
+  `prompt_secret_env`）；只支持 PG，用 lite-rag 自己的 `database_url`；`cache.schema` 不能与 `store.schema` 相同。缓存不进索引身份。
+- runtime 的 lite-model 注册 lite-cache 的 `CacheHook`（`RagRuntime(model=…)` 可注入，测试用录制 transport）；`contextual`、`graph`、
+  `answer` 的调用各自在 `cache_context` 里（scope `literag/<namespace>`，`roles` 里没有的 role 照旧不缓存）；lite-cache 的错误转成
+  lite-rag 的 `StoreError`（503），读失败不发请求。
+- **发现**：§6 的来源块 nonce 每个 prompt 随机，请求永不重复，L1 一次也命中不了（写入成功、hits 为 0）。主人选方案 A：缓存的调用在
+  `keyed_nonces` 里渲染，nonce = `HMAC-SHA256(密钥, 用占位 tag 渲染的 prompt)` 的前 12 位十六进制；密钥来自 `LITERAG_PROMPT_SECRET`
+  （≥32 字符且至少 12 种不同字符，否则 `ConfigError`；Codex 指出长度证明不了随机，挡住明显重复的值，README 写明用 `openssl rand -hex 32` 生成）。不知道密钥算不出 nonce，强度与随机 nonce 相同（48 位）；缓存关闭或该 role 不缓存时仍是随机 nonce。
+- **发现**：lite-model 0.2.1 的 `Bounded.map` 用普通线程池，工作线程不继承 contextvar，`call_context` 到不了 hook，`contextual` 并发 > 1
+  时缓存静默失效（并发 4 时 hook 看到的 scope 全是 None）。`BoundedLLM.map` 按项 `copy_context()` 绕过；lite-model 0.3.0 计划里修根上。
+- `Completion` / `Answer` 带 `cached`；CLI 标 `(cached answer …)`，HTTP 回答多一个 `cached` 字段（只增不改）；`ask()` 可选的提问日志。
+- 检查：单测 + 集成 556 个、`-m ollama` 9 个；变异：去掉 keyed nonce 4 个缓存测试变红，去掉 `copy_context` 并发测试变红（测试文本起初只切出 1 个 chunk，
+  `Bounded.map` 走串行，这条变异没被抓住，改成 4 段后抓住），去掉 `Answer.cached` 3 个测试变红。`-m ollama` 的真实往返没跑：本机
+  Ollama 当时没起，随后 `brew services run ollama` 起来补跑：`-m ollama` 9 个全过，其中新加的真实往返（生产路径
+  `RagEngine.from_settings`，qwen3:8b）第二次 ask `cached` 为真、hits 1 stored 1；去掉注册 hook 时它变红。
+- **收尾 review**：`/simplify`（4 个角度）修了：`cache.schema` 拒绝 `public` / `information_schema` / `pg_*`（与 store 共用
+  `sql_identifier`，先红）；开着缓存时 `from_settings` 就检查 extra 和密钥（像 reranker，先红）；`close()` 从注入的模型上撤销 hook
+  （先红）；带密钥时 `render_pair` 只渲染一次；`cache.py` 的 extra 导入和错误转换各只一处；测试共用 `tests/chat.py`。不改：密钥存进
+  `CacheBinding`（第一次进 `cache_context` 时模型和 binding 还没建）、`prompt_key` 改用 `extras.api_key`（报错说 API key）。
+  Codex 1 条（见上，密钥强度）。独立的整分支 review（"修完可合并"）：重要 2 条——**问题文本没有像文档那样转义，带密钥时固定占位符
+  会被问题里同样的字符串冒充成真 tag**，改为每次渲染用不可预测的随机占位符、算 HMAC 前把它规范成固定标记（先红：问题里的占位符
+  多出一个真 tag）；注入的模型上 hook 重名时把 lite-model 的错误转成 lite-rag 的 `ConfigError`（先红）。次要：reindex 测试也比对
+  图、补 ingest 时读缓存失败的测试、测试关闭 runtime、用公开的 `hooks[name]`、CLI 对缓存答案写 `saved` 而不是 `tokens`（先红）、
+  提问日志加锁（未测：交错难以稳定复现）。换 `LITERAG_PROMPT_SECRET` 等于让全部缓存失效（README 已写）。

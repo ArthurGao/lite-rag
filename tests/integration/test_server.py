@@ -170,6 +170,7 @@ def test_ask_answers_through_the_api(store: PgStore, keys: dict[str, str]) -> No
             "/v1/kbs/c-1/ask", headers=h, json={"question": "How long do refunds take?"}
         ).json()
     assert answer["status"] == "answered" and answer["citations"][0]["doc_id"] == "refund"
+    assert answer["cached"] is False  # S18: an added field (lite-cache off here)
 
 
 def test_an_upstream_failure_is_reported_without_its_detail(

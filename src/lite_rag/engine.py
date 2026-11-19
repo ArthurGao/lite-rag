@@ -23,9 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lite_model import Model
+import lite_model
+from lite_model import LiteModel
+from lite_model.hooks import Registration
 
 from lite_rag.answer import Answer, check_citations, prompt
+from lite_rag.cache import CacheBinding, cache_context, check_cache, log_question, open_cache
 from lite_rag.chunking import build_chunker, chunk_context, embedding_text
 from lite_rag.config import Mode, RetrievalPath, Role, Settings
 from lite_rag.contextual import Contextualizer
@@ -95,9 +98,12 @@ class RagRuntime:
         llm: LLM | None = None,
         context_llm: LLM | None = None,
         graph_llm: LLM | None = None,
+        model: LiteModel | None = None,
     ) -> None:
         """`reranker` and the LLMs are built from `settings` on first use when not given, so a
-        search-only runtime never needs an LLM key or the rerank model."""
+        search-only runtime never needs an LLM key or the rerank model. `model`: the lite-model
+        every role not given uses (default: built from `settings.llm`); the cache hook goes on
+        it."""
         self.settings = settings
         self.store = store
         self.embedder = embedder
@@ -105,7 +111,9 @@ class RagRuntime:
         # semantic chunking embeds sentences with the kb's own embedder (and its cache)
         self.chunker = build_chunker(settings.chunking, self.counter, embedder.embed_documents)
         self._reranker = reranker
-        self._model: Model | None = None  # lite-model, for every role not given
+        self._model: LiteModel | None = model  # lite-model, for every role not given
+        self._cache: CacheBinding | None = None  # lite-cache, when settings.cache.enabled (S18)
+        self._cache_hook: Registration | None = None
         self._llm = llm
         self._context_llm = context_llm
         self._contextualizer: Contextualizer | None = None
@@ -116,7 +124,10 @@ class RagRuntime:
     @classmethod
     def from_settings(cls, settings: Settings, *, max_connections: int = 4) -> "RagRuntime":
         """`max_connections`: the store's pool (the server passes its worker count, so no
-        request waits on the pool)."""
+        request waits on the pool). An enabled cache is checked here (its extra and prompt
+        secret), like the reranker: a server must not start healthy and fail on a request."""
+        if settings.cache.enabled:
+            check_cache(settings)
         store = open_store(settings.store, settings.database_url, max_connections=max_connections)
         try:
             embedder = build_embedder(settings.embedding, cache=store)
@@ -163,6 +174,12 @@ class RagRuntime:
         use; the caller holds the lock."""
         if self._model is None:
             self._model = build_model(self.settings.llm)
+        if self.settings.cache.enabled and self._cache is None:
+            self._cache = open_cache(self.settings)
+            try:
+                self._cache_hook = self._model.hooks.register(self._cache.hook)
+            except lite_model.ConfigError as exc:  # e.g. the host registered its own CacheHook
+                raise ConfigError(f"cannot register lite-cache on this model: {exc}") from exc
         return RoleLLM(self._model, role)
 
     def contextualizer(self) -> Contextualizer:
@@ -187,6 +204,10 @@ class RagRuntime:
             return self._graph_extractor
 
     def close(self) -> None:
+        if self._cache_hook is not None:  # an injected model may outlive this runtime
+            self._cache_hook.remove()
+        if self._cache is not None:
+            self._cache.close()
         self.store.close()
 
 
@@ -278,16 +299,14 @@ class RagEngine:
             return Upserted(doc_id, 0, skipped=True)
         doc = Document(doc_id, title, text, source, meta, pages)
         parents, chunks = self._chunker.split_parents(doc)
-        contexts: list[str | None] = (
-            list(self.runtime.contextualizer().contexts(doc, chunks))
-            if self._settings.chunking.contextual.enabled
-            else [None] * len(chunks)
-        )
-        graphs = (
-            self.runtime.graph_extractor().extract(chunks)
-            if self._settings.graph.enabled
-            else [ChunkGraph()] * len(chunks)
-        )
+        contexts: list[str | None] = [None] * len(chunks)
+        if self._settings.chunking.contextual.enabled:
+            with cache_context(self._settings, self.namespace, "contextual"):
+                contexts = list(self.runtime.contextualizer().contexts(doc, chunks))
+        graphs = [ChunkGraph()] * len(chunks)
+        if self._settings.graph.enabled:
+            with cache_context(self._settings, self.namespace, "graph"):
+                graphs = self.runtime.graph_extractor().extract(chunks)
         inputs = [embedding_text(c, ctx) for c, ctx in zip(chunks, contexts, strict=True)]
         vectors = self._embedder.embed_documents(inputs) if inputs else []
         indexed = [
@@ -531,7 +550,10 @@ class RagEngine:
     ) -> Answer:
         """Search, then let the LLM answer from the hits only, citing them as [n] (design §6).
         Citations to numbers that were not given are removed and reported in `dropped`. With
-        no hits the LLM is not called."""
+        no hits the LLM is not called. With `cache.question_log` set, the question is logged
+        first (S18)."""
+        if self._settings.cache.question_log is not None:
+            log_question(self._settings.cache.question_log, self.namespace, question)
         hits = self.search(kb, question, top_k=top_k, mode=mode, rerank=rerank, where=where)
         if not hits:
             return Answer(
@@ -542,7 +564,8 @@ class RagEngine:
                 sources=[],
                 model_id=None,
             )
-        completion = self.runtime.llm().complete(prompt(question, hits))
+        with cache_context(self._settings, self.namespace, "answer", question):
+            completion = self.runtime.llm().complete(prompt(question, hits))
         text, citations, dropped = check_citations(completion.text, hits)
         return Answer(
             question=question,
@@ -553,6 +576,7 @@ class RagEngine:
             model_id=completion.model_id,
             usage=completion.usage,
             dropped=dropped,
+            cached=completion.cached,
         )
 
     def _rerank(

@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -59,3 +60,39 @@ def test_key_create_prints_the_key_once_and_a_config_entry_with_its_hash() -> No
     entry = ApiKeyConfig(**json.loads(out.strip().splitlines()[-1]))
     assert entry.sha256 == key_hash(key) and key not in out.splitlines()[-1]
     assert (entry.namespaces, entry.kbs, entry.mode) == (["steward/*"], ["*"], "write")
+
+
+def _answered(monkeypatch: pytest.MonkeyPatch, *, cached: bool) -> None:
+    """`literag ask` over an engine stub: only the CLI's rendering is under test here."""
+    from contextlib import contextmanager
+
+    from lite_rag import cli
+    from lite_rag.answer import Answer
+
+    answer = Answer("q?", "answered", "Ratio 1:16 [1].", [], [], "ollama/qwen3:8b", cached=cached)
+
+    class Stub:
+        def ask(self, *args: Any, **kwargs: Any) -> Answer:
+            return answer
+
+    @contextmanager
+    def engine(*args: Any) -> Any:
+        yield Stub()
+
+    monkeypatch.setattr(cli, "_engine", engine)
+
+
+def test_ask_marks_a_cached_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    _answered(monkeypatch, cached=True)
+    out = CliRunner().invoke(app, ["ask", "kb", "q?"])
+    assert out.exit_code == 0, out.output
+    assert "(cached answer" in out.output
+    assert "saved" in out.output  # its tokens were not spent again (final review S18)
+    _answered(monkeypatch, cached=False)
+    assert "cached" not in CliRunner().invoke(app, ["ask", "kb", "q?"]).output
+
+
+def test_ask_json_carries_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    _answered(monkeypatch, cached=True)
+    out = CliRunner().invoke(app, ["ask", "kb", "q?", "--json"])
+    assert json.loads(out.output)["cached"] is True

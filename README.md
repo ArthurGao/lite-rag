@@ -205,6 +205,7 @@ llm:                                                   # lite-model's config (it
   roles: {graph: {model: qwen3:14b}}                   # contextual / graph: their own model (default qwen3:1.7b; index identity)
 server: {host: 127.0.0.1, port: 8700}
 loader: {pdf: pypdf}                                   # or docling
+cache: {enabled: false, roles: [answer, contextual, graph]}   # lite-cache L1 (extra `cache`), below
 ```
 
 Keep `LITERAG_DATABASE_URL` and API keys in the environment; a key is read from `api_key_env` or
@@ -225,6 +226,28 @@ went.
 | `pdf` | PDF text extraction with pypdf |
 | `docling` | PDF / DOCX to Markdown with docling (large: pulls in torch) |
 | `chonkie` | chonkie's semantic chunker, for comparison |
+| `cache` | lite-cache: repeated model calls answered from PostgreSQL |
+
+### Cache
+
+With the `cache` extra and `cache.enabled: true`, a model call that was made before is answered
+from PostgreSQL ([lite-cache](https://github.com/ArthurGao/lite-cache), schema `cache.schema`,
+default `lite_cache`, in lite-rag's own database) instead of calling the model again:
+
+- **index roles** (`contextual`, `graph`): rebuilding the same chunks — `literag reindex --into` a new
+  kb after changing the embedding model, say — sends no context or graph calls again;
+- **answers**: the same question over the same retrieved chunks returns the earlier answer, marked
+  `cached` (CLI: `(cached answer …)`; HTTP: `"cached": true`) with the model that wrote it.
+
+Entries are shared within a namespace and never across namespaces (`literag/<namespace>`);
+`cache.roles` picks which roles are cached, `cache.ttl_s` how long an entry lives. Cached calls
+need a secret in `LITERAG_PROMPT_SECRET` — generate it, e.g. `openssl rand -hex 32` (at least 32
+characters; repetitive values are refused, but only randomness makes it safe): source blocks normally
+carry a random nonce per prompt, which would make every request unique; for cached calls the nonce
+is an HMAC of the prompt under that secret instead — the same prompt gives the same request, and a
+document still cannot predict it. Changing the secret changes every nonce, so it invalidates every cached
+entry (the calls are simply made again). `cache.question_log: <path>` appends each `ask` question to a
+JSONL file (for a later replay evaluation). PostgreSQL store only.
 
 ## Evaluation
 

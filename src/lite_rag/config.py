@@ -11,7 +11,7 @@ from typing import Any, ClassVar, Literal, Self
 
 from lite_model import ModelsConfig, RoleConfig, Target
 from lite_model.config import Name, target
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PositiveInt, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -26,6 +26,13 @@ OLLAMA_URL = (
     "http://127.0.0.1:11434"  # the local Ollama server's embeddings (/api); LLMs: lite-model
 )
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+
+
+def sql_identifier(name: str, value: str) -> str:
+    """`value` when it is a lowercase SQL identifier; the setting `name` names it otherwise."""
+    if not IDENTIFIER.match(value):
+        raise ValueError(f"{name} must be a lowercase SQL identifier, got {value!r}")
+    return value
 
 
 Mode = Literal["vector", "bm25", "graph", "hybrid"]
@@ -52,9 +59,7 @@ class StoreConfig(BaseModel):
     @field_validator("schema_name")
     @classmethod
     def _identifier(cls, value: str) -> str:
-        if not IDENTIFIER.match(value):
-            raise ValueError(f"schema must be a lowercase SQL identifier, got {value!r}")
-        return value
+        return sql_identifier("schema", value)
 
 
 class EmbeddingConfig(BaseModel):
@@ -332,6 +337,32 @@ ContextualConfig.model_rebuild()
 GraphConfig.model_rebuild()
 
 
+class CacheConfig(BaseModel):
+    """lite-cache's L1 for lite-rag's model calls (S18; lite-cache design §9). Off by default.
+    Entries live in `schema` of lite-rag's own PostgreSQL; every cached call is scoped to
+    `literag/<namespace>` (lite-cache §0). Not part of a kb's identity: a hit returns what the
+    same request returned before."""
+
+    enabled: bool = False
+    roles: list[Role] = ["answer", "contextual", "graph"]
+    ttl_s: PositiveInt | None = None  # None: until invalidated
+    schema_name: str = Field(default="lite_cache", alias="schema")
+    # `ask()` appends {ts, scope, question} per question (JSONL) when set: for a later replay
+    # evaluation (lite-cache §8). Off by default: questions may be personal.
+    question_log: Path | None = None
+    # The variable holding the secret for source-block nonces of cached calls (design §6): with
+    # random nonces no prompt would repeat; with this key they repeat and stay unpredictable.
+    prompt_secret_env: str = "LITERAG_PROMPT_SECRET"
+
+    @field_validator("schema_name")
+    @classmethod
+    def _identifier(cls, value: str) -> str:
+        # lite-cache's own rule (its design §5): a schema of its own, never a shared or system one
+        if value in ("public", "information_schema") or value.startswith("pg_"):
+            raise ValueError(f"cache.schema {value!r} is shared or a system schema")
+        return sql_identifier("cache.schema", value)
+
+
 class ApiKeyConfig(BaseModel):
     """One API key of the HTTP service (design §7). Only the key's sha256 is configured;
     `literag key create` prints a new key once, with this entry. Access is the intersection of
@@ -375,7 +406,23 @@ class Settings(BaseSettings):
     graph: GraphConfig = GraphConfig()
     rerank: RerankConfig = RerankConfig()
     llm: LLMConfig = LLMConfig()
+    cache: CacheConfig = CacheConfig()
     server: ServerConfig = ServerConfig()
+
+    @model_validator(mode="after")
+    def _cache(self) -> Self:
+        if self.cache.schema_name == self.store.schema_name:
+            raise ValueError(
+                "cache.schema must differ from store.schema (lite-cache owns its schema)"
+            )
+        if self.cache.enabled:
+            if self.store.backend != "postgres":
+                raise ValueError(
+                    "cache needs the postgres backend (lite-cache stores in PostgreSQL)"
+                )
+            if not self.database_url:
+                raise ValueError("cache needs database_url (lite-cache uses lite-rag's PostgreSQL)")
+        return self
 
     @model_validator(mode="after")
     def _graph(self) -> Self:

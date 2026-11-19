@@ -6,22 +6,19 @@ from typing import Any
 
 import httpx2
 import pytest
+from lite_model import Provenance, TextReply, Usage
 from pydantic import ValidationError
 
 from lite_rag.config import LLMConfig, load_settings
 from lite_rag.errors import ConfigError
 from lite_rag.llm import LLMError, Message, RoleLLM, build_model
+from tests.chat import chat_completion
 
 MESSAGES = [Message("system", "Be brief."), Message("user", "Hi")]
 
 
 def _reply(model: str, content: str | None, finish: str = "stop") -> httpx2.Response:
-    return httpx2.Response(200, json={
-        "id": "c", "object": "chat.completion", "created": 0, "model": model,
-        "choices": [{"index": 0, "finish_reason": finish,
-                     "message": {"role": "assistant", "content": content}}],
-        "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
-    })  # fmt: skip
+    return httpx2.Response(200, json=chat_completion(model, content, finish))
 
 
 def _role(handler: Any, role: str = "answer", **llm: Any) -> RoleLLM:
@@ -99,3 +96,37 @@ def test_a_config_a_backend_cannot_honour_fails_before_any_call(
 def test_a_reasoning_effort_typo_fails_at_config_load() -> None:
     with pytest.raises(ValidationError, match="reasoning_effort"):
         load_settings(llm={"reasoning_effort": "hihg"})
+
+
+def test_a_cached_reply_is_marked() -> None:
+    # A hook that answers (lite-cache's hit) marks the completion cached, with the stored
+    # reply's own provenance (lite-cache design §9, lite-rag S18).
+    stored = TextReply(
+        "from the cache",
+        Provenance("answer", "ollama", "qwen3:8b", "qwen3:8b", "local", routed=False),
+        Usage(input=3, output=2),
+    )
+
+    class Hit:
+        name = "hit"
+
+        def before(self, call: Any) -> TextReply:
+            return stored
+
+        def after(self, call: Any, reply: Any) -> None: ...
+
+    sent: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request)
+        return _reply("qwen3:8b", "fresh")
+
+    http = httpx2.Client(transport=httpx2.MockTransport(handler))
+    model = build_model(LLMConfig(), http_client=http)
+    fresh = RoleLLM(model, "answer").complete([Message("user", "Hi?")])
+    model.hooks.register(Hit())
+    hit = RoleLLM(model, "answer").complete([Message("user", "Hi?")])
+    assert (fresh.text, fresh.cached) == ("fresh", False)
+    assert (hit.text, hit.cached, hit.model_id) == ("from the cache", True, "ollama/qwen3:8b")
+    assert hit.usage == {"input": 3, "output": 2}
+    assert len(sent) == 1
