@@ -102,6 +102,9 @@ def test_every_role_sends_the_recorded_request(monkeypatch: pytest.MonkeyPatch) 
     # S16 asks the graph role for a reply held to a JSON schema: the one change since the recording
     schema = {"name": "GraphReply", "schema": strict_schema(GraphReply), "strict": True}
     recorded["graph"]["body"]["response_format"] = {"type": "json_schema", "json_schema": schema}
+    # S17 moves the index roles to the small model without thinking: the other change
+    for role in ("contextual", "graph"):
+        recorded[role]["body"] |= {"model": "qwen3:1.7b", "reasoning_effort": "none"}
     seen = record(monkeypatch)
     assert sorted(seen) == sorted(recorded)
     for case in recorded:

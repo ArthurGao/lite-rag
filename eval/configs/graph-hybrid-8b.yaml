@@ -1,0 +1,6 @@
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+graph: {enabled: true}
+retrieval: {mode: hybrid, hybrid_paths: [vector, bm25, graph]}
+# the graph role on the model it used before S17 (qwen3:8b), to compare with the default
+# (qwen3:1.7b): KB 2026-11-19-lite-small-model-per-role
+llm: {roles: {graph: {model: "qwen3:8b"}}}

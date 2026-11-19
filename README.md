@@ -26,7 +26,8 @@ measure.
   be compared with significance (`lite-eval compare`).
 
 Use it as a Python library or as a service (`literag serve`, Docker image, HTTP API with API keys).
-The default stack (Ollama `bge-m3` + `qwen3:8b`, PostgreSQL/pgvector, jieba) runs locally and costs
+The default stack (Ollama `bge-m3` + `qwen3:8b` for answers + `qwen3:1.7b` for contexts and graphs,
+PostgreSQL/pgvector, jieba) runs locally and costs
 nothing. [llm-steward](https://github.com/ArthurGao/llm-steward) uses it as its knowledge-base
 engine.
 
@@ -63,7 +64,7 @@ Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), [Ollama](https://ol
 host, and PostgreSQL with pgvector ≥ 0.8 (or use the Chroma backend, below).
 
 ```bash
-ollama pull bge-m3 && ollama pull qwen3:8b
+ollama pull bge-m3 && ollama pull qwen3:8b && ollama pull qwen3:1.7b
 uv sync
 cp .env.example .env              # set LITERAG_DATABASE_URL
 uv run literag migrate            # create the schema (lite_rag by default)
@@ -201,7 +202,7 @@ rerank: {enabled: false, model: BAAI/bge-reranker-v2-m3-int8, top_n: 20}
 llm:                                                   # lite-model's config (its README)
   backend: ollama                                      # ollama | openai | anthropic | gateway | litellm
   model: qwen3:8b                                      # the top level (and its call settings) tunes answers only
-  roles: {graph: {model: qwen3:14b}}                   # contextual / graph: their own model (index identity)
+  roles: {graph: {model: qwen3:14b}}                   # contextual / graph: their own model (default qwen3:1.7b; index identity)
 server: {host: 127.0.0.1, port: 8700}
 loader: {pdf: pypdf}                                   # or docling
 ```
@@ -302,7 +303,7 @@ them.
 uv sync --all-extras
 uv run ruff check && uv run ruff format --check && uv run mypy
 uv run pytest                          # unit, contract and integration tests, fake models only
-uv run pytest -m ollama                # opt-in: real Ollama (bge-m3 and qwen3:8b pulled)
+uv run pytest -m ollama                # opt-in: real Ollama (bge-m3, qwen3:8b and qwen3:1.7b pulled)
 uv run --all-extras pytest -m model    # opt-in: real Hugging Face models (the reranker)
 ```
 

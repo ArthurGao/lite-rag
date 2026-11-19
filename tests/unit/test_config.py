@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from lite_rag.config import LLMConfig, load_settings
@@ -133,8 +134,8 @@ def test_graph_is_off_by_default_and_hybrid_keeps_two_paths() -> None:
     s = load_settings()
     assert s.graph.enabled is False
     assert s.retrieval.hybrid_paths == ["vector", "bm25"]
-    # extraction on local qwen3 without thinking: the reply is JSON, not a monologue
-    assert s.llm.role_id("graph") == "ollama/qwen3:8b"
+    # extraction on the small local qwen3 without thinking: the reply is JSON, not a monologue
+    assert s.llm.role_id("graph") == "ollama/qwen3:1.7b"
     assert s.llm.target_of("graph").reasoning_effort == "none"
 
 
@@ -183,7 +184,10 @@ def test_moving_answers_leaves_the_index_roles_on_their_own_model(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     s = load_settings(llm={"backend": "anthropic", "model": "claude-x", "max_output_tokens": 700})
     assert s.llm.role_id("answer") == "anthropic/claude-x"
-    assert s.llm.role_id("contextual") == s.llm.role_id("graph") == "ollama/qwen3:8b"
+    # S17: the index roles default to the small model (answers over its indexes unchanged, KB
+    # 2026-11-19-lite-small-model-per-role), without thinking
+    assert s.llm.role_id("contextual") == s.llm.role_id("graph") == "ollama/qwen3:1.7b"
+    assert s.llm.target_of("contextual").reasoning_effort == "none"
     graph = s.llm.target_of("graph")
     assert (graph.reasoning_effort, graph.max_output_tokens) == ("none", 2048)
     assert s.llm.target_of("contextual").max_output_tokens == 1024
@@ -223,7 +227,7 @@ def test_top_level_call_settings_tune_answers_only() -> None:
         "none", 0.3, 300
     )  # fmt: skip
     assert (contextual.reasoning_effort, contextual.temperature, contextual.max_output_tokens) == (
-        None, 0.0, 1024
+        "none", 0.0, 1024
     )  # fmt: skip
     assert (graph.reasoning_effort, graph.temperature, graph.max_output_tokens) == (
         "none", 0.0, 2048
@@ -231,3 +235,18 @@ def test_top_level_call_settings_tune_answers_only() -> None:
     # the answer role's own setting wins over the top level
     both = load_settings(llm={"temperature": 0.3, "roles": {"answer": {"temperature": 0.7}}})
     assert both.llm.target_of("answer").temperature == 0.7
+
+
+@pytest.mark.parametrize(
+    ("config", "role", "model", "effort"),
+    [("chunk-contextual-8b", "contextual", "qwen3:8b", None),
+     ("graph-hybrid-8b", "graph", "qwen3:8b", "none")],
+)  # fmt: skip
+def test_the_8b_eval_configs_rebuild_an_index_role_as_before_s17(
+    config: str, role: str, model: str, effort: str | None
+) -> None:
+    # the comparison configs for the S17 default: the role as it was before (KB 2026-11-19)
+    path = Path(__file__).parents[2] / "eval" / "configs" / f"{config}.yaml"
+    s = load_settings(**yaml.safe_load(path.read_text()))
+    target = s.llm.target_of(role)
+    assert (s.llm.role_id(role), target.reasoning_effort) == (f"ollama/{model}", effort)

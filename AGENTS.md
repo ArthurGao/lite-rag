@@ -21,7 +21,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S0–S16 done** (2026-11-08/19; S16: graph extraction asks for a reply held to a JSON schema (`GraphReply`), once more if still off it — design §12 S16 record; S15: every LLM call goes through lite-model 0.2.0 — roles `answer` / `contextual` / `graph`, request bodies and index identity unchanged, design §12 S15 record; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
+**S0–S17 done** (2026-11-08/19; S17: the index roles `contextual` / `graph` default to `qwen3:1.7b` without thinking — answers over their indexes unchanged, design §12 S17 record; S16: graph extraction asks for a reply held to a JSON schema (`GraphReply`), once more if still off it — design §12 S16 record; S15: every LLM call goes through lite-model 0.2.0 — roles `answer` / `contextual` / `graph`, request bodies and index identity unchanged, design §12 S15 record; S11: graph retrieval, local mode, PostgreSQL only; S12: `literag eval` runs on
 lite-eval, numbers identical to before; S13: the grounded judge from lite-eval E5 calibrated on a
 constructed set and run on real `literag ask` answers, `literag eval-answers`; S14: answer correctness (`key_fact`), `response_model`, and the measured effect of
 LiteLLM auto-routing on answers — design §12 S14 record). The owner's direction
@@ -32,7 +32,7 @@ llm-steward's needs still come first.
 Decided (2026-11-08): separate public repo; library + optional HTTP service (`literag serve`, Docker image) over one
 `RagEngine`; storage is PostgreSQL + pgvector by default (vectors, own BM25 postings and the document registry in one
 transaction), Chroma + SQLite optional; own BM25 with jieba;
-Ollama for local embedding (`bge-m3`) and chat (`qwen3:8b`); LLM switchable between `ollama`, `openai`
+Ollama for local embedding (`bge-m3`) and chat (`qwen3:8b` answers, `qwen3:1.7b` contexts and graphs); LLM switchable between `ollama`, `openai`
 (any OpenAI-compatible endpoint, including llm-gateway) and `anthropic` — through lite-model since S15 (also
 `gateway`, `litellm`).
 
@@ -72,7 +72,7 @@ it pins the OpenAI and Anthropic SDKs), Jinja2, pytest, ruff, mypy. Ollama on th
 
 ```
 uv run pytest                 # unit + integration, fakes only
-uv run pytest -m ollama       # opt-in: real Ollama (bge-m3 / qwen3:8b must be pulled)
+uv run pytest -m ollama       # opt-in: real Ollama (bge-m3 / qwen3:8b / qwen3:1.7b must be pulled)
 uv run --all-extras pytest -m model   # opt-in: real Hugging Face models (the reranker, ~0.6 GB once)
 uv run --all-extras literag eval -c eval/configs/chunk-markdown.yaml -c eval/configs/mode-vector.yaml   # compare configs
 uv run --with ranx==0.3.21 --all-extras literag eval -c … --crosscheck   # also recompute the metrics with ranx

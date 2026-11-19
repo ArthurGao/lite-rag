@@ -223,7 +223,7 @@ llm:                      # lite-model 的 ModelsConfig（它的设计 §4），
   model: qwen3:8b         # 顶层的 backend、model 和调用参数只调 answer（和 S15 之前的 `llm` 一样）
   max_output_tokens: 1024
   connect_timeout_s: 5
-  roles:                  # contextual、graph 默认固定在 ollama/qwen3:8b（graph 不思考、2048 token），逐字段可改
+  roles:                  # contextual、graph 默认固定在 ollama/qwen3:1.7b、不思考（S17；graph 2048 token），逐字段可改
     graph: {model: qwen3:14b}
   backends:               # 同名逐字段改：openai 兼容厂商用 openai 这个名字，记录仍是 openai/<model>
     openai: {base_url: "https://api.deepseek.com/v1", api_key_env: DEEPSEEK_API_KEY}
@@ -354,6 +354,7 @@ lite-rag/
 | S14 回答对不对与自动路由 | 金标题的 `key_fact` 和 `eval-answers` 的 `regex` 评分器；`response_model`（LLM 响应写的模型）一路带到 `ask` 和评测输出；`eval-answers` 关掉输出缓存；四个对比配置（直连 Ollama 8b，经 LiteLLM Proxy 的 small / workhorse / smart-router） | `key_fact` 标签按构造（匹配合格回答、不匹配题目、不匹配改数字和换答案的回答）；全有或全无；缓存关闭（第二次运行重新回答）；FakeLLM：`response_model` 取自响应、评测输出带上、未检查时报告写明；四个配置 × 2 次真实运行，逐条读未通过的回答，结果记进 KB 和 lite-model 设计 §15 |
 | S15 迁到 lite-model | LLM 调用改由 lite-model 0.2.0 完成：三处 LLM 配置变成 `answer` / `contextual` / `graph` 三个 role（后两个不可路由、模型固定在 `host_roles`）；`RoleLLM`；`model_id` 改成实际回答的模型，`response_model` 删除；截断算错误；旧配置键拒绝并说明去处；删掉旧客户端 | 迁移前录下的 5 个请求（三个 role 的默认、OpenAI 兼容厂商全参数、Anthropic）逐字段相同；索引身份（评测 kb 名）不变；`literag eval`（contextual、graph）和 `eval-answers` 前后一致；`-m ollama` 通过 |
 | S16 图抽取用结构化输出 | graph role 的回复受 JSON schema 约束（lite-model `structured()`，`GraphReply`）；仍不合 schema 的回复用同一个 prompt 再要一次，第二次仍不合就整篇失败；`CODE_VERSION` 2（图 kb 的身份变了） | 单测：请求带 schema、不合 schema 再要一次且只一次、调用失败不重复、日志不带回复；请求体录制只多 `response_format`；之前 10 次里 7 次坏 JSON 的 chunk 用结构化输出 10 次都合法；`literag eval` graph-hybrid 3 次全部完成 |
+| S17 索引角色默认用小模型 | `contextual`、`graph` 默认 `ollama/qwen3:1.7b`、不思考；`eval/configs/*-8b.yaml` 写回 8b 作对照 | 单测：两个索引角色的默认 id 和参数、顶层设置不影响它们；8b 对照配置解析到 S17 之前的设置；检索和回答评测（KB 2026-11-19）不比 8b 差 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -418,6 +419,17 @@ lite-rag/
     `_replies` 挪进 `FakeLLM`（只有一个测试文件用）。
   - Codex：第一轮 1 条（重试改变了图的生成方式，应该进身份）——改成结构化输出后 `CODE_VERSION` 已升；第二轮 1 条不成立：
     "fake 的校验比发给模型的 schema 宽"——真实路径也是 `model_validate_json`，两边一样宽。
+- **S17 索引角色默认用小模型（2026-11-19）**：所有模块迁到 lite-model 之后，逐个 role 比较 qwen3:1.7b 和 qwen3:8b
+  （KB `global/llm-evals/evals/2026-11-19-lite-small-model-per-role.md`，本机 Ollama，每组 2 次）。
+  - 检索：contextual 1.7b 建库快 3.6×（54 s vs 190 s），graph 快 5.7×（70 s vs 401 s）；hit@5 不变（0.969 / 0.938），但
+    hit@1 掉 0.06–0.11：4 / 3 题的正确 chunk 从第 1 名掉到第 2–3 名，两次都一样。
+  - 回答（8b 回答、校准过的 grounded 评审，"对" = key fact 且 grounded）：contextual 0.938 ×2（8b 建的 0.969 / 0.938），
+    graph 0.969 ×2（8b 建的 0.906 / 0.938）；不经索引的基线 0.938 ×2。每道错题都读过：q12、q04 是基线就错的题，没有新错题；
+    一次 q04 的回答在 answer role 的输出上限处截断（answer role 的问题，不是索引的）。top 5 都交给回答模型，名次 1 → 2 不影响回答。
+  - 所以 `contextual`、`graph` 的默认改成 `ollama/qwen3:1.7b`、`reasoning_effort: none`（contextual 之前没设，现在和测过的配置
+    一样）。answer 不变（8b）。role 的 id 进索引身份：用默认值的已有 contextual / graph kb 身份不再匹配，要重建，或在
+    `llm.roles` 里写回 `qwen3:8b`（`eval/configs/*-8b.yaml` 就是这样，用来对照）。lite-mem 的 `extract` 不换：1.7b 留下更多过时事实，而且不更快。
+  - 需要先 `ollama pull qwen3:1.7b`。只读第一个 hit 的调用方（不经回答）会感到名次的变化，这种情况写回 8b。
 
 ## 13. 待确认
 

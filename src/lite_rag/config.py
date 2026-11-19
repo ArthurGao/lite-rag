@@ -265,23 +265,27 @@ Role = Literal["answer", "contextual", "graph"]
 
 class LLMConfig(ModelsConfig):
     """Design §6, S15: lite-model's configuration (its design §4: `backend`, `model`, `roles`,
-    `backends`, …) with lite-rag's defaults: every role on the local Ollama (qwen3:8b), at most
-    1024 output tokens, a stopped server failing fast (5 s), one retry of the same model.
+    `backends`, …) with lite-rag's defaults: every role on the local Ollama — answers on qwen3:8b,
+    the index roles on qwen3:1.7b without thinking (S17) —, at most 1024 output tokens, a stopped
+    server failing fast (5 s), one retry of the same model.
 
     The top-level `backend` / `model` move answers only; `contextual` and `graph` keep their own
-    (graph: no thinking, 2048 tokens) until `roles` names them, field by field. Backends are
-    named after their type, so a role's id (`ollama/qwen3:8b`), recorded in index identity and on
-    every answer, is the same as before lite-model."""
+    (graph: 2048 tokens) until `roles` names them, field by field. Backends are named after their
+    type, so a role's id (`ollama/qwen3:8b`) is recorded in index identity and on every answer."""
 
     # The index roles keep their own model, as their own sections did before lite-model: moving
     # answers (the top-level `backend` / `model`) must not move them — their model is index
     # identity, and ingest would start calling it (S15).
+    # S17: qwen3:1.7b builds contexts 3.6x and graphs 5.7x faster than 8b; the right chunk drops
+    # from rank 1 to 2-3 on 3-4 of 32 questions, but the 8b answers over its indexes do not change
+    # (KB global/llm-evals/evals/2026-11-19-lite-small-model-per-role.md). "none" turns qwen3's
+    # thinking off on Ollama (7 vs ~350 tokens for a one-line answer, measured 2026-11-08).
     host_roles: ClassVar[Mapping[str, RoleConfig]] = {
-        "contextual": RoleConfig(backend="ollama", model="qwen3:8b", max_output_tokens=1024),
-        # "none" turns qwen3's thinking off on Ollama (7 vs ~350 tokens for a one-line answer,
-        # measured 2026-11-08)
+        "contextual": RoleConfig(
+            backend="ollama", model="qwen3:1.7b", reasoning_effort="none", max_output_tokens=1024
+        ),
         "graph": RoleConfig(
-            backend="ollama", model="qwen3:8b", reasoning_effort="none", max_output_tokens=2048
+            backend="ollama", model="qwen3:1.7b", reasoning_effort="none", max_output_tokens=2048
         ),
     }
     backend: Name = "ollama"
