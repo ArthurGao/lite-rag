@@ -703,6 +703,8 @@ lite-rag/
   （≥32 字符且至少 12 种不同字符，否则 `ConfigError`；Codex 指出长度证明不了随机，挡住明显重复的值，README 写明用 `openssl rand -hex 32` 生成）。不知道密钥算不出 nonce，强度与随机 nonce 相同（48 位）；缓存关闭或该 role 不缓存时仍是随机 nonce。
 - **发现**：lite-model 0.2.1 的 `Bounded.map` 用普通线程池，工作线程不继承 contextvar，`call_context` 到不了 hook，`contextual` 并发 > 1
   时缓存静默失效（并发 4 时 hook 看到的 scope 全是 None）。`BoundedLLM.map` 按项 `copy_context()` 绕过；lite-model 0.3.0 计划里修根上。
+  2026-11-20：升到 lite-model 0.3.0 / lite-cache 0.2.0，lite-model 自己的 `Bounded.map` 带上调用方 context，绕过已删；
+  `test_contextual_concurrency_four_still_hits` 不改照样通过，作为回归测试。
 - `Completion` / `Answer` 带 `cached`；CLI 标 `(cached answer …)`，HTTP 回答多一个 `cached` 字段（只增不改）；`ask()` 可选的提问日志。
 - 检查：单测 + 集成 556 个、`-m ollama` 9 个；变异：去掉 keyed nonce 4 个缓存测试变红，去掉 `copy_context` 并发测试变红（测试文本起初只切出 1 个 chunk，
   `Bounded.map` 走串行，这条变异没被抓住，改成 4 段后抓住），去掉 `Answer.cached` 3 个测试变红。`-m ollama` 的真实往返没跑：本机

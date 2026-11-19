@@ -6,7 +6,6 @@ model answered. A failed call raises `LLMError`; its message never carries upstr
 This module keeps lite-rag's side: `RoleLLM`, one role of a shared lite-model `Model`.
 """
 
-import contextvars
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -103,13 +102,10 @@ class BoundedLLM(RoleLLM):
         self._bounded = model
 
     def map[T, R](self, one: Callable[[T], R], items: Sequence[T]) -> list[R]:
-        """`one` over `items`, in order; up to `concurrency` at once (independent calls). Each
-        item runs in a copy of the caller's context: lite-model 0.2.1's worker threads do not
-        inherit contextvars, so `call_context()` (lite-cache's scope) would not reach the hooks
-        of these calls (S18; lite-model plans the same fix in 0.3.0)."""
-        context = contextvars.copy_context()
-        # A fresh copy per item: one Context cannot be entered by two threads at once.
-        return self._bounded.map(lambda item: context.copy().run(one, item), items)
+        """`one` over `items`, in order; up to `concurrency` at once (independent calls). lite-model
+        0.3.0 runs each item in a copy of the caller's context, so `call_context()` (lite-cache's
+        scope) reaches the hooks of these calls (S18 worked around it here before 0.3.0)."""
+        return self._bounded.map(one, items)
 
 
 # lite-rag's name for an LLM: what the engine and the enhancers take.
