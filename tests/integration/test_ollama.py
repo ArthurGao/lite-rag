@@ -1,5 +1,6 @@
 """Opt-in: the real Ollama server and the real bge-m3 tokenizer (`uv run pytest -m ollama`)."""
 
+import secrets
 from pathlib import Path
 
 import psycopg
@@ -159,3 +160,37 @@ def test_real_graph_extraction_parses_and_links_two_documents() -> None:
     assert "李明" in keys[0] and "李明" in keys[1]  # the same person links the two documents
     assert any("北辰" in k for k in keys[0])
     assert found[0].relations and found[1].relations
+
+
+def test_real_ask_twice_with_the_cache_calls_the_model_once(
+    pg: psycopg.Connection, pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S18 end to end on the production path (RagEngine.from_settings, no injected model): the
+    # second identical question is answered by lite-cache, with the first answer's provenance.
+    cache_schema = "lite_rag_cache_test"
+    drop = psycopg.sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+        psycopg.sql.Identifier(cache_schema)
+    )
+    pg.execute(drop)
+    monkeypatch.setenv("LITERAG_PROMPT_SECRET", secrets.token_urlsafe(32))
+    migrate(pg, TEST_SCHEMA)
+    settings = load_settings(
+        database_url=pg_url,
+        store={"schema": TEST_SCHEMA},
+        llm={"reasoning_effort": "none"},
+        cache={"enabled": True, "schema": cache_schema, "roles": ["answer"]},
+    )
+    engine = RagEngine.from_settings(settings, namespace="e2e")
+    try:
+        engine.upsert_text("faq", "refund", "退款", "退款会在七天内原路退回到您的支付账户。")
+        first = engine.ask("faq", "退款多久能到账？", top_k=1)
+        second = engine.ask("faq", "退款多久能到账？", top_k=1)
+        cache = engine.runtime._cache
+        assert cache is not None
+        [stats] = cache.hook.stats()
+    finally:
+        engine.close()
+        pg.execute(drop)
+    assert (first.cached, second.cached) == (False, True)
+    assert (second.text, second.model_id) == (first.text, "ollama/qwen3:8b")
+    assert (stats.role, stats.hits, stats.stored) == ("answer", 1, 1)

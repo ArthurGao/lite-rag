@@ -46,6 +46,9 @@ class Answer:
     model_id: str | None
     usage: dict[str, int] = field(default_factory=dict)
     dropped: list[int] = field(default_factory=list)
+    # From lite-cache (S18): the same question over the same sources was answered before;
+    # `model_id` and `usage` are that answer's (callers mark it as a cached answer).
+    cached: bool = False
 
 
 def prompt(question: str, hits: list[Hit]) -> list[Message]:

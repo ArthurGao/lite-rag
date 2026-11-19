@@ -44,6 +44,10 @@ sentence-transformers = [
 chroma = [
     "chromadb==1.5.9",
 ]
+# lite-cache (S18): L1 answers for repeated model calls, off by default (`cache.enabled`).
+cache = [
+    "lite-cache",
+]
 server = [
     "fastapi==0.162.2",
     "python-multipart==0.0.33",
@@ -70,6 +74,7 @@ dev = [
     "httpx==0.28.1",
     "chromadb==1.5.9",
     "lite-rag[eval]",  # the eval tests run lite-eval
+    "lite-rag[cache]",  # the cache tests run lite-cache (S18)
 ]
 
 [build-system]
@@ -106,5 +111,6 @@ markers = [
 ]
 
 [tool.uv.sources]
+lite-cache = { url = "https://github.com/ArthurGao/lite-cache/releases/download/v0.1.0/lite_cache-0.1.0-py3-none-any.whl" }
 lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.2.1/lite_model-0.2.1-py3-none-any.whl" }
 lite-eval = { url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.4.1/lite_eval-0.4.1-py3-none-any.whl" }

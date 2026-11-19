@@ -297,7 +297,10 @@ def ask(
     if answer.dropped:
         typer.echo(f"(removed citations to sources that were not given: {answer.dropped})")
     if answer.model_id:
-        typer.echo(f"— {answer.model_id}, tokens {answer.usage}")
+        tokens = f"saved {answer.usage} (cached)" if answer.cached else f"tokens {answer.usage}"
+        typer.echo(f"— {answer.model_id}, {tokens}")
+    if answer.cached:
+        typer.echo("(cached answer: the same question over the same sources was answered before)")
 
 
 @app.command("eval")

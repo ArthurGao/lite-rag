@@ -33,3 +33,6 @@ eval/lite-eval/
 # lite-eval runs and cache of the grounded judge (the dataset and suites are committed)
 eval/judge-grounded/runs/
 eval/judge-grounded/.lite-eval/
+
+# Agent workspaces (superpowers plan ledgers)
+.superpowers/
