@@ -2,6 +2,7 @@
 recording transport, the cache in schema `lite_rag_cache_test` of the test database."""
 
 import json
+import secrets
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, ClassVar
@@ -34,7 +35,7 @@ TEXT = "\n\n".join(
     ]
 )
 QUESTION = "手冲咖啡的粉水比是多少？"
-SECRET = "k7Qp2Lx9Vd4Rm8Tz1Wc6Yb3Nh5Gf0Jas"  # a test value, as `openssl rand` would give
+SECRET = secrets.token_urlsafe(32)  # made per run (43 chars, ~30 distinct): no literal
 
 
 class Endpoint:

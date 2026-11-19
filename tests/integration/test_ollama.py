@@ -1,5 +1,6 @@
 """Opt-in: the real Ollama server and the real bge-m3 tokenizer (`uv run pytest -m ollama`)."""
 
+import secrets
 from pathlib import Path
 
 import psycopg
@@ -171,7 +172,7 @@ def test_real_ask_twice_with_the_cache_calls_the_model_once(
         psycopg.sql.Identifier(cache_schema)
     )
     pg.execute(drop)
-    monkeypatch.setenv("LITERAG_PROMPT_SECRET", "k7Qp2Lx9Vd4Rm8Tz1Wc6Yb3Nh5Gf0Jas")
+    monkeypatch.setenv("LITERAG_PROMPT_SECRET", secrets.token_urlsafe(32))
     migrate(pg, TEST_SCHEMA)
     settings = load_settings(
         database_url=pg_url,
