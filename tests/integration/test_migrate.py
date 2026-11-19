@@ -1,9 +1,14 @@
+from unittest.mock import MagicMock
+
 import psycopg
+import pytest
 from psycopg.conninfo import conninfo_to_dict
 from typer.testing import CliRunner
 
 from lite_rag.cli import app
 from lite_rag.db import check_vector, migrate
+from lite_rag.errors import StoreError
+from lite_rag.stores.pg import PgStore
 from tests.conftest import TEST_SCHEMA
 
 TABLES = {"schema_migrations", "kbs", "documents", "chunks", "postings", "parents"}
@@ -114,3 +119,22 @@ def test_0003_backfills_existing_postings(pg: psycopg.Connection) -> None:
 
     row = pg.execute(f"SELECT length, doc_id FROM {s}.postings").fetchone()
     assert row == (2, "d1")
+
+
+def test_the_vector_extension_is_created_in_public(pg: psycopg.Connection) -> None:
+    # pgvector already exists here, so check the statement sent, not where a fresh install lands.
+    spy = MagicMock(wraps=pg)
+    migrate(spy, TEST_SCHEMA)
+    sent = [str(c.args[0]) for c in spy.execute.call_args_list]
+    created = [q for q in sent if "CREATE EXTENSION" in q]
+    assert created == ["CREATE EXTENSION IF NOT EXISTS vector SCHEMA public"]
+
+
+def test_opening_a_store_on_an_outdated_schema_says_to_migrate(
+    pg: psycopg.Connection, pg_url: str
+) -> None:
+    migrate(pg, TEST_SCHEMA, until="0004_pages_parents_context")
+    with pytest.raises(StoreError, match=r"0005_documents_text, 0006_graph.*literag migrate"):
+        PgStore(pg_url, TEST_SCHEMA)
+    migrate(pg, TEST_SCHEMA)
+    PgStore(pg_url, TEST_SCHEMA).close()  # up to date: opens

@@ -61,7 +61,9 @@ def migrate(conn: psycopg.Connection, schema: str, until: str | None = None) -> 
     """Apply pending migrations to `schema` — up to and including `until` when given; returns
     the versions applied (empty: up to date)."""
     with conn.transaction():
-        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        # In public: the role and the schema often share a name, and "$user" comes first in
+        # search_path, so an unqualified install would land in (and be dropped with) the schema.
+        conn.execute("CREATE EXTENSION IF NOT EXISTS vector SCHEMA public")
         conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
         conn.execute(
             sql.SQL(
@@ -105,3 +107,17 @@ def check_vector(conn: psycopg.Connection) -> None:
     if version < MIN_PGVECTOR:
         found = row[0] if row else "not installed"
         raise StoreError(f"pgvector >= 0.8 is required (found {found})")
+
+
+def pending(conn: psycopg.Connection, schema: str) -> list[str]:
+    """The migration versions not yet applied to `schema` (all of them when it has none)."""
+    table = sql.Identifier(schema, "schema_migrations")
+    applied: set[str] = set()
+    with conn.transaction():
+        row = conn.execute("SELECT to_regclass(%s)", (table.as_string(conn),)).fetchone()
+        if row and row[0] is not None:
+            rows = conn.execute(sql.SQL("SELECT version FROM {}").format(table))
+            applied = {version for (version,) in rows}
+    files = resources.files(MIGRATIONS).iterdir()
+    versions = sorted(f.name.removesuffix(".sql") for f in files if f.name.endswith(".sql"))
+    return [v for v in versions if v not in applied]
