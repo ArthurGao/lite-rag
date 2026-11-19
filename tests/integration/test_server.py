@@ -358,3 +358,31 @@ def test_a_multi_kb_search_needs_access_to_every_kb(
     )
     r = client.post("/v1/search", headers=_h(keys["reader"]), json={"kbs": [], "query": "x"})
     assert r.status_code == 422
+
+
+def test_an_open_server_refuses_browser_pages_and_proxied_requests(store: PgStore) -> None:
+    """Open mode serves direct local clients only: a browser page (Origin) on any site may
+    send requests to loopback, and a proxy in front means the client is not local at all."""
+    settings = load_settings(chunking=CHUNKING)  # no keys
+    with TestClient(create_app(settings, make_runtime(store)), base_url="http://localhost") as c:
+        assert c.get("/health").status_code == 200
+        for header in (
+            {"Origin": "https://evil.example"},
+            {"Origin": "null"},
+            {"X-Forwarded-For": "203.0.113.9"},
+            {"Forwarded": "for=203.0.113.9"},
+            {"X-Real-IP": "203.0.113.9"},
+            {"X-Forwarded-Host": "evil.example"},
+            {"X-Forwarded-Proto": "https"},
+            {"Via": "1.1 proxy.example"},
+        ):
+            r = c.get("/v1/kbs", headers={"X-LiteRag-Namespace": "ns", **header})
+            assert r.status_code == 403, header
+            assert r.json()["title"] == "Forbidden"
+
+
+def test_a_server_with_keys_still_accepts_requests_with_an_origin(
+    client: TestClient, keys: dict[str, str]
+) -> None:
+    r = client.get("/v1/kbs", headers={**_h(keys["writer"]), "Origin": "https://app.example"})
+    assert r.status_code == 200  # keys decide; the Origin rule is for open mode only

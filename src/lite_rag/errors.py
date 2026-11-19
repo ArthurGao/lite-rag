@@ -7,13 +7,31 @@ returned (design §7)."""
 import re
 from typing import ClassVar
 
-_CREDENTIALS = re.compile(r"(?<=://)[^\s/@]+@|(?<=password=)\S+", re.IGNORECASE)
+# (pattern, replacement), the same rules as lite-mem's `redact`: a URL's user:password@; a
+# password-like URL parameter (it ends at the next parameter); a key=value password with any
+# prefix (PGPASSWORD, sslpassword), spaces around '=', quoted or up to the next space.
+_CREDENTIALS = (
+    (re.compile(r"(://)[^\s/@]+@"), r"\1***@"),
+    (re.compile(r"([?&]\w*password=)[^\s&]+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"((?<![?&\w])\w*password\s*=\s*)('[^']*'|\S+)", re.IGNORECASE), r"\1***"),
+    # An HTTP credential, and an API key or token written as key=value / key: value.
+    (re.compile(r"(\bbearer\s+)\S+", re.IGNORECASE), r"\1***"),
+    (
+        re.compile(
+            r"(\b(?:api[_-]?key|(?:access|auth)?[_-]?token|secret)\s*[:=]\s*)\S+", re.IGNORECASE
+        ),
+        r"\1***",
+    ),
+)
 
 
 def redact(text: str) -> str:
     """`text` with credentials removed — a URL's user:password, a conninfo's password — for
-    logging an error whose message is not shown (the server, and in-process callers)."""
-    return _CREDENTIALS.sub(lambda m: "***@" if m.group().endswith("@") else "***", text)
+    logging an error whose message is not shown (the server, and in-process callers). A whole
+    connection string is `db.redact_conninfo`'s job; this scrubs free text quoting one."""
+    for pattern, replacement in _CREDENTIALS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 class LiteRagError(Exception):

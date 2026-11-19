@@ -87,3 +87,20 @@ def test_logged_errors_have_their_credentials_removed() -> None:
     out = redact(msg)
     assert "s3cret" not in out and "hunter2" not in out
     assert "postgresql://***@db:5432/x" in out and "password=***" in out
+
+
+def test_redaction_covers_every_form_libpq_accepts() -> None:
+    from lite_rag.errors import redact
+
+    cases = {
+        "failed: password = hunter2 host=db": "hunter2",  # spaces around '='
+        "failed: password='two words' host=db": "two words",  # a quoted value
+        "env PGPASSWORD=hunter2 was set": "hunter2",  # any *password key
+        "postgresql://u@db/x?sslpassword=hunter2&sslmode=require": "hunter2",  # URL parameter
+        "upstream said api_key=sk-hunter2 is invalid": "sk-hunter2",  # an API key
+        "request had token: hunter2 attached": "hunter2",
+        "sent Authorization: Bearer lrk_ab_hunter2": "lrk_ab_hunter2",  # an HTTP credential
+    }
+    for text, secret in cases.items():
+        out = redact(text)
+        assert secret not in out and "***" in out, out

@@ -23,7 +23,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from lite_rag.config import IDENTIFIER
-from lite_rag.db import check_vector, connection_error, require_url
+from lite_rag.db import check_vector, connection_error, pending, require_url
 from lite_rag.errors import ConfigError, KbNotFound, StoreError
 from lite_rag.keyword import Bm25Inputs, Posting, bm25
 from lite_rag.stores.base import (
@@ -165,6 +165,12 @@ class PgStore:
         self._cache_tables: set[int] = set()
         with self._pool.connection() as conn:
             check_vector(conn)
+            behind = pending(conn, schema)
+        if behind:  # migrations stay explicit (design §4): refuse, never half-work on old tables
+            self._pool.close()
+            raise StoreError(
+                f"schema {schema} is behind (pending: {', '.join(behind)}): run `literag migrate`"
+            )
 
     def close(self) -> None:
         self._pool.close()

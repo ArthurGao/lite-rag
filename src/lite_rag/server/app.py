@@ -69,10 +69,38 @@ class _BodyLimit:
         await self._app(scope, counted, send)
 
 
+class _DirectClientsOnly:
+    """Open mode (no keys) serves direct local clients only: a browser page on any site can send
+    requests to loopback (it carries Origin), and a proxy in front means the client is not local.
+    The Host rule against DNS rebinding is TrustedHostMiddleware's; both run only in open mode."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and NOT_DIRECT & {name for name, _ in scope["headers"]}:
+            detail = "no API keys are configured: only direct local clients"
+            await problem(403, "Forbidden", detail)(scope, receive, send)
+            return
+        await self._app(scope, receive, send)
+
+
 UPLOAD_PATH = re.compile(r"/v1/kbs/[^/]+/files")
 TOO_LARGE = "the request body is larger than the server allows (server.max_upload_mb / max_body_mb)"
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}  # bind addresses allowed without keys
 LOCAL_HOSTS = sorted(f"[{h}]" if ":" in h else h for h in LOOPBACK)  # as Host headers spell them
+# Any of these means a browser page (origin) or a proxy sent the request. ASGI names: lowercase.
+NOT_DIRECT = {
+    b"origin",
+    b"forwarded",
+    b"via",
+    b"x-real-ip",
+    b"x-forwarded-for",
+    b"x-forwarded-host",
+    b"x-forwarded-proto",
+    b"x-forwarded-port",
+    b"x-forwarded-prefix",
+}
 NAMESPACE_HEADER = "X-LiteRag-Namespace"
 PROBLEM = "application/problem+json"
 TITLES = {401: "Unauthorized", 403: "Forbidden"}
@@ -132,6 +160,7 @@ def create_app(settings: Settings, runtime: RagRuntime) -> FastAPI:
         # Open mode is safe only on loopback; a DNS-rebinding web page reaches loopback under
         # its own host name, so only local host names are answered.
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=LOCAL_HOSTS)
+        app.add_middleware(_DirectClientsOnly)
 
     @app.exception_handler(LiteRagError)
     async def _lite_rag(request: Request, exc: LiteRagError) -> JSONResponse:

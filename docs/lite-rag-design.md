@@ -255,7 +255,7 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 - **namespace**：每个请求用 `X-LiteRag-Namespace` 头指定（namespace 本身含 `/`，放进路径不干净）。缺这个头返回 400；key 不覆盖这个 namespace 或这个 kb 返回 403，只读 key 写入也是 403；没有 key 或 key 不认识返回 401，带 `WWW-Authenticate: Bearer`。服务端持有一个 `RagRuntime`，每个请求用 `runtime.engine(namespace)` 取一个引擎，共用 store、embedder、chunker 和模型。
 - **有意不加鉴权的路径**只有 `GET /health`（`?deep=true` 时还会 embed 一条缓存过的探测查询）。
 - **错误格式**：RFC 9457 Problem Details（`application/problem+json`）：`KbNotFound` / `DocumentNotFound` 404、kb 配置不一致（`KbMismatch`）409、调用方的错误（`InvalidRequest`：名字、参数、文件类型、过滤值）400、请求校验失败 422、embedding / LLM 失败 502、存储失败 503、服务自身配置错误（`ConfigError`：extra 没装、API key 没设、模型不存在）500。上游失败和服务配置错误的细节只写日志，不返回给客户端（里面可能有地址、供应商的报错原文或环境变量名）。
-- **请求体上限**：所有请求在解析之前就按大小检查（JSON `server.max_body_mb`，默认 10；上传 `server.max_upload_mb`），超过返回 413。开放模式（不配 key）只接受本机的 Host（防 DNS rebinding）。`GET /v1/kbs` 只列出 key 的 `kbs` 范围之内的 kb。
+- **请求体上限**：所有请求在解析之前就按大小检查（JSON `server.max_body_mb`，默认 10；上传 `server.max_upload_mb`），超过返回 413。开放模式（不配 key）只接受本机的 Host（防 DNS rebinding），并拒绝带 `Origin`（浏览器网页发的）或代理头（`Forwarded`、`X-Forwarded-For`、`X-Real-IP`）的请求，返回 403（2026-11-20，和 lite-mem 一致）。`GET /v1/kbs` 只列出 key 的 `kbs` 范围之内的 kb。
 - **并发**：处理函数都是同步的，FastAPI 放进线程池执行，线程数由 `server.max_workers`（默认 8）限制；启用 rerank 时启动阶段先加载模型。
 - **上传**：`POST /v1/kbs/{kb}/files`（multipart，`file` 加可选的 `doc_id`；默认 `file:<sha256(文件名)>`，同名文件再传就是替换），大小上限 `server.max_upload_mb`（默认 20）。
 - **部署**：仓库自带 `Dockerfile`（python:3.12-slim、非 root、`HEALTHCHECK`；启动时先 `literag migrate`），用环境变量指向 PG 和 Ollama。CI 每次构建镜像并做冒烟测试（/health、401、403、200），**不推送**到任何 registry（2026-11-08 决定）。`deploy/compose.yaml` 示例包含 lite-rag + PG（pgvector）；Ollama 跑在宿主机上（`host.docker.internal`）。
@@ -431,6 +431,17 @@ lite-rag/
     一样）。answer 不变（8b）。role 的 id 进索引身份：用默认值的已有 contextual / graph kb 身份不再匹配，要重建，或在
     `llm.roles` 里写回 `qwen3:8b`（`eval/configs/*-8b.yaml` 就是这样，用来对照）。lite-mem 的 `extract` 不换：1.7b 留下更多过时事实，而且不更快。
   - 需要先 `ollama pull qwen3:1.7b`。只读第一个 hit 的调用方（不经回答）会感到名次的变化，这种情况写回 8b。
+- **跨仓库体检后的修补（2026-11-20）**：整个 lite-ai 跑过一遍后修的三处，各自先写了失败的测试。(1) `CREATE EXTENSION vector`
+  加 `SCHEMA public`：role 和 schema 同名（`lite_rag`）时 `"$user"` 排在 search_path 最前，新库上扩展会装进应用 schema、
+  删 schema 时一起被删；lite-mem 和 llm-steward 早就这样写。(2) 打开 PgStore 时检查未执行的迁移，有就报错并提示
+  `literag migrate`（迁移仍然显式执行，不自动迁移）；本机的应用 schema 曾落后 0004–0006 三个迁移而没人发现。
+  (3) `errors.redact` 改用和 lite-mem 相同的规则：`password = x`（等号两边有空格）、带引号的值、`PGPASSWORD` 这类前缀和 URL 参数里的密码。
+  另外开放模式补上 Origin 和代理头检查（§7），做成和 `TrustedHostMiddleware` 并列的中间件（整个开放模式的规则在一层）。
+  - /simplify：`pending()` 和 lite-cache 的同一份（只列文件名，不读 SQL）；Origin 检查从每个请求的依赖挪到中间件；测试用
+    `MagicMock(wraps=…)` 记录发出的 SQL。没改：检查放在 `PgStore.__init__` 而不是 `open_store`（和 `check_vector` 在一起，
+    直接构造 `PgStore` 的调用方也被覆盖）；打开时多两次往返（每个进程只打开一次）。
+  - Codex 采纳 2 条（先写失败的测试）：`redact` 也遮住 `Authorization: Bearer …`、`api_key=`、`token:`、`secret=`；
+    开放模式也拒绝 `Via`、`X-Forwarded-Host/-Proto/-Port/-Prefix`（lite-mem 同步）。
 
 ## 13. 待确认
 
