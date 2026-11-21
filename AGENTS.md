@@ -1,8 +1,8 @@
 # lite-rag — Agent Guide
 
 lite-rag is a **small, fully local RAG engine built for learning**: own chunking, own BM25, vector search
-in Chroma, RRF fusion, optional cross-encoder rerank, and answer generation through a switchable LLM
-(Ollama / OpenAI-compatible / Anthropic). It is also a KB engine for
+in PostgreSQL + pgvector (Chroma as an optional extra), RRF fusion, optional cross-encoder rerank, graph
+retrieval, and answer generation through lite-model roles (Ollama / OpenAI-compatible / Anthropic). It is also a KB engine for
 [llm-steward](https://github.com/ArthurGao/llm-steward), which imports it in-process.
 
 This file is the shared guide for every coding agent. `CLAUDE.md` imports it.
