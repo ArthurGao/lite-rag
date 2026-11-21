@@ -149,10 +149,13 @@ def test_a_hosted_embedder_needs_its_key(
 def test_each_provider_defaults_to_its_own_endpoint() -> None:
     from lite_rag.embedding import OllamaEmbedder, OpenAICompatEmbedder
 
-    assert OllamaEmbedder(EmbeddingConfig())._base_url == "http://127.0.0.1:11434"
-    assert OpenAICompatEmbedder(EmbeddingConfig(provider="openai"))._base_url == (
+    # S19: these two go through lite-model; the endpoint is the target it resolved
+    assert OllamaEmbedder(EmbeddingConfig()).endpoint == "http://127.0.0.1:11434/v1"
+    assert OpenAICompatEmbedder(EmbeddingConfig(provider="openai")).endpoint == (
         "https://api.openai.com/v1"
     )
+    proxied = EmbeddingConfig(base_url="http://gpu-box:11434/")
+    assert OllamaEmbedder(proxied).endpoint == "http://gpu-box:11434/v1"
     assert VoyageEmbedder(EmbeddingConfig(provider="voyage"))._base_url == (
         "https://api.voyageai.com/v1"
     )

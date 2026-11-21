@@ -22,9 +22,6 @@ from pydantic_settings import (
 from lite_rag.loaders import PdfLoader
 from lite_rag.types import model_id
 
-OLLAMA_URL = (
-    "http://127.0.0.1:11434"  # the local Ollama server's embeddings (/api); LLMs: lite-model
-)
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 

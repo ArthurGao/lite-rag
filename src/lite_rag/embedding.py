@@ -15,16 +15,22 @@ from itertools import batched
 from typing import Any, ClassVar, Literal, Protocol
 
 import httpx2
+import lite_model
+from lite_model import ModelsConfig, RolePolicy, RoleSpec
 
-from lite_rag.config import OLLAMA_URL, EmbeddingConfig
+from lite_rag.config import EmbeddingConfig
 from lite_rag.errors import ConfigError, LiteRagError
 from lite_rag.extras import api_key, require_extra
+from lite_rag.llm import build_model
 from lite_rag.model_profiles import Prefixes, prefixes_for
 from lite_rag.stores.base import VectorCache
 from lite_rag.types import model_id
 
 Sleep = Callable[[float], None]
 Role = Literal["document", "query"]  # APIs with an input type get it per call
+
+ROLE = "embed"  # the lite-model role of the embedders that call through it (S19)
+ROLES = RoleSpec({ROLE: RolePolicy(kind="embed")})  # never routable: index identity
 
 
 class EmbeddingError(LiteRagError):
@@ -86,7 +92,28 @@ class _Prefixing:
         raise NotImplementedError
 
 
-class _HTTPEmbedder(_Prefixing):
+class _ProbedDim(_Prefixing):
+    """The vector size: `dimensions` when configured, else learnt once from the model; every
+    reply is checked against it (part of the index identity, rule 3)."""
+
+    def __init__(self, config: EmbeddingConfig) -> None:
+        super().__init__(config)
+        self._dim = config.dimensions
+
+    @property
+    def dim(self) -> int:
+        if self._dim is None:  # learn it from the model once (set `dimensions` to skip this)
+            self._dim = len(self.embed_query("dimension probe"))
+        return self._dim
+
+    def _check_dim(self, vectors: list[list[float]]) -> None:
+        if vectors and self._dim is not None and len(vectors[0]) != self._dim:
+            raise EmbeddingError(
+                f"{self.model}: expected {self._dim}-d vectors, got {len(vectors[0])}"
+            )
+
+
+class _HTTPEmbedder(_ProbedDim):
     """Batching, bounded concurrency and retry with exponential backoff, for HTTP embedding APIs.
     Each provider declares its facts — `default_url`, `key_env` (where its key comes from by
     default; None: no key unless configured) and `max_batch` (its limit on texts per call) — and
@@ -109,13 +136,6 @@ class _HTTPEmbedder(_Prefixing):
         self._batch = min(config.batch_size, self.max_batch or config.batch_size)
         self._client = client or httpx2.Client(timeout=config.timeout_s)
         self._sleep = sleep
-        self._dim = config.dimensions
-
-    @property
-    def dim(self) -> int:
-        if self._dim is None:  # learn it from the model once (set `dimensions` to skip this)
-            self._dim = len(self.embed_query("dimension probe"))
-        return self._dim
 
     def _embed(self, texts: list[str], role: Role) -> list[list[float]]:
         batches = [list(b) for b in batched(texts, self._batch)]
@@ -131,10 +151,7 @@ class _HTTPEmbedder(_Prefixing):
     def _check(self, vectors: list[list[float]], expected: int) -> None:
         if len(vectors) != expected:
             raise EmbeddingError(f"{self.model}: asked for {expected} vectors, got {len(vectors)}")
-        if vectors and self._dim is not None and len(vectors[0]) != self._dim:
-            raise EmbeddingError(
-                f"{self.model}: expected {self._dim}-d vectors, got {len(vectors[0])}"
-            )
+        self._check_dim(vectors)
 
     def _fitting(self, batch: list[str], role: Role) -> list[list[float]]:
         """One batch. A batch the API refuses as too large (400 / 413 — e.g. Voyage's limit on
@@ -174,38 +191,79 @@ class _HTTPEmbedder(_Prefixing):
         return response.json()
 
 
-class OllamaEmbedder(_HTTPEmbedder):
-    """Ollama's `/api/embed` (local, free)."""
+class _LiteModelEmbedder(_ProbedDim):
+    """An embedder whose calls are lite-model's `embed()` (S19; its design §3.2): batching,
+    bounded concurrency, halving a batch refused as too large, retries of the same model on
+    429 / 5xx / transport errors, the vectors' count and order. lite-rag keeps what is index
+    identity — the provider name, the model, the prefixes (`_Prefixing`) and the dim — and the
+    vector cache (`CachingEmbedder`). The configuration stays lite-rag's own."""
+
+    def __init__(self, config: EmbeddingConfig, client: httpx2.Client | None = None) -> None:
+        super().__init__(config)
+        models = ModelsConfig(
+            backend=self.provider,
+            model=config.model,
+            timeout_s=config.timeout_s,
+            max_retries=config.max_retries,
+            backends={self.provider: self._backend(config)},
+            roles={ROLE: self._role(config)},
+        )
+        self._model = build_model(models, client, roles=ROLES)
+
+    def _backend(self, config: EmbeddingConfig) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _role(self, config: EmbeddingConfig) -> dict[str, Any]:
+        return {"batch_size": config.batch_size, "max_concurrency": config.max_concurrency}
+
+    @property
+    def endpoint(self) -> str | None:
+        """The API root lite-model sends to (its resolved target)."""
+        return self._model.target(ROLE).base_url
+
+    def _embed(self, texts: list[str], role: Role) -> list[list[float]]:
+        try:
+            vectors = self._model.embed(ROLE, texts).vectors
+        except lite_model.ModelError as exc:
+            raise EmbeddingError(str(exc)) from exc
+        self._check_dim(vectors)
+        return vectors
+
+
+class OllamaEmbedder(_LiteModelEmbedder):
+    """Ollama (local, free), through lite-model at its OpenAI-compatible `/v1/embeddings` (its
+    profile's default endpoint): the same vectors as the `/api/embed` lite-rag called before S19
+    (tests/integration/test_ollama.py). `dimensions` is not sent: it was not before, and it is
+    part of the index identity."""
 
     provider = "ollama"
-    default_url = OLLAMA_URL
 
-    def _call(self, batch: list[str], role: Role) -> list[list[float]]:
-        reply = self._post(f"{self._base_url}/api/embed", {"model": self.model, "input": batch}, {})
-        embeddings: list[list[float]] = reply["embeddings"]
-        return embeddings
+    def _backend(self, config: EmbeddingConfig) -> dict[str, Any]:
+        where: dict[str, Any] = {"type": "ollama"}
+        if config.base_url:  # lite-rag's setting is the server's root
+            where["base_url"] = f"{config.base_url.rstrip('/')}/v1"
+        return where
 
 
-class OpenAICompatEmbedder(_HTTPEmbedder):
+class OpenAICompatEmbedder(_LiteModelEmbedder):
     """`POST {base_url}/embeddings` — OpenAI, and the many services that copy its API (DashScope,
-    SiliconFlow, Jina, vLLM, TEI…). Many of those need no key: none unless `api_key_env` is set."""
+    SiliconFlow, Jina, vLLM, TEI…), through lite-model. Many of those need no key: none unless
+    `api_key_env` is set."""
 
     provider = "openai"
-    default_url = "https://api.openai.com/v1"
-    dimensions_field = "dimensions"
 
-    def _call(self, batch: list[str], role: Role) -> list[list[float]]:
-        body: dict[str, Any] = {"model": self.model, "input": batch, **self._role_fields(role)}
-        if self._config.dimensions:
-            body[self.dimensions_field] = self._config.dimensions
-        reply = self._post(f"{self._base_url}/embeddings", body, self._bearer())
-        return [d["embedding"] for d in sorted(reply["data"], key=lambda d: d["index"])]
+    def _backend(self, config: EmbeddingConfig) -> dict[str, Any]:
+        where = {"type": "openai", "base_url": config.base_url or "https://api.openai.com/v1"}
+        if config.api_key_env:
+            return where | {"api_key_env": config.api_key_env}
+        return where | {"keyless": True}
 
-    def _role_fields(self, role: Role) -> dict[str, str]:
-        return {}  # OpenAI's models embed queries and documents alike
+    def _role(self, config: EmbeddingConfig) -> dict[str, Any]:
+        role = super()._role(config)
+        return role | {"dimensions": config.dimensions} if config.dimensions else role
 
 
-class VoyageEmbedder(OpenAICompatEmbedder):
+class VoyageEmbedder(_HTTPEmbedder):
     """Voyage AI `POST /v1/embeddings` (paid): OpenAI's shape plus `input_type`. Voyage prepends
     its own retrieval prompt for that role, so no prefix is added here."""
 
@@ -213,10 +271,13 @@ class VoyageEmbedder(OpenAICompatEmbedder):
     default_url = "https://api.voyageai.com/v1"
     key_env = "VOYAGE_API_KEY"
     max_batch = 1000
-    dimensions_field = "output_dimension"
 
-    def _role_fields(self, role: Role) -> dict[str, str]:
-        return {"input_type": role}
+    def _call(self, batch: list[str], role: Role) -> list[list[float]]:
+        body: dict[str, Any] = {"model": self.model, "input": batch, "input_type": role}
+        if self._config.dimensions:
+            body["output_dimension"] = self._config.dimensions
+        reply = self._post(f"{self._base_url}/embeddings", body, self._bearer())
+        return [d["embedding"] for d in sorted(reply["data"], key=lambda d: d["index"])]
 
 
 class CohereEmbedder(_HTTPEmbedder):

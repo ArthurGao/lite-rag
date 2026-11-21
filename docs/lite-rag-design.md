@@ -1,6 +1,6 @@
 # lite-rag 设计文档
 
-> 状态：S0–S18 已完成（2026-11-08 至 11-19；S18 = lite-cache L1）。实施按第 12 节的阶段推进；某个阶段的行为改变时，在同一次提交里更新本文。
+> 状态：S0–S19 已完成（2026-11-08 至 11-22；S18 = lite-cache L1，S19 = ollama / openai 的 embedding 改走 lite-model）。实施按第 12 节的阶段推进；某个阶段的行为改变时，在同一次提交里更新本文。
 
 ## 1. 概述
 
@@ -362,6 +362,7 @@ lite-rag/
 | S16 图抽取用结构化输出 | graph role 的回复受 JSON schema 约束（lite-model `structured()`，`GraphReply`）；仍不合 schema 的回复用同一个 prompt 再要一次，第二次仍不合就整篇失败；`CODE_VERSION` 2（图 kb 的身份变了） | 单测：请求带 schema、不合 schema 再要一次且只一次、调用失败不重复、日志不带回复；请求体录制只多 `response_format`；之前 10 次里 7 次坏 JSON 的 chunk 用结构化输出 10 次都合法；`literag eval` graph-hybrid 3 次全部完成 |
 | S17 索引角色默认用小模型 | `contextual`、`graph` 默认 `ollama/qwen3:1.7b`、不思考；`eval/configs/*-8b.yaml` 写回 8b 作对照 | 单测：两个索引角色的默认 id 和参数、顶层设置不影响它们；8b 对照配置解析到 S17 之前的设置；检索和回答评测（KB 2026-11-19）不比 8b 差 |
 | S18 接 lite-cache L1 | `cache` extra（lite-cache v0.1.0 release wheel，默认关）；`cache` 配置（`enabled`、`roles`、`ttl_s`、`schema`、`question_log`），用 lite-rag 的 `database_url`、只支持 PG；开着时 runtime 的 lite-model 注册 `CacheHook`；`contextual`、`graph`、`answer` 的调用都在 `call_context(scope="literag/<namespace>")` 里（lite-cache 设计 §0、§9）；`BoundedLLM.map` 按项 `copy_context()`（lite-model 0.2.1 的 `Bounded.map` 线程不继承 contextvar）；`Completion` / `Answer` 带 `cached`，CLI 标出缓存答案；`ask()` 可选的提问日志（JSONL） | 关闭时与之前等价（请求体、索引身份、回答都不变，不建 lite-cache 的 schema）；开启时：换 embedding 后 `reindex --into` 新 kb，`contextual` / `graph` 不发请求，产出的上下文和图与第一次逐字相同；同一问题第二次 `ask` 不调用 LLM，`cached` 为真；两个 namespace 互不命中；`contextual` 并发大于 1 时也命中；`roles` 里没有的 role 不缓存；store 不是 PG 时开启报 `ConfigError`；提问日志关闭时不写文件 |
+| S19 embedding 走 lite-model | `OllamaEmbedder`、`OpenAICompatEmbedder` 改由 lite-model 0.6.0 的 `embed()` 调用（分批、并发、400/413 对半拆、同模型重试都是它的）；lite-rag 的 `EmbeddingConfig` 不变，由它生成 lite-model 的配置；前缀（`_Prefixing`）、向量缓存（`CachingEmbedder`）、索引身份留在 lite-rag；Voyage / Cohere / Gemini / fastembed / sentence-transformers 不动 | 索引身份不变（provider、model、`model_id`、前缀）；`-m ollama` 下 `/v1/embeddings` 与 `/api/embed` 的向量逐元素相等（含 query / document 前缀）；吞吐不变（同一批文本、默认并发 4 × 批 32）；Ollama 不发 `dimensions`（以前也不发） |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -448,6 +449,28 @@ lite-rag/
     直接构造 `PgStore` 的调用方也被覆盖）；打开时多两次往返（每个进程只打开一次）。
   - Codex 采纳 2 条（先写失败的测试）：`redact` 也遮住 `Authorization: Bearer …`、`api_key=`、`token:`、`secret=`；
     开放模式也拒绝 `Via`、`X-Forwarded-Host/-Proto/-Port/-Prefix`（lite-mem 同步）。
+
+- **S19 embedding 走 lite-model（2026-11-22）**：架构评审（2026-11-21）定的：HTTP embedder 收进 lite-model。lite-mem 在它的 S14
+  已经迁了；lite-rag 的 embedder 功能更多（并发、400/413 对半拆、可配的批大小、`dimensions`），所以先给 lite-model 补齐（0.6.0），再只迁
+  ollama 和 openai 两种。Voyage、Cohere、Gemini 的请求格式 lite-model 不支持，fastembed 和 sentence-transformers 在进程内跑，这几种照旧。
+  - 用户配置不变：`LITERAG_EMBEDDING__*` 的键和默认值都没变，`_LiteModelEmbedder` 由它生成 lite-model 的 `ModelsConfig`（backend 名就是
+    provider 名，openai 不设 `api_key_env` 时为 keyless）。
+  - 索引身份不变（先写测试固定）；Ollama 改走 `/v1/embeddings`，`-m ollama` 测试里向量与 `/api/embed` 逐元素相等，含前缀；把输出故意
+    倒序后测试变红。
+  - 吞吐：README 段落 130 条，默认并发 4、批 32，改前和改后交替各跑两组，每组 3 次，中位数都是 4.8 秒。
+  - 有意改的旧测试：`test_embedding.py` 里 Ollama / OpenAI 的线上格式改成 `/v1/embeddings` 的请求和回复。重试测试不再检查 lite-rag 自己
+    的退避秒数（退避现在是 SDK 的），只检查重试的是同一个模型、次数正确、4xx 不重试。新加：400/413 对半拆、Ollama 不发 `dimensions`。
+  - 行为变化：没有 key 的 OpenAI 兼容端点（TEI、vLLM）现在会收到 `Authorization: Bearer unused`，这是 lite-model 的占位符，因为 OpenAI
+    SDK 一定要有 key；以前不带这个头。这些服务没配鉴权时会忽略它；测试保证发出去的只会是占位符，不会是环境里的 key。
+    错误信息也不再带上游的原文（lite-model 规则 8）。
+  - 收尾：/simplify 采纳 6 条：
+    - dim 的探测和校验抽成 `_ProbedDim`，HTTP 和 lite-model 两种 embedder 共用；
+    - `_OpenAIShape` 只剩 Voyage 一个子类，并回 `VoyageEmbedder`；
+    - provider 之间的差别改成 `_role` / `_backend` 两个钩子，去掉 `sends_dimensions` 标志；
+    - 建 lite-model 客户端和转换错误改用 `llm.build_model`（多了 `roles` 参数），和 LLM 那边共用；
+    - Ollama 的默认地址交给 lite-model 的 profile，删掉 `OLLAMA_URL`；
+    - 删掉测试里一个死别名。
+  - Codex：没有 finding。检查：pytest 564 passed；`-m ollama` 10 passed；ruff、mypy 通过。
 
 ## 13. 待确认
 

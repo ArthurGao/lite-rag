@@ -111,6 +111,6 @@ markers = [
 ]
 
 [tool.uv.sources]
-lite-cache = { url = "https://github.com/ArthurGao/lite-cache/releases/download/v0.3.0/lite_cache-0.3.0-py3-none-any.whl" }
-lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.5.1/lite_model-0.5.1-py3-none-any.whl" }
+lite-cache = { url = "https://github.com/ArthurGao/lite-cache/releases/download/v0.3.1/lite_cache-0.3.1-py3-none-any.whl" }
+lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.6.0/lite_model-0.6.0-py3-none-any.whl" }
 lite-eval = { url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.4.1/lite_eval-0.4.1-py3-none-any.whl" }
