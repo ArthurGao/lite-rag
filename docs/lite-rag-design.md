@@ -45,7 +45,7 @@ lite-rag 是一个**可读、可改、可单独部署**的轻量 RAG 引擎，�
 | `Chunker` | `split(doc) -> list[Chunk]`；`split_parents(doc) -> (parents, chunks)` | `recursive` | 见 §3.1：fixed、sentence、paragraph、markdown、semantic、parent-child，另有 contextual 增强 |
 | `Embedder` | `embed_documents(texts)`、`embed_query(text)`、`dim`、`model` | `ollama`（`bge-m3`） | 见 §3.2：openai 兼容、voyage、cohere、gemini、fastembed、sentence-transformers、`FakeEmbedder` |
 | `Store` | `get_or_create_kb`、`get_kb`、`upsert_document`、`delete_document`、`vector_query`（可用 `among` 限定 chunk 范围）、`bm25_query`、`chunks`、`stats`；图检索另有 `GraphStore`（只有 PgStore 实现）：`graph_names_in`、`graph_chunks_of`、`graph_entities_of` | `PgStore`（pgvector 存向量，PG 表存 BM25 倒排和文档登记） | `ChromaStore`（extra `[chroma]`）：向量放 Chroma，倒排和登记放 SQLite |
-| `Reranker` | `score(query, texts) -> list[float]`（只打分；排序和组装上下文由引擎负责） | 不启用（`rerank.enabled=false`） | 本地 cross-encoder `BAAI/bge-reranker-v2-m3-int8`（extra `[fastembed]`） |
+| `Reranker` | `score(query, texts) -> list[float]`（只打分；排序和组装上下文由引擎负责） | 不启用（`rerank.enabled=false`） | 本地 cross-encoder `BAAI/bge-reranker-v2-m3-int8`（extra `[fastembed]`）；Voyage `rerank-2.5`（`provider: voyage`，付费，S20） |
 | `LLM` | `complete(messages) -> Completion` | `OpenAICompatLLM`（Ollama `/v1`、OpenAI、llm-gateway） | `AnthropicLLM`（extra `[anthropic]`）、`FakeLLM` |
 
 `Store` 把向量和倒排放在同一个接口里，这样 PG 后端能在一个事务里完成一篇文档的所有写入。BM25 的公式写在 `keyword.py` 里；store 只提供一个 `bm25_query`，内部决定在哪里打分：PgStore 可以在 SQL 里打分（`store.bm25_impl: sql`，默认），也可以取回 posting 后交给 `keyword.bm25` 打分（`python`）。两种方式共用同一段统计量 SQL。Chroma 后端只用 Python 方式。
@@ -97,7 +97,7 @@ engine.stats(kb)
 | `fastembed` | 进程内 ONNX，不需要 Ollama | `BAAI/bge-small-zh-v1.5`、`intfloat/multilingual-e5-*` 等 | 免费 |
 | `sentence_transformers` | 进程内 PyTorch（extra `[sentence-transformers]`，6.2.0；CPU / CUDA / Apple MPS；第一次用到时才加载 torch） | 任意 HF embedding 模型，例如 `Qwen/Qwen3-Embedding-0.6B` | 免费 |
 | `openai` | OpenAI 兼容的 `/v1/embeddings` | OpenAI `text-embedding-3-large` / `-small`（支持 `dimensions` 截断）；同一个实现也能接 DashScope（通义 `text-embedding-v*`）、SiliconFlow、Jina、vLLM、TEI | 付费（各家免费额度不一） |
-| `voyage` | 直接 HTTP `POST /v1/embeddings`（不装 SDK），`input_type` = query / document（Voyage 会自己在前面拼一句检索提示），`output_dimension`；每次最多 1000 条；key `VOYAGE_API_KEY` | `voyage-4-large`、`voyage-4`、`voyage-4-lite`、`voyage-3.5` 等。KB 中 tenderted 实测用过 voyage-3-large | 付费 |
+| `voyage` | lite-model 的 `voyage` 类型（S20 起；之前是直接 HTTP），`input_type` = query / document（Voyage 会自己在前面拼一句检索提示），`output_dimension`；每次最多 1000 条；key `VOYAGE_API_KEY` | `voyage-4-large`、`voyage-4`、`voyage-4-lite`、`voyage-3.5` 等。KB 中 tenderted 实测用过 voyage-3-large | 付费 |
 | `cohere` | 直接 HTTP `POST /v2/embed`，`input_type` = search_document / search_query，`embedding_types: [float]`；每次最多 96 条；key `CO_API_KEY` | `embed-v4.0`、`embed-multilingual-v3.0` 等 | 付费 |
 | `gemini` | 直接 HTTP `POST /v1beta/models/{model}:batchEmbedContents`，每条文本一个 Content（多个 part 放在一个 Content 里会被合成一个向量）；`gemini-embedding-001` 用 `taskType` = RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY，`gemini-embedding-2` 没有这个参数，任务写成前缀（见下表）；`outputDimensionality`；每次最多 100 条；key `GEMINI_API_KEY` | `gemini-embedding-2`、`gemini-embedding-001`（两者的向量空间不兼容） | 付费，有免费额度 |
 
@@ -363,6 +363,7 @@ lite-rag/
 | S17 索引角色默认用小模型 | `contextual`、`graph` 默认 `ollama/qwen3:1.7b`、不思考；`eval/configs/*-8b.yaml` 写回 8b 作对照 | 单测：两个索引角色的默认 id 和参数、顶层设置不影响它们；8b 对照配置解析到 S17 之前的设置；检索和回答评测（KB 2026-11-19）不比 8b 差 |
 | S18 接 lite-cache L1 | `cache` extra（lite-cache v0.1.0 release wheel，默认关）；`cache` 配置（`enabled`、`roles`、`ttl_s`、`schema`、`question_log`），用 lite-rag 的 `database_url`、只支持 PG；开着时 runtime 的 lite-model 注册 `CacheHook`；`contextual`、`graph`、`answer` 的调用都在 `call_context(scope="literag/<namespace>")` 里（lite-cache 设计 §0、§9）；`BoundedLLM.map` 按项 `copy_context()`（lite-model 0.2.1 的 `Bounded.map` 线程不继承 contextvar）；`Completion` / `Answer` 带 `cached`，CLI 标出缓存答案；`ask()` 可选的提问日志（JSONL） | 关闭时与之前等价（请求体、索引身份、回答都不变，不建 lite-cache 的 schema）；开启时：换 embedding 后 `reindex --into` 新 kb，`contextual` / `graph` 不发请求，产出的上下文和图与第一次逐字相同；同一问题第二次 `ask` 不调用 LLM，`cached` 为真；两个 namespace 互不命中；`contextual` 并发大于 1 时也命中；`roles` 里没有的 role 不缓存；store 不是 PG 时开启报 `ConfigError`；提问日志关闭时不写文件 |
 | S19 embedding 走 lite-model | `OllamaEmbedder`、`OpenAICompatEmbedder` 改由 lite-model 0.6.0 的 `embed()` 调用（分批、并发、400/413 对半拆、同模型重试都是它的）；lite-rag 的 `EmbeddingConfig` 不变，由它生成 lite-model 的配置；前缀（`_Prefixing`）、向量缓存（`CachingEmbedder`）、索引身份留在 lite-rag；Voyage / Cohere / Gemini / fastembed / sentence-transformers 不动 | 索引身份不变（provider、model、`model_id`、前缀）；`-m ollama` 下 `/v1/embeddings` 与 `/api/embed` 的向量逐元素相等（含 query / document 前缀）；吞吐不变（同一批文本、默认并发 4 × 批 32）；Ollama 不发 `dimensions`（以前也不发） |
+| S20 Voyage 走 lite-model、Voyage rerank | `VoyageEmbedder` 改由 lite-model 0.7.0 的 `voyage` 类型调用（`input_type` 按 query / document、`dimensions` 作 `output_dimension`、对半拆与重试都是 lite-model 的）；`rerank.provider: voyage`：`VoyageReranker` 走 lite-model 的 `rerank()`（`/v1/rerank`，付费），默认 `rerank-2.5`；`-m voyage` opt-in | 索引身份不变（provider `voyage`、model、前缀为空、dim）；请求体只多了 SDK 的 `encoding_format: "base64"`；reranker 按输入顺序给每条打分、`model_id` 为 `voyage/<model>`；缺 key 在构建时报 `ConfigError`；fastembed 的 reranker 不变、拒绝 voyage 专用字段；`-m voyage` 没有 key 时失败而不是跳过 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -471,6 +472,26 @@ lite-rag/
     - Ollama 的默认地址交给 lite-model 的 profile，删掉 `OLLAMA_URL`；
     - 删掉测试里一个死别名。
   - Codex：没有 finding。检查：pytest 564 passed；`-m ollama` 10 passed；ruff、mypy 通过。
+- **S20 Voyage 走 lite-model（2026-11-22）**：用户要 Voyage（Anthropic 推荐的 embedding 提供方），并且希望 lite-mem、llm-steward 以后也能用，
+  所以先在 lite-model 0.7.0 加 `voyage` 类型（embed 的 `input_type`、`rerank()`，它的设计 §3.3），再把这里的 `VoyageEmbedder` 换过去。
+  - `VoyageEmbedder` 现在是 `_LiteModelEmbedder`：`input_type = True` 时把调用的角色（document / query）作 lite-model 的 `input_type` 发出；
+    批大小仍封顶 1000；`base_url` / `api_key_env` 照旧可配。索引身份没变：provider、model、空前缀、dim 都是同一套属性。
+  - 有意改的旧测试（`test_embedding_vendors.py`）：请求体多了 `encoding_format: "base64"`（OpenAI SDK 不带它时自己加上并解码；Voyage
+    不接受 "float"），JSON 浮点的回复照样读；`_base_url` 换成 S19 起的 `endpoint`；错误信息匹配 lite-model 的错误类型名
+    （`BadRequestError`、`AuthenticationError`），因为 lite-model 的错误信息不带上游文本（它的规则 8），不再有 "400" / "401"。对半拆的请求序列
+    测试原样通过（5 → 2 + 3 → 1 + 2）。
+  - Voyage rerank：`RerankConfig.provider` 加 `voyage`，`api_key_env`、`base_url`、`timeout_s`、`max_retries` 只给 voyage（fastembed 设了就报错），
+    model 不写时是 `rerank-2.5`（不把 fastembed 的默认模型名发给 Voyage）。`RerankError` 是 502。测试 `tests/unit/test_rerank_voyage.py`，
+    回复故意按相关度倒序，检查分数回到输入顺序；导入失败时全部红。
+  - `-m voyage`（`tests/integration/test_voyage.py`）：一次真实的 embed（文档与查询）加一次 rerank，没有 `VOYAGE_API_KEY` 时失败而不是跳过；
+    这次没有 key，没跑。契约测试的格式来自 Voyage 2025-12-10 的 API 参考，要等真实调用确认。
+  - /simplify 采纳：Voyage 的 backend 条目由 `voyage_backend()` 给 embedder 和 reranker 共用；`dimensions` 由 `_LiteModelEmbedder` 按
+    `sends_dimensions` 发出（Ollama 为 False，仍不发）；rerank 回复里有未打分的文本就报 `RerankError`，不悄悄过滤；fastembed 也拒绝
+    `timeout_s` / `max_retries`。拒绝：把 `ModelsConfig` 的构造再抽一层（重复很小）；`input_type` 由 lite-model 的 profile 决定而去掉
+    类上的标志（是否按角色发出是 lite-rag 对每种 embedder 的选择）。
+  - Codex：没有需要改的问题；一条小建议成立并修复（先红后绿）：`provider: voyage` 设了 fastembed 的 `cache_dir` 也报错。
+  - 依赖：lite-model 0.7.0、lite-cache 0.3.2（它的 wheel 也指向 lite-model 0.7.0）。检查：pytest 570 passed（PG），`-m ollama` 10 passed，
+    mypy、ruff 干净。
 
 ## 13. 待确认
 

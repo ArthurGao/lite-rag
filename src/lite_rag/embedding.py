@@ -154,8 +154,8 @@ class _HTTPEmbedder(_ProbedDim):
         self._check_dim(vectors)
 
     def _fitting(self, batch: list[str], role: Role) -> list[list[float]]:
-        """One batch. A batch the API refuses as too large (400 / 413 — e.g. Voyage's limit on
-        total tokens per request, which depends on the model) is halved and each half sent
+        """One batch. A batch the API refuses as too large (400 / 413 — e.g. a limit on total
+        tokens per request, which depends on the model) is halved and each half sent
         again, down to a single text; a single text that is refused is an error."""
         try:
             return self._with_retry(batch, role)
@@ -213,17 +213,27 @@ class _LiteModelEmbedder(_ProbedDim):
     def _backend(self, config: EmbeddingConfig) -> dict[str, Any]:
         raise NotImplementedError
 
+    # Whether `dimensions` is sent (index identity: Ollama never sent it, S19).
+    sends_dimensions: ClassVar[bool] = True
+
     def _role(self, config: EmbeddingConfig) -> dict[str, Any]:
-        return {"batch_size": config.batch_size, "max_concurrency": config.max_concurrency}
+        role = {"batch_size": config.batch_size, "max_concurrency": config.max_concurrency}
+        if self.sends_dimensions and config.dimensions:
+            role["dimensions"] = config.dimensions
+        return role
 
     @property
     def endpoint(self) -> str | None:
         """The API root lite-model sends to (its resolved target)."""
         return self._model.target(ROLE).base_url
 
+    # Whether the API takes the call's role as lite-model's `input_type` (Voyage, S20).
+    input_type: ClassVar[bool] = False
+
     def _embed(self, texts: list[str], role: Role) -> list[list[float]]:
         try:
-            vectors = self._model.embed(ROLE, texts).vectors
+            kind = role if self.input_type else None
+            vectors = self._model.embed(ROLE, texts, input_type=kind).vectors
         except lite_model.ModelError as exc:
             raise EmbeddingError(str(exc)) from exc
         self._check_dim(vectors)
@@ -237,6 +247,7 @@ class OllamaEmbedder(_LiteModelEmbedder):
     part of the index identity."""
 
     provider = "ollama"
+    sends_dimensions = False
 
     def _backend(self, config: EmbeddingConfig) -> dict[str, Any]:
         where: dict[str, Any] = {"type": "ollama"}
@@ -258,26 +269,32 @@ class OpenAICompatEmbedder(_LiteModelEmbedder):
             return where | {"api_key_env": config.api_key_env}
         return where | {"keyless": True}
 
-    def _role(self, config: EmbeddingConfig) -> dict[str, Any]:
-        role = super()._role(config)
-        return role | {"dimensions": config.dimensions} if config.dimensions else role
+
+def voyage_backend(base_url: str | None, api_key_env: str | None) -> dict[str, Any]:
+    """lite-model's `voyage` backend entry for the embedder and the reranker (S20)."""
+    where: dict[str, Any] = {"type": "voyage"}
+    if base_url:
+        where["base_url"] = base_url.rstrip("/")
+    if api_key_env:
+        where["api_key_env"] = api_key_env
+    return where
 
 
-class VoyageEmbedder(_HTTPEmbedder):
-    """Voyage AI `POST /v1/embeddings` (paid): OpenAI's shape plus `input_type`. Voyage prepends
-    its own retrieval prompt for that role, so no prefix is added here."""
+class VoyageEmbedder(_LiteModelEmbedder):
+    """Voyage AI `/v1/embeddings` (paid), through lite-model's `voyage` type (0.7.0, S20): the
+    call's role goes as `input_type`, `dimensions` as `output_dimension`. Voyage prepends its own
+    retrieval prompt for that role, so no prefix is added here. The vectors come back as base64
+    float32 (the SDK's default; Voyage takes no "float"), the same numbers as its JSON floats."""
 
     provider = "voyage"
-    default_url = "https://api.voyageai.com/v1"
-    key_env = "VOYAGE_API_KEY"
-    max_batch = 1000
+    input_type = True
 
-    def _call(self, batch: list[str], role: Role) -> list[list[float]]:
-        body: dict[str, Any] = {"model": self.model, "input": batch, "input_type": role}
-        if self._config.dimensions:
-            body["output_dimension"] = self._config.dimensions
-        reply = self._post(f"{self._base_url}/embeddings", body, self._bearer())
-        return [d["embedding"] for d in sorted(reply["data"], key=lambda d: d["index"])]
+    def _backend(self, config: EmbeddingConfig) -> dict[str, Any]:
+        return voyage_backend(config.base_url, config.api_key_env)
+
+    def _role(self, config: EmbeddingConfig) -> dict[str, Any]:
+        # Voyage takes at most 1000 texts per request
+        return super()._role(config) | {"batch_size": min(config.batch_size, 1000)}
 
 
 class CohereEmbedder(_HTTPEmbedder):

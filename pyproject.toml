@@ -102,15 +102,16 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Opt-in, deselected by default: `-m ollama` (the real Ollama server on the host).
-addopts = "-m 'not ollama and not model'"
+addopts = "-m 'not ollama and not model and not voyage'"
 # jieba 0.42.1 (unmaintained upstream) has invalid escapes in its own regexes; nothing else.
 filterwarnings = ["ignore::SyntaxWarning:jieba.*"]
 markers = [
     "ollama: talks to the real Ollama server (opt-in: uv run pytest -m ollama)",
     "model: runs a real local model downloaded from Hugging Face, e.g. the reranker (opt-in: uv run --all-extras pytest -m model)",
+    "voyage: the real Voyage AI API, paid per token (opt-in: VOYAGE_API_KEY=... uv run pytest -m voyage)",
 ]
 
 [tool.uv.sources]
-lite-cache = { url = "https://github.com/ArthurGao/lite-cache/releases/download/v0.3.1/lite_cache-0.3.1-py3-none-any.whl" }
-lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.6.0/lite_model-0.6.0-py3-none-any.whl" }
+lite-cache = { url = "https://github.com/ArthurGao/lite-cache/releases/download/v0.3.2/lite_cache-0.3.2-py3-none-any.whl" }
+lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.7.0/lite_model-0.7.0-py3-none-any.whl" }
 lite-eval = { url = "https://github.com/ArthurGao/lite-eval/releases/download/v0.4.1/lite_eval-0.4.1-py3-none-any.whl" }

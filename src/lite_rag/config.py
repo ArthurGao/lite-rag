@@ -243,11 +243,35 @@ class RerankConfig(BaseModel):
     """Design §5: a cross-encoder re-scores the fused candidates (off by default)."""
 
     enabled: bool = False
-    provider: Literal["fastembed"] = "fastembed"
+    # fastembed: a local ONNX cross-encoder; voyage: Voyage AI's `/v1/rerank` (paid), through
+    # lite-model's rerank() (S20).
+    provider: Literal["fastembed", "voyage"] = "fastembed"
     # Apache-2.0, multilingual (bge-m3 family), int8 ONNX ~0.6 GB. Not jina-v2 (CC-BY-NC).
+    # voyage: rerank-2.5 unless one is named.
     model: str = "BAAI/bge-reranker-v2-m3-int8"
     top_n: int = Field(default=20, gt=0, le=200)  # candidates re-scored
-    cache_dir: str | None = None
+    cache_dir: str | None = None  # fastembed
+    # voyage: the key's variable (default VOYAGE_API_KEY), the API root, timeout and retries of
+    # the same model (no fallback).
+    api_key_env: str | None = None
+    base_url: str | None = None
+    timeout_s: float = Field(default=30.0, gt=0)
+    max_retries: int = Field(default=2, ge=0)
+
+    @model_validator(mode="after")
+    def _provider_fields(self) -> Self:
+        if self.provider == "voyage":
+            if "model" not in self.model_fields_set:
+                self.model = "rerank-2.5"
+            if self.cache_dir is not None:
+                raise ValueError("rerank.cache_dir: only for the fastembed provider")
+            return self
+        remote = sorted(
+            {"api_key_env", "base_url", "timeout_s", "max_retries"} & self.model_fields_set
+        )
+        if remote:
+            raise ValueError(f"rerank.{', rerank.'.join(remote)}: only for the voyage provider")
+        return self
 
 
 def _moved_llm(value: Any, section: str, role: str) -> Any:
