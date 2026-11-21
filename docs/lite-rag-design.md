@@ -1,6 +1,6 @@
 # lite-rag 设计文档
 
-> 状态：设计稿（2026-11-08）。实施按第 12 节的阶段推进；某个阶段的行为改变时，在同一次提交里更新本文。
+> 状态：S0–S18 已完成（2026-11-08 至 11-19；S18 = lite-cache L1）。实施按第 12 节的阶段推进；某个阶段的行为改变时，在同一次提交里更新本文。
 
 ## 1. 概述
 
@@ -287,12 +287,18 @@ FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `
 ```yaml
 database_url: null        # 一般用环境变量 LITERAG_DATABASE_URL，不写进文件
 store: {backend: postgres, schema: lite_rag}   # 或 {backend: chroma, data_dir: ./lite_rag_data}
-embedding: {provider: ollama, model: bge-m3, base_url: http://127.0.0.1:11434, batch_size: 32, max_concurrency: 4, query_prefix: ""}
+embedding: {provider: ollama, model: bge-m3:567m, base_url: null, batch_size: 32, max_concurrency: 4, query_prefix: null}
 chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50, contextual: {enabled: false}}
 retrieval: {mode: hybrid, hybrid_paths: [vector, bm25], top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60, bm25: {k1: 1.5, b: 0.75}}
-graph: {enabled: false, llm: {provider: ollama, model: qwen3:8b, reasoning_effort: none}, concurrency: 4, hops: 2, hub_chunks: 5, max_neighbors: 20}
+graph: {enabled: false, concurrency: 4, hops: 2, hub_chunks: 5, max_neighbors: 20}
 rerank: {enabled: false, model: BAAI/bge-reranker-v2-m3-int8, top_n: 20}
-llm: {provider: ollama, model: qwen3:8b}
+# lite-model's ModelsConfig (§6, S15). The top level tunes `answer`; the index roles keep their own
+# (qwen3:1.7b, thinking off, S17) until `roles` names them. A backend's base_url / api_key_env go
+# under `backends`; the pre-S15 keys (llm.provider, graph.llm, chunking.contextual.llm) are refused.
+llm: {backend: ollama, model: qwen3:8b, max_output_tokens: 1024, connect_timeout_s: 5,
+      roles: {graph: {model: qwen3:1.7b}},
+      backends: {openai: {type: openai, base_url: "https://…/v1", api_key_env: OPENAI_API_KEY}}}
+cache: {enabled: false, roles: [answer, contextual, graph], ttl_s: null, schema: lite_cache}   # S18
 server: {host: 127.0.0.1, port: 8700}
 ```
 
