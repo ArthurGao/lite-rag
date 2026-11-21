@@ -31,7 +31,7 @@ from typing import Any, Literal
 
 import yaml
 from lite_eval.config import ci_from_env
-from lite_eval.contracts import Case, Output, Trace
+from lite_eval.contracts import Case, Output, Span, Trace
 from lite_eval.datasets.local import Dataset, load_dataset
 from lite_eval.runner import RunOptions, RunResult, execute
 from lite_eval.scorers.ranking import normalise
@@ -47,7 +47,7 @@ from lite_rag.llm import LLM
 from lite_rag.loaders import PdfLoader, find_files, load_file
 from lite_rag.rerank import Reranker, build_reranker
 from lite_rag.stores.base import CachedStore, KbRef
-from lite_rag.types import Hit
+from lite_rag.types import Hit, Route
 
 TOP_K = 10  # MRR@10 needs ten hits
 NAMESPACE = "eval"
@@ -198,6 +198,16 @@ RerankerFor = Callable[[RerankConfig], Reranker]
 CorpusFor = Callable[[PdfLoader], Corpus]
 
 
+def route_span(route: Route) -> Span:
+    """The router's choice for one case (S21), kept in the run's outputs."""
+    return Span(
+        kind="route",
+        name=route.mode,
+        output={"mode": route.mode, "reason": route.reason},
+        attrs={"model": route.model_id},
+    )
+
+
 class LiteRagTarget:
     """One lite-rag config as a lite-eval target (lite-eval design §5.3), built by `evaluate`."""
 
@@ -281,11 +291,15 @@ class LiteRagTarget:
         assert self.engine is not None
         start = time.perf_counter()
         hits = self.engine.search(self.kb, self.query(case), top_k=TOP_K)
-        latency_ms = (time.perf_counter() - start) * 1000
+        latency_ms = (time.perf_counter() - start) * 1000  # with the routing call, if any
+        route = hits[0].route if hits else None
+        spans = [] if route is None else [route_span(route)]
         return Output(
             case_id=case.id,
             value=[hit_record(h) for h in hits],
-            trace=Trace(latency_ms=latency_ms, latency_scope=latency_scope(self.settings)),
+            trace=Trace(
+                spans=spans, latency_ms=latency_ms, latency_scope=latency_scope(self.settings)
+            ),
         )
 
     def _drop(self) -> str | None:

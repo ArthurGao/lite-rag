@@ -1,0 +1,7 @@
+# S21: the router on the local default (qwen3:1.7b, thinking off)
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+graph: {enabled: true}
+retrieval:
+  mode: route
+  hybrid_paths: [vector, bm25, graph]
+  router: {modes: [vector, hybrid]}

@@ -1,0 +1,19 @@
+{%- set links = "the links between named things (people, teams, projects). Best when the answer sits one or two steps away from what the question names, e.g. \"the office of the person who leads project X\"" -%}
+Retrieval modes offered:
+{% for mode in modes %}
+{%- if mode == "vector" %}
+- vector: semantic similarity. Best for a question about one fact, also when it is phrased in other words than the documents use.
+{%- elif mode == "bm25" %}
+- bm25: exact keyword match. Best when the question quotes an identifier, code, name or number that must appear verbatim.
+{%- elif mode == "graph" %}
+- graph: follows {{ links }}.
+{%- elif mode == "hybrid" and "graph" in hybrid_paths %}
+- hybrid: {{ hybrid_paths | join(" + ") }} fused, including {{ links }}.
+{%- elif mode == "hybrid" %}
+- hybrid: {{ hybrid_paths | join(" + ") }} fused. A safe middle when the question mixes these needs.
+{%- endif %}
+{%- endfor %}
+
+<{{ tag }} kind="question">
+{{ question | material(tag) }}
+</{{ tag }}>

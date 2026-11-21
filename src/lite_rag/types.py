@@ -1,7 +1,7 @@
 """Value types shared by every component (design §3)."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,21 @@ class Hit:
     scores: dict[str, float] = field(default_factory=dict)
     ranks: dict[str, int] = field(default_factory=dict)
     kb: str = field(kw_only=True)  # the knowledge base it came from (several searched at once)
+    route: "Route | None" = field(default=None, kw_only=True)  # mode="route": what was chosen
+
+
+# What the router may pick (S21); `retrieval.mode` adds "route" itself (config.Mode).
+RouteMode = Literal["vector", "bm25", "graph", "hybrid"]
+
+
+@dataclass(frozen=True)
+class Route:
+    """The router's choice for one question (S21): the mode it picked, the model that picked it
+    (`backend/model`, read from the reply) and the reason it gave."""
+
+    mode: RouteMode
+    model_id: str
+    reason: str
 
 
 # Graph retrieval (design §5, S11): what an LLM found in one chunk.

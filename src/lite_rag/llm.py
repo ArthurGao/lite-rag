@@ -29,6 +29,7 @@ ROLES = RoleSpec({
     "answer": RolePolicy(routable=True),
     "contextual": RolePolicy(routable=False),
     "graph": RolePolicy(routable=False),
+    "route": RolePolicy(routable=True),  # S21: picks a retrieval mode; not index identity
 })  # fmt: skip
 
 
@@ -66,6 +67,11 @@ def build_model(
         raise ConfigError(str(exc)) from exc
 
 
+def _answered(p: lite_model.Provenance) -> str:
+    """lite-model's Provenance.tag with lite-rag's `/`: answers have recorded `x/y` since S0."""
+    return model_id(p.backend, p.answered or f"{p.requested}?")
+
+
 class RoleLLM:
     """One role of a lite-model `Model`: what the engine, the contextualizer and the graph
     extractor call."""
@@ -79,20 +85,25 @@ class RoleLLM:
             reply = self._model.text(self._role, messages)
         except lite_model.ModelError as exc:
             raise LLMError(str(exc)) from exc
-        p, u = reply.provenance, reply.usage
+        u = reply.usage
         usage = {k: v for k, v in (("input", u.input), ("output", u.output)) if v is not None}
-        # lite-model's Provenance.tag with lite-rag's `/`: answers have recorded `x/y` since S0
-        answered = model_id(p.backend, p.answered or f"{p.requested}?")
-        return Completion(reply.text, answered, usage, cached=reply.cached)
+        return Completion(reply.text, _answered(reply.provenance), usage, cached=reply.cached)
 
     def structured[T: BaseModel](self, messages: Sequence[Message], schema: type[T]) -> T:
         """A reply constrained to `schema` (lite-model sends it as a strict JSON schema)."""
+        return self.structured_reply(messages, schema)[0]
+
+    def structured_reply[T: BaseModel](
+        self, messages: Sequence[Message], schema: type[T]
+    ) -> tuple[T, str]:
+        """`structured`, with the `backend/model` that answered (S21: recorded with a route)."""
         try:
-            return self._model.structured(self._role, messages, schema).value
+            reply = self._model.structured(self._role, messages, schema)
         except lite_model.BadStructuredReply as exc:
             raise BadReply(str(exc)) from exc
         except lite_model.ModelError as exc:
             raise LLMError(str(exc)) from exc
+        return reply.value, _answered(reply.provenance)
 
     def bounded(self, concurrency: int) -> "BoundedLLM":
         """The same role with at most `concurrency` calls in flight through it, from any thread
