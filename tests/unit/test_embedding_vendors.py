@@ -41,9 +41,12 @@ def test_voyage_sends_the_input_type_per_role_and_reorders_by_index() -> None:
     e = VoyageEmbedder(cfg, _client(handler))
     assert e.embed_documents(["a", "b"]) == [[0.0, 1.0], [1.0, 1.0]]
     e.embed_query("q")
+    # S20, through lite-model: as before, plus the SDK's `encoding_format: "base64"` (Voyage
+    # takes no "float"; a JSON-float reply, as here, is read the same)
+    voyage = {"model": "voyage-4", "encoding_format": "base64", "output_dimension": 2}
     assert seen == [
-        {"model": "voyage-4", "input": ["a", "b"], "input_type": "document", "output_dimension": 2},
-        {"model": "voyage-4", "input": ["q"], "input_type": "query", "output_dimension": 2},
+        voyage | {"input": ["a", "b"], "input_type": "document"},
+        voyage | {"input": ["q"], "input_type": "query"},
     ]
     assert (e.prefixes.query, e.prefixes.document) == ("", "")  # the API adds its own
 
@@ -156,11 +159,12 @@ def test_each_provider_defaults_to_its_own_endpoint() -> None:
     )
     proxied = EmbeddingConfig(base_url="http://gpu-box:11434/")
     assert OllamaEmbedder(proxied).endpoint == "http://gpu-box:11434/v1"
-    assert VoyageEmbedder(EmbeddingConfig(provider="voyage"))._base_url == (
+    # S20: Voyage too
+    assert VoyageEmbedder(EmbeddingConfig(provider="voyage")).endpoint == (
         "https://api.voyageai.com/v1"
     )
     proxy = EmbeddingConfig(provider="voyage", base_url="https://proxy/v1/")
-    assert VoyageEmbedder(proxy)._base_url == "https://proxy/v1"
+    assert VoyageEmbedder(proxy).endpoint == "https://proxy/v1"
 
 
 def test_a_gemini_model_without_a_prefix_profile_gets_a_task_type() -> None:
@@ -245,7 +249,8 @@ def test_a_single_text_that_is_refused_is_an_error_not_a_loop() -> None:
         return httpx2.Response(400, json={"detail": "bad input"})
 
     cfg = EmbeddingConfig(provider="voyage", model="voyage-4", batch_size=4, max_concurrency=1)
-    with pytest.raises(EmbeddingError, match="400"):
+    # S20: lite-model's message names the error type, never the API's text (its rule 8)
+    with pytest.raises(EmbeddingError, match="BadRequestError"):
         VoyageEmbedder(cfg, _client(handler)).embed_documents(["a", "b", "c", "d"])
     assert len(calls) <= 7 and calls[-1] == 1  # halved down to one text, then given up
 
@@ -260,6 +265,6 @@ def test_other_client_errors_are_not_split() -> None:
         return httpx2.Response(401, json={"detail": "invalid key"})
 
     cfg = EmbeddingConfig(provider="voyage", model="voyage-4", batch_size=4, max_concurrency=1)
-    with pytest.raises(EmbeddingError, match="401"):
+    with pytest.raises(EmbeddingError, match="AuthenticationError"):
         VoyageEmbedder(cfg, _client(handler)).embed_documents(["a", "b", "c", "d"])
     assert calls == [4]  # a bad key is not a size problem: one call, then the error
