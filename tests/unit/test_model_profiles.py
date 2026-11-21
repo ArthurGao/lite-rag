@@ -40,7 +40,8 @@ def test_the_embedder_applies_the_model_prefixes_itself() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         inputs = json.loads(request.content)["input"]
         seen.extend(inputs)
-        return httpx2.Response(200, json={"embeddings": [[1.0] for _ in inputs]})
+        data = [{"object": "embedding", "index": i, "embedding": [1.0]} for i in range(len(inputs))]
+        return httpx2.Response(200, json={"object": "list", "data": data, "model": "m"})
 
     client = httpx2.Client(transport=httpx2.MockTransport(handler))
     e = OllamaEmbedder(EmbeddingConfig(model="nomic-embed-text"), client)

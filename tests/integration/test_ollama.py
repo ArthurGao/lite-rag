@@ -30,6 +30,26 @@ def test_bge_m3_embeds_1024_d_and_puts_paraphrases_closer() -> None:
     assert _cos(q, near) > _cos(q, far)
 
 
+def test_the_vectors_equal_the_ones_api_embed_returned() -> None:
+    # S19: OllamaEmbedder goes through lite-model to /v1/embeddings; every stored vector came
+    # from /api/embed. Same model, prefixes and texts must give the same vectors.
+    import httpx2
+
+    e = OllamaEmbedder(EmbeddingConfig(query_prefix="query: ", document_prefix="passage: "))
+    docs = ["退款会在七天内处理完成。", "Refunds take seven days.", "x"]
+    new_docs, new_query = e.embed_documents(docs), e.embed_query("退款要多久？")
+    old = httpx2.post(
+        "http://127.0.0.1:11434/api/embed",
+        json={
+            "model": "bge-m3:567m",
+            "input": [*["passage: " + d for d in docs], "query: 退款要多久？"],
+        },
+        timeout=120,
+    ).json()["embeddings"]
+    for got, want in zip([*new_docs, new_query], old, strict=True):
+        assert got == pytest.approx(want, abs=1e-6)
+
+
 def test_the_bge_m3_tokenizer_counts_tokens_with_offsets() -> None:
     counter = HFTokenCounter("BAAI/bge-m3")
     text = "我住北京。I live in Beijing."

@@ -14,7 +14,7 @@ import lite_model
 from lite_model import Bounded, Message, RolePolicy, RoleSpec
 from pydantic import BaseModel
 
-from lite_rag.config import LLMConfig, Role
+from lite_rag.config import Role
 from lite_rag.errors import ConfigError, LiteRagError
 from lite_rag.types import model_id
 
@@ -51,13 +51,17 @@ class Completion:
 
 
 def build_model(
-    config: LLMConfig, http_client: "httpx2.Client | None" = None
+    config: lite_model.ModelsConfig,
+    http_client: "httpx2.Client | None" = None,
+    *,
+    roles: lite_model.RoleSpec = ROLES,
 ) -> lite_model.LiteModel:
-    """One lite-model for every role. The whole config is checked here (an unknown backend, a
-    missing key or extra, a routing alias on a pinned role) and refused as ConfigError. Its
-    `.hooks` take lite-cache's `CacheHook` when the cache is on (S18)."""
+    """One lite-model for every role (the LLM's, or an embedder's, S19). The whole config is
+    checked here (an unknown backend, a missing key or extra, a routing alias on a pinned role)
+    and refused as ConfigError. Its `.hooks` take lite-cache's `CacheHook` when the cache is on
+    (S18)."""
     try:
-        return lite_model.build(config, ROLES, http_client=http_client)
+        return lite_model.build(config, roles, http_client=http_client)
     except lite_model.ConfigError as exc:
         raise ConfigError(str(exc)) from exc
 
