@@ -20,7 +20,7 @@ from pydantic_settings import (
 )
 
 from lite_rag.loaders import PdfLoader
-from lite_rag.types import model_id
+from lite_rag.types import RouteMode, model_id
 
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
@@ -32,7 +32,9 @@ def sql_identifier(name: str, value: str) -> str:
     return value
 
 
-Mode = Literal["vector", "bm25", "graph", "hybrid"]
+# A retrieval mode; `route` lets the router pick one of `retrieval.router.modes` per question (S21).
+Mode = Literal["vector", "bm25", "graph", "hybrid", "route"]
+
 RetrievalPath = Literal["vector", "bm25", "graph"]  # one retrieval path; hybrid fuses several
 
 
@@ -183,10 +185,28 @@ class BM25Config(BaseModel):
     b: float = Field(default=0.75, ge=0, le=1)
 
 
+class RouterConfig(BaseModel):
+    """Design §5, S21: for `mode: route`, the `route` role (a small model, default local
+    qwen3:1.7b without thinking) picks one of `modes` for each question. A failed call raises;
+    there is no default mode to fall back to."""
+
+    modes: list[RouteMode] = ["vector", "graph"]
+
+    @field_validator("modes")
+    @classmethod
+    def _two(cls, value: list[RouteMode]) -> list[RouteMode]:
+        if len(value) < 2 or len(set(value)) != len(value):
+            raise ValueError(
+                f"retrieval.router.modes must name at least two distinct modes: {value}"
+            )
+        return value
+
+
 class RetrievalConfig(BaseModel):
     """Design §5."""
 
     mode: Mode = "hybrid"
+    router: RouterConfig = RouterConfig()
     # The paths `hybrid` fuses; adding "graph" needs graph.enabled (design §5, S11).
     hybrid_paths: list[RetrievalPath] = ["vector", "bm25"]
     top_k: int = Field(default=5, gt=0, le=200)
@@ -286,7 +306,8 @@ def _moved_llm(value: Any, section: str, role: str) -> Any:
 _ANSWER_ONLY = ("temperature", "reasoning_effort", "max_output_tokens")
 
 # lite-rag's LLM roles (design §6). `contextual` and `graph` are index identity: never routed.
-Role = Literal["answer", "contextual", "graph"]
+# `route` picks a retrieval mode per question (S21).
+Role = Literal["answer", "contextual", "graph", "route"]
 
 
 class LLMConfig(ModelsConfig):
@@ -312,6 +333,10 @@ class LLMConfig(ModelsConfig):
         ),
         "graph": RoleConfig(
             backend="ollama", model="qwen3:1.7b", reasoning_effort="none", max_output_tokens=2048
+        ),
+        # S21: a one-word choice and a short reason; on the same small model as the index roles
+        "route": RoleConfig(
+            backend="ollama", model="qwen3:1.7b", reasoning_effort="none", max_output_tokens=256
         ),
     }
     backend: Name = "ollama"
@@ -449,7 +474,9 @@ class Settings(BaseSettings):
     def _graph(self) -> Self:
         if self.graph.enabled and self.store.backend != "postgres":
             raise ValueError("graph needs the postgres backend (design §5, S11)")
-        uses_graph = self.retrieval.mode == "graph" or "graph" in self.retrieval.hybrid_paths
+        r = self.retrieval
+        routes_to_graph = r.mode == "route" and "graph" in r.router.modes
+        uses_graph = r.mode == "graph" or "graph" in r.hybrid_paths or routes_to_graph
         if uses_graph and not self.graph.enabled:
             raise ValueError(
                 "retrieval uses the graph path: set graph.enabled (and rebuild the kb)"

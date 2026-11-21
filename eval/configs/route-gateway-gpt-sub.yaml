@@ -1,0 +1,10 @@
+# S21: the router through llm-gateway's gpt-sub (subscription; owner-approved runs only)
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+graph: {enabled: true}
+retrieval:
+  mode: route
+  hybrid_paths: [vector, bm25, graph]
+  router: {modes: [vector, hybrid]}
+llm:
+  roles:
+    route: {backend: gateway, model: gpt-sub, reasoning_effort: null}

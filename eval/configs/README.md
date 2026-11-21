@@ -8,6 +8,10 @@ uv run --all-extras literag eval -c eval/configs/chunk-fixed.yaml -c eval/config
 
 - `chunk-*.yaml` — the chunkers, all hybrid retrieval, 120-token chunks (small, so the choice matters)
 - `mode-vector.yaml`, `mode-bm25.yaml` — one retrieval path only (markdown chunks)
+- `route-*.yaml` — S21: the router picks vector or hybrid (vector + bm25 + graph) per question; qwen3:1.7b locally, or
+  llm-gateway's gpt-sub / claude-sub-haiku (subscription: only when the owner has started the gateway and asked).
+  Run with `graph-hybrid.yaml` in the same `literag eval` so both search one graph; `uv run python eval/route_ceiling.py`
+  prints the per-question ceiling from the stored runs
 - `hybrid-rerank.yaml` — hybrid plus the cross-encoder (needs the fastembed extra)
 - `chunk-semantic.yaml`, `chunk-semantic-chonkie.yaml` — semantic chunking, own and chonkie (`[chonkie]` extra)
 - `chunk-parent-child.yaml` (120/480) and `chunk-parent-child-small.yaml` (40/120, against

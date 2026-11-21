@@ -182,7 +182,7 @@ engine.stats(kb)
   `IDF(t) = ln(1 + (N − n(t) + 0.5)/(n(t) + 0.5))`，默认 `k1=1.5`、`b=0.75`。
 - **融合**：默认用 RRF，`score = Σ 1/(k + rank)`，`k=60`。也可以选加权融合：两路分数先各自做 min-max 归一化，再按权重相加。
 - **Rerank**（可选）：取融合后的前 n 条，用 cross-encoder 对每个 `(query, chunk)` 对重新打分，再取前 k 条。
-- **模式**：`vector`、`bm25`、`hybrid`。每个 `Hit` 都带各阶段的分数 `scores={vector, bm25, fused, rerank}` 和排名，方便对比和调试。
+- **模式**：`vector`、`bm25`、`hybrid`（S11 起还有 `graph`）；S21 起还有 `route`：`route` role（默认本地 qwen3:1.7b、不思考）对每个问题从 `retrieval.router.modes` 里选一种，每个 `Hit.route` 记下选了什么、哪个模型选的、理由；调用失败就报错，没有默认模式可退。每个 `Hit` 都带各阶段的分数 `scores={vector, bm25, fused, rerank}` 和排名，方便对比和调试。
 - **多个 kb 一起查**（S10，2026-11-09，为 llm-steward 的联合检索）：`RagEngine.search_kbs(kbs, query, …)` 把同一 namespace 里的几个 kb 当成一个来查。query 只嵌入一次；每一路（向量、BM25）在各 kb 取前 n 条，按分数合并成一张表，再只融合一次、只 rerank 一次。结果的 `Hit.kb` 标明来源（chunk id 只在 kb 内唯一，内部用"kb 序号/chunk id"作键）。向量分数在 kb 之间可比（一个引擎只有一个模型）；BM25 的 IDF 是各 kb 自己统计的，合并后的 BM25 表是近似的：小 kb 里同一个词的 IDF 更高，分数偏大，在默认路径（rerank 关）上会占到合并后 BM25 表的前排。开 rerank 时最终顺序完全可比。查询次数随 kb 数增长（每一轮每个 kb 两路各一次，加深时每个 kb 都重查）。留到以后：偏差成问题时，让 Store 返回每个 kb 的 (N, df(t), avgdl)，由引擎算统一的 IDF；kb 多时把各 kb 的查询并行，或在 PG 上一条 SQL 查多个 kb 的向量。还没写过文档（不存在）的 kb 跳过；名字不合法仍是 `InvalidRequest`。单 kb 的 `search` 走同一套流程，结果不变。
 - **图检索**（S11，2026-11-12，只做 local、只支持 PG）：
   - **建库**：kb 开了 `graph.enabled` 时，每个 chunk 调一次 LLM（role `graph`，默认本地 qwen3、关闭思考），按 `prompts/graph_*.j2` 抽出实体（名字、类型）和关系（两端实体、一句描述），回复受 JSON schema 约束（S16 起，`GraphReply`：`entities`、`relations` 两个列表都要有，没找到就是空列表）。只给 LLM 看 chunk 正文，不给文档标题：给了标题，本地模型会把标题当成每个 chunk 的实体，成为连接一切的枢纽（实测）。回复仍不合 schema 时用同一个 prompt 再要一次，第二次还不合就整篇写入失败，不换别的模型（规则 5）。关系端点不在实体列表里时补成实体。实体按规范化的名字合并（NFKC、casefold、合并空白），所以同一个人在不同文档里是同一个节点。图和 chunk 在同一个事务里写；抽取模型和 prompt 记进 kb 的身份（`chunker.graph`），换了就要新 kb。Chroma 后端不支持，配置时就报错。
@@ -364,6 +364,7 @@ lite-rag/
 | S18 接 lite-cache L1 | `cache` extra（lite-cache v0.1.0 release wheel，默认关）；`cache` 配置（`enabled`、`roles`、`ttl_s`、`schema`、`question_log`），用 lite-rag 的 `database_url`、只支持 PG；开着时 runtime 的 lite-model 注册 `CacheHook`；`contextual`、`graph`、`answer` 的调用都在 `call_context(scope="literag/<namespace>")` 里（lite-cache 设计 §0、§9）；`BoundedLLM.map` 按项 `copy_context()`（lite-model 0.2.1 的 `Bounded.map` 线程不继承 contextvar）；`Completion` / `Answer` 带 `cached`，CLI 标出缓存答案；`ask()` 可选的提问日志（JSONL） | 关闭时与之前等价（请求体、索引身份、回答都不变，不建 lite-cache 的 schema）；开启时：换 embedding 后 `reindex --into` 新 kb，`contextual` / `graph` 不发请求，产出的上下文和图与第一次逐字相同；同一问题第二次 `ask` 不调用 LLM，`cached` 为真；两个 namespace 互不命中；`contextual` 并发大于 1 时也命中；`roles` 里没有的 role 不缓存；store 不是 PG 时开启报 `ConfigError`；提问日志关闭时不写文件 |
 | S19 embedding 走 lite-model | `OllamaEmbedder`、`OpenAICompatEmbedder` 改由 lite-model 0.6.0 的 `embed()` 调用（分批、并发、400/413 对半拆、同模型重试都是它的）；lite-rag 的 `EmbeddingConfig` 不变，由它生成 lite-model 的配置；前缀（`_Prefixing`）、向量缓存（`CachingEmbedder`）、索引身份留在 lite-rag；Voyage / Cohere / Gemini / fastembed / sentence-transformers 不动 | 索引身份不变（provider、model、`model_id`、前缀）；`-m ollama` 下 `/v1/embeddings` 与 `/api/embed` 的向量逐元素相等（含 query / document 前缀）；吞吐不变（同一批文本、默认并发 4 × 批 32）；Ollama 不发 `dimensions`（以前也不发） |
 | S20 Voyage 走 lite-model、Voyage rerank | `VoyageEmbedder` 改由 lite-model 0.7.0 的 `voyage` 类型调用（`input_type` 按 query / document、`dimensions` 作 `output_dimension`、对半拆与重试都是 lite-model 的）；`rerank.provider: voyage`：`VoyageReranker` 走 lite-model 的 `rerank()`（`/v1/rerank`，付费），默认 `rerank-2.5`；`-m voyage` opt-in | 索引身份不变（provider `voyage`、model、前缀为空、dim）；请求体只多了 SDK 的 `encoding_format: "base64"`；reranker 按输入顺序给每条打分、`model_id` 为 `voyage/<model>`；缺 key 在构建时报 `ConfigError`；fastembed 的 reranker 不变、拒绝 voyage 专用字段；`-m voyage` 没有 key 时失败而不是跳过 |
+| S21 检索路由（先量上限） | `eval/route_ceiling.py`（只读已有的 lite-eval 运行：每题选对配置时的上限、最好的固定配置、延迟）；`mode: route`、`retrieval.router.modes`、`route` role（可路由，默认 ollama/qwen3:1.7b 不思考，最多 256 token）；`Router`（每个 router 的 JSON schema 只含它提供的模式，偏离就再问一次，仍不行报 `BadReply`）；`prompts/route_*.j2`（问题放在 nonce 块里当材料）；`Hit.route`；eval 输出里的 `route` span；`eval/configs/route-*.yaml`（qwen3:1.7b、llm-gateway 的 gpt-sub / claude-sub-haiku） | 路由选的模式就是实际执行的（与直接指定该模式的结果逐条相同）；每次搜索一次路由调用，固定模式不调用；没有 kb 时不调用；调用失败、两次都不在 schema 内都报错；`route` 模式里有 graph 而 graph 没开时配置报错；用 lite-eval 比较路由与最好的固定配置 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -492,6 +493,28 @@ lite-rag/
   - Codex：没有需要改的问题；一条小建议成立并修复（先红后绿）：`provider: voyage` 设了 fastembed 的 `cache_dir` 也报错。
   - 依赖：lite-model 0.7.0、lite-cache 0.3.2（它的 wheel 也指向 lite-model 0.7.0）。检查：pytest 570 passed（PG），`-m ollama` 10 passed，
     mypy、ruff 干净。
+- **S21 检索路由（2026-11-22）**：用户想要"先用一个小模型选检索方式"。embedding 是索引身份，不能按请求换，所以路由选的是检索模式。
+  2026-11-11 的测量（KB eval-results）说过：用 bge-m3 时，每题选对 vector 或 BM25 也只等于单用 vector，所以当时不做 `mode=auto`。这次先量上限。
+  - 上限（`eval/route_ceiling.py`，三组金标 60 题，六个配置：vector、bm25、hybrid、hybrid+rerank、graph-hybrid、graph-only）：
+    golden 32 题与 exact 12 题上 vector 已全中，逐题选也提不上去；rerank 一题都没帮上，只多约 1 秒。multihop 16 题：最好的固定配置
+    graph-hybrid 12，逐题选的上限 15。合计：vector 54/60，逐题上限 59/60，按题型选（多跳走 graph-hybrid、其余走 vector）56/60。过了门槛（≥2 题）。
+  - 设计：路由只在 `vector` 和 `hybrid`（vector + bm25 + graph）之间选。不给 graph-only：上限表里它在单跳题上只有 13/32，选错的代价太大；
+    hybrid 带 graph 在单跳题上只差 2 题。rerank 不进路由：它没有让任何一题变好。
+  - 结果（qwen3:1.7b 路由，与 graph-hybrid 同一次 eval、同一个图索引；vector 是同日的 mode-vector 运行）：路由 56/60（32、12、12），
+    graph-hybrid 53/60，vector 54/60。路由的选择全对：44 道单跳题全选 vector，12 道多跳题全选 hybrid（多跳集里 4 道关键词题两种都选过，都命中）。
+    也就是正好到了按题型选的上限；多跳题剩下的 4 题是图检索本身没找到。lite-eval compare 都不显著（McNemar p ≥ 0.5，题太少）。
+    代价：每次搜索多一次模型调用，p50 约 650–750 ms（本地 qwen3:1.7b），原来是 4–15 ms。
+  - 结论：不推翻 2026-11-11 的决定，默认不路由；`mode: route` 作为 opt-in 留下，适合问题里混有多跳题、又不想对所有问题都走图检索的场景。
+    llm-gateway 上 gpt-sub / claude-sub-haiku 的对比：配置已写好（`route-gateway-*.yaml`），gateway 这次没在运行，等用户启动后再跑。
+  - 测试：`tests/unit/test_route.py`、`tests/integration/test_route.py`，导入失败时全部红；后补的 span 测试改坏 span 的 kind 后变红。
+  - /simplify 采纳：每个 router 的 schema 只含它提供的模式（偏离由 schema 拒绝，结构和 graph 的两次尝试一样）；`_answered()` 共用；
+    `Route.mode` 用 `RouteMode`，去掉 cast；`router()` 建好后不再拿锁；提示词里重复的句子用变量；ceiling 脚本改用 lite-eval 的 `load_run`。
+    拒绝：路由和 query embedding 并发（本地 embedding 几十毫秒且有缓存，收益小）；提示词只渲染一次（每次渲染都要新 nonce）；
+    把 route 从每个 Hit 上移到一个返回类型里（会改 `search() -> list[Hit]` 的公开接口，llm-steward 在用）。
+  - Codex：两条 P2。成立一条，先写失败的测试再修：`search_kbs` 的 kb 都不存在时也调用了路由。拒绝一条："`mode: route` 只提供 vector / bm25 时
+    `hybrid_paths` 里的 graph 不该要求 graph.enabled"：`hybrid_paths` 也给按次指定的 `search(mode="hybrid")` 用，这条检查一直与 `mode` 无关。
+    缓存：`route` 不在 `cache.roles` 的默认里，要缓存路由就把它加进去。
+  - 检查：pytest 584 passed（PG），mypy、ruff 干净。
 
 ## 13. 待确认
 

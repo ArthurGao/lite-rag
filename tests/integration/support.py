@@ -25,6 +25,7 @@ def make_runtime(
     llm: LLM | None = None,
     graph: dict[str, Any] | None = None,
     graph_llm: LLM | None = None,
+    route_llm: LLM | None = None,
     llm_settings: dict[str, Any] | None = None,
     **chunking: Any,
 ) -> RagRuntime:
@@ -38,7 +39,15 @@ def make_runtime(
     )
     inner = embedder or FakeEmbedder(dim=8)
     wrapped: Embedder = CachingEmbedder(inner, store) if cache else inner
-    return RagRuntime(settings, store, wrapped, reranker=reranker, llm=llm, graph_llm=graph_llm)
+    return RagRuntime(
+        settings,
+        store,
+        wrapped,
+        reranker=reranker,
+        llm=llm,
+        graph_llm=graph_llm,
+        route_llm=route_llm,
+    )
 
 
 def make_engine(

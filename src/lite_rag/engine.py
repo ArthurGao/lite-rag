@@ -40,6 +40,7 @@ from lite_rag.llm import LLM, RoleLLM, build_model
 from lite_rag.loaders import doc_id_for, file_doc_id, load_file
 from lite_rag.ranking import Key, ranked
 from lite_rag.rerank import Reranker, build_reranker
+from lite_rag.route import Router
 from lite_rag.stores.base import (
     CachedStore,
     GraphStore,
@@ -52,7 +53,7 @@ from lite_rag.stores.base import (
 )
 from lite_rag.stores.factory import open_store
 from lite_rag.text import build_counter, terms
-from lite_rag.types import ChunkGraph, Document, Hit
+from lite_rag.types import ChunkGraph, Document, Hit, Route, RouteMode
 
 NAMESPACE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}(/[a-z0-9][a-z0-9_.-]{0,62}){0,3}$")
 KB_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,99}$")
@@ -98,6 +99,7 @@ class RagRuntime:
         llm: LLM | None = None,
         context_llm: LLM | None = None,
         graph_llm: LLM | None = None,
+        route_llm: LLM | None = None,
         model: LiteModel | None = None,
     ) -> None:
         """`reranker` and the LLMs are built from `settings` on first use when not given, so a
@@ -119,6 +121,8 @@ class RagRuntime:
         self._contextualizer: Contextualizer | None = None
         self._graph_llm = graph_llm
         self._graph_extractor: GraphExtractor | None = None
+        self._route_llm = route_llm
+        self._router: Router | None = None
         self._lock = threading.Lock()  # each model is built once, also under concurrent requests
 
     @classmethod
@@ -202,6 +206,18 @@ class RagRuntime:
                 llm = self._graph_llm or self._role("graph")
                 self._graph_extractor = GraphExtractor(llm, cfg.concurrency)
             return self._graph_extractor
+
+    def router(self) -> Router:
+        """The retrieval router (S21), built on first use: a search that does not route never
+        needs its model."""
+        if self._router is not None:  # every routed search: no lock once built
+            return self._router
+        with self._lock:
+            if self._router is None:
+                cfg = self.settings.retrieval
+                llm = self._route_llm or self._role("route")
+                self._router = Router(llm, cfg.router.modes, cfg.hybrid_paths)
+            return self._router
 
     def close(self) -> None:
         if self._cache_hook is not None:  # an injected model may outlive this runtime
@@ -398,6 +414,13 @@ class RagEngine:
         if k < 1:
             raise InvalidRequest(f"top_k must be at least 1, got {k}")
         mode = mode or cfg.mode
+        route = None
+        if mode == "route":  # one routing call per search, before any retrieval (S21)
+            if not refs:  # no kb to search: no model call either (Codex S21)
+                return []
+            with cache_context(self._settings, self.namespace, "route", query):
+                route = self.runtime.router().choose(query)
+            mode = route.mode
         paths = self._paths(mode)
         reranking = self._settings.rerank.enabled if rerank is None else rerank
         if not refs:
@@ -441,7 +464,7 @@ class RagEngine:
         ranks = {s: {c: i for i, (c, _) in enumerate(r, start=1)} for s, r in rankings.items()}
         scores = {s: dict(r) for s, r in rankings.items()}
         return [
-            self._hit(refs[key[0]].name, key, stored[key], score, scores, ranks)
+            self._hit(refs[key[0]].name, key, stored[key], score, scores, ranks, route)
             for key, score in candidates[:k]
         ]
 
@@ -483,7 +506,7 @@ class RagEngine:
             )
         return rankings
 
-    def _paths(self, mode: Mode) -> set[RetrievalPath]:
+    def _paths(self, mode: RouteMode) -> set[RetrievalPath]:
         """The retrieval paths `mode` runs: itself, or for hybrid the configured ones."""
         paths: set[RetrievalPath] = (
             set(self._settings.retrieval.hybrid_paths) if mode == "hybrid" else {mode}
@@ -518,6 +541,7 @@ class RagEngine:
         score: float,
         scores: dict[str, dict[Key, float]],
         ranks: dict[str, dict[Key, int]],
+        route: Route | None = None,
     ) -> Hit:
         """A hit for chunk `c` (ranked under `key`); a parent_child child returns its parent's
         text and position."""
@@ -536,6 +560,7 @@ class RagEngine:
             scores={s: m[key] for s, m in scores.items() if key in m},
             ranks={s: m[key] for s, m in ranks.items() if key in m},
             kb=kb,
+            route=route,
         )
 
     def ask(
