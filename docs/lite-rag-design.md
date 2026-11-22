@@ -98,10 +98,10 @@ engine.stats(kb)
 | `sentence_transformers` | 进程内 PyTorch（extra `[sentence-transformers]`，6.2.0；CPU / CUDA / Apple MPS；第一次用到时才加载 torch） | 任意 HF embedding 模型，例如 `Qwen/Qwen3-Embedding-0.6B` | 免费 |
 | `openai` | OpenAI 兼容的 `/v1/embeddings` | OpenAI `text-embedding-3-large` / `-small`（支持 `dimensions` 截断）；同一个实现也能接 DashScope（通义 `text-embedding-v*`）、SiliconFlow、Jina、vLLM、TEI | 付费（各家免费额度不一） |
 | `voyage` | lite-model 的 `voyage` 类型（S20 起；之前是直接 HTTP），`input_type` = query / document（Voyage 会自己在前面拼一句检索提示），`output_dimension`；每次最多 1000 条；key `VOYAGE_API_KEY` | `voyage-4-large`、`voyage-4`、`voyage-4-lite`、`voyage-3.5` 等。KB 中 tenderted 实测用过 voyage-3-large | 付费 |
-| `cohere` | 直接 HTTP `POST /v2/embed`，`input_type` = search_document / search_query，`embedding_types: [float]`；每次最多 96 条；key `CO_API_KEY` | `embed-v4.0`、`embed-multilingual-v3.0` 等 | 付费 |
-| `gemini` | 直接 HTTP `POST /v1beta/models/{model}:batchEmbedContents`，每条文本一个 Content（多个 part 放在一个 Content 里会被合成一个向量）；`gemini-embedding-001` 用 `taskType` = RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY，`gemini-embedding-2` 没有这个参数，任务写成前缀（见下表）；`outputDimensionality`；每次最多 100 条；key `GEMINI_API_KEY` | `gemini-embedding-2`、`gemini-embedding-001`（两者的向量空间不兼容） | 付费，有免费额度 |
+| `cohere` | lite-model 的 `cohere` 类型（S23 起；之前是直接 HTTP）`POST /v2/embed`，`input_type` = search_document / search_query，`embedding_types: [float]`；每次最多 96 条；key `CO_API_KEY` | `embed-v4.0`、`embed-multilingual-v3.0` 等 | 付费 |
+| `gemini` | lite-model 的 `gemini` 类型（S23 起；之前是直接 HTTP）`POST /v1beta/models/{model}:batchEmbedContents`，每条文本一个 Content（多个 part 放在一个 Content 里会被合成一个向量）；`gemini-embedding-001` 用 `taskType` = RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY，`gemini-embedding-2` 没有这个参数，任务写成前缀（见下表）；`outputDimensionality`；每次最多 100 条；key `GEMINI_API_KEY` | `gemini-embedding-2`、`gemini-embedding-001`（两者的向量空间不兼容） | 付费，有免费额度 |
 
-每个 provider 有自己的默认 `base_url`（`EMBEDDING_URLS`），`embedding.base_url` 可以覆盖（例如走代理）；`api_key_env` 不填时用各家 SDK 的惯例变量名。托管 provider 不用官方 SDK，是因为请求只有一个 POST，直接 HTTP 可以和 Ollama、OpenAI 兼容接口共用同一套分批、并发和重试（`_HTTPEmbedder`），也不多装依赖（S5c，2026-11-08）。
+每个 provider 有自己的默认 `base_url`（`EMBEDDING_URLS`），`embedding.base_url` 可以覆盖（例如走代理）；`api_key_env` 不填时用各家 SDK 的惯例变量名。所有 HTTP embedder 都走 lite-model（S19 ollama / openai、S20 voyage、S23 cohere / gemini）：分批、并发、400 / 413 对半拆、同模型重试都是它的，lite-rag 只把自己的 `EmbeddingConfig` 换成 lite-model 的配置，并保留前缀、向量缓存和索引身份。（历史：S5c 时它们是 lite-rag 自己的直接 HTTP 调用，共用 `_HTTPEmbedder`；S23 删除。）进程内的 fastembed / sentence-transformers 留在 lite-rag（lite-model 不带 ONNX / torch，见它的设计 §3.4）。
 
 - **"最好"由自己测**：榜单只能用来缩小候选范围。模型的取舍以本项目语料上的 `literag eval` 结果为准（AGENTS 规则 8）。所以 S5c 的验收是一张多模型对比表，列出 hit@k、MRR、延迟和费用（本地模型为 0；付费 API 只在用户提供 key 并同意后才跑）。
 - **接口**：每个 `Embedder` 都提供 `model_id`（`provider/model`，例如 `ollama/bge-m3:567m`）、`dim`、`prefixes`、`embed_documents` 和 `embed_query`。具体用哪个实现由配置决定，调用方只依赖这个接口。
@@ -366,6 +366,7 @@ lite-rag/
 | S20 Voyage 走 lite-model、Voyage rerank | `VoyageEmbedder` 改由 lite-model 0.7.0 的 `voyage` 类型调用（`input_type` 按 query / document、`dimensions` 作 `output_dimension`、对半拆与重试都是 lite-model 的）；`rerank.provider: voyage`：`VoyageReranker` 走 lite-model 的 `rerank()`（`/v1/rerank`，付费），默认 `rerank-2.5`；`-m voyage` opt-in | 索引身份不变（provider `voyage`、model、前缀为空、dim）；请求体只多了 SDK 的 `encoding_format: "base64"`；reranker 按输入顺序给每条打分、`model_id` 为 `voyage/<model>`；缺 key 在构建时报 `ConfigError`；fastembed 的 reranker 不变、拒绝 voyage 专用字段；`-m voyage` 没有 key 时失败而不是跳过 |
 | S21 检索路由（先量上限） | `eval/route_ceiling.py`（只读已有的 lite-eval 运行：每题选对配置时的上限、最好的固定配置、延迟）；`mode: route`、`retrieval.router.modes`、`route` role（可路由，默认 ollama/qwen3:1.7b 不思考，最多 256 token）；`Router`（每个 router 的 JSON schema 只含它提供的模式，偏离就再问一次，仍不行报 `BadReply`）；`prompts/route_*.j2`（问题放在 nonce 块里当材料）；`Hit.route`；eval 输出里的 `route` span；`eval/configs/route-*.yaml`（qwen3:1.7b、llm-gateway 的 gpt-sub / claude-sub-haiku） | 路由选的模式就是实际执行的（与直接指定该模式的结果逐条相同）；每次搜索一次路由调用，固定模式不调用；没有 kb 时不调用；调用失败、两次都不在 schema 内都报错；`route` 模式里有 graph 而 graph 没开时配置报错；用 lite-eval 比较路由与最好的固定配置 |
 | S22 每个 kb 选自己的 embedder | `embeddings.<name>`（命名 embedder，`embedding` 即 `default`）；`create_kb(kb, embedding=)`、`literag ingest/reindex --embedding`、`PUT /v1/kbs/{kb}` 的 `{embedding}`；打开 kb 时按它记录的身份（provider、model、前缀，再到 dim）找回 embedder，不加迁移；`search_kbs` 每个 embedder 只 embed 一次 query，各 embedder 的列表用 RRF 合并；跨 embedder 又没开 rerank 时警告一次；`literag eval --kb-per-dir`、跨语言评测集 `golden-xlang` | 只配一个 embedder 时结果逐条不变（分数是原始相似度）；新 kb 用指定的 embedder，已有 kb 换名字报错，未知名字 400；写已有 kb 用它自己的 embedder；`reindex --embedding` 换模型；评测：单一模型 vs 混用 vs 混用 + rerank |
+| S23 Cohere / Gemini 走 lite-model | `CohereEmbedder`、`GeminiEmbedder` 改由 lite-model 0.8.0 的 `cohere` / `gemini` 类型调用；`_HTTPEmbedder` 删除；`_LiteModelEmbedder._input_type(role)` 由各 embedder 决定是否把角色作 `input_type` 发出（Gemini 有前缀时不发） | 原有 vendor 测试（请求 URL、鉴权头、请求体、角色映射、批上限、前缀、缺 key）一条不改就通过，索引身份不变 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -568,6 +569,15 @@ lite-rag/
   - Codex：两条 P2，都成立，先写失败的测试再修：`--kb-per-dir` 的计费只看 default embedder（命名的付费 embedder 会被标成 free）；kb 名
     直接用目录名，可能重名或不合法，改为按位置编号。顺带发现 S21 的缺口：`mode: route` 时计费没算 route role，补上并先写测试。
   - 检查：pytest 606 passed（PG），`-m ollama` 10 passed，mypy、ruff 干净。llm-steward 只用 `upsert_text` 和 `search_kbs`，接口不变，这次不升它的 pin。
+- **S23 Cohere / Gemini 走 lite-model（2026-11-22）**：S19（ollama / openai）、S20（voyage）之后剩下的两个 HTTP embedder。lite-model 0.8.0 为它们加了
+  只做 embed 的 `cohere`、`gemini` 类型（它的设计 §3.4）。
+  - `CohereEmbedder`、`GeminiEmbedder` 改为 `_LiteModelEmbedder` 的子类；批上限 96 / 100 照旧；`vendor_backend()` 由 voyage、cohere、gemini 和 Voyage reranker 共用；
+    `input_type` 从类上的布尔改成方法 `_input_type(role)`，Gemini 在模型 profile 有前缀时返回 None（不发 taskType，和以前一样）。
+  - `_HTTPEmbedder`、`_retryable`、`_too_large` 删除（再没有人用）。
+  - 验证：`test_embedding_vendors.py` 里 Cohere / Gemini 的测试一条不改就通过（URL、`authorization` / `x-goog-api-key`、请求体、`input_type` / `taskType`、
+    `outputDimensionality`、批上限、gemini-embedding-2 的前缀、缺 key 报错），所以请求和索引身份都没变。
+  - Codex：两条都成立并修复：锁文件在同一个改动里升到 lite-model 0.8.0（和 lite-cache 0.3.3）；design 里描述 `_HTTPEmbedder` 为现行做法的那段改写为历史。
+    依赖：lite-model 0.8.0、lite-cache 0.3.3。检查：pytest 606 passed，`-m ollama` 通过，mypy、ruff 干净。
 
 ## 13. 待确认
 

@@ -8,7 +8,7 @@ import lite_model
 from lite_model import ModelsConfig, RolePolicy, RoleSpec
 
 from lite_rag.config import RerankConfig
-from lite_rag.embedding import fastembed_models, voyage_backend
+from lite_rag.embedding import fastembed_models, vendor_backend
 from lite_rag.errors import ConfigError, LiteRagError
 from lite_rag.extras import require_extra
 from lite_rag.llm import build_model
@@ -66,7 +66,7 @@ class VoyageReranker:
             model=config.model,
             timeout_s=config.timeout_s,
             max_retries=config.max_retries,
-            backends={"voyage": voyage_backend(config.base_url, config.api_key_env)},
+            backends={"voyage": vendor_backend("voyage", config.base_url, config.api_key_env)},
         )
         self._model = build_model(models, client, roles=ROLES)  # a missing key: ConfigError
         self.model_id = model_id("voyage", config.model)
