@@ -1,0 +1,6 @@
+# S24 (--kb-per-dir): the zh/ kb on Qwen3-Embedding-0.6B (best on zh), the en/ kb on the default bge-m3, with rerank
+embeddings:
+  zh: {provider: sentence_transformers, model: Qwen/Qwen3-Embedding-0.6B}
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+retrieval: {mode: vector}
+rerank: {enabled: true}

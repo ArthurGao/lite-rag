@@ -69,6 +69,21 @@ def test_the_cross_language_golden_set_matches_its_corpus() -> None:
     assert all(groups[q.doc] == q.doc_lang for q in questions)  # doc_lang is where it lives
 
 
+def test_the_hard_cross_language_set_matches_its_corpus_and_its_generator() -> None:
+    """S24: near-duplicate documents (tiers, regions, versions); each question's evidence is in its
+    document only, and the committed files are what eval/make_xlang_hard.py writes."""
+    from lite_rag.eval import corpus_groups
+
+    corpus = load_corpus(REPO / "eval" / "corpus-xlang-hard")
+    questions = load_golden(REPO / "eval" / "golden-xlang-hard.jsonl", corpus)
+    assert len(corpus) == 15 and len(questions) == 36
+    assert [q.kind for q in questions].count("cross") == 24
+    for q in questions:  # the evidence names its variant: no other document holds it
+        assert [d for d, (_, text) in corpus.items() if q.evidence in text] == [q.doc]
+    groups = corpus_groups(REPO / "eval" / "corpus-xlang-hard")
+    assert all(groups[q.doc] == q.doc_lang for q in questions)
+
+
 def test_a_golden_line_whose_quote_is_not_in_its_document_is_refused(tmp_path: Path) -> None:
     corpus = {"doc": ("Doc", "Refunds take seven days.")}
     golden = tmp_path / "golden.jsonl"

@@ -367,6 +367,7 @@ lite-rag/
 | S21 检索路由（先量上限） | `eval/route_ceiling.py`（只读已有的 lite-eval 运行：每题选对配置时的上限、最好的固定配置、延迟）；`mode: route`、`retrieval.router.modes`、`route` role（可路由，默认 ollama/qwen3:1.7b 不思考，最多 256 token）；`Router`（每个 router 的 JSON schema 只含它提供的模式，偏离就再问一次，仍不行报 `BadReply`）；`prompts/route_*.j2`（问题放在 nonce 块里当材料）；`Hit.route`；eval 输出里的 `route` span；`eval/configs/route-*.yaml`（qwen3:1.7b、llm-gateway 的 gpt-sub / claude-sub-haiku） | 路由选的模式就是实际执行的（与直接指定该模式的结果逐条相同）；每次搜索一次路由调用，固定模式不调用；没有 kb 时不调用；调用失败、两次都不在 schema 内都报错；`route` 模式里有 graph 而 graph 没开时配置报错；用 lite-eval 比较路由与最好的固定配置 |
 | S22 每个 kb 选自己的 embedder | `embeddings.<name>`（命名 embedder，`embedding` 即 `default`）；`create_kb(kb, embedding=)`、`literag ingest/reindex --embedding`、`PUT /v1/kbs/{kb}` 的 `{embedding}`；打开 kb 时按它记录的身份（provider、model、前缀，再到 dim）找回 embedder，不加迁移；`search_kbs` 每个 embedder 只 embed 一次 query，各 embedder 的列表用 RRF 合并；跨 embedder 又没开 rerank 时警告一次；`literag eval --kb-per-dir`、跨语言评测集 `golden-xlang` | 只配一个 embedder 时结果逐条不变（分数是原始相似度）；新 kb 用指定的 embedder，已有 kb 换名字报错，未知名字 400；写已有 kb 用它自己的 embedder；`reindex --embedding` 换模型；评测：单一模型 vs 混用 vs 混用 + rerank |
 | S23 Cohere / Gemini 走 lite-model | `CohereEmbedder`、`GeminiEmbedder` 改由 lite-model 0.8.0 的 `cohere` / `gemini` 类型调用；`_HTTPEmbedder` 删除；`_LiteModelEmbedder._input_type(role)` 由各 embedder 决定是否把角色作 `input_type` 发出（Gemini 有前缀时不发） | 原有 vendor 测试（请求 URL、鉴权头、请求体、角色映射、批上限、前缀、缺 key）一条不改就通过，索引身份不变 |
+| S24 更难的跨语言评测 | `eval/make_xlang_hard.py` 生成 `corpus-xlang-hard/{en,zh}`（15 篇几乎相同的档位 / 地区 / 版本文档）和 `golden-xlang-hard.jsonl`（36 题，24 道跨语言，每题证据只在一篇里）；`vector-rerank.yaml`、`embed-qwen3-0.6b-rerank.yaml`、`xlang-en-bge-zh-qwen3*.yaml` | 回答：给不同语料选不同 embedding 模型，是否比最好的单一模型更好 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -578,6 +579,27 @@ lite-rag/
     `outputDimensionality`、批上限、gemini-embedding-2 的前缀、缺 key 报错），所以请求和索引身份都没变。
   - Codex：两条都成立并修复：锁文件在同一个改动里升到 lite-model 0.8.0（和 lite-cache 0.3.3）；design 里描述 `_HTTPEmbedder` 为现行做法的那段改写为历史。
     依赖：lite-model 0.8.0、lite-cache 0.3.3。检查：pytest 606 passed，`-m ollama` 通过，mypy、ruff 干净。
+- **S24 更难的跨语言评测（2026-11-22）**：S22 的跨语言集对 bge-m3 太容易（24/24），回答不了"按语料选模型是否更好"。新集合每份制度有
+  几个几乎一样的版本（云服务的三个档位、备份制度的两个年份、三个地区的机房、两档采购、两类员工的休假），只差数字或条件；问题点名版本，
+  证据句只在那一篇（生成脚本断言，测试再检查一遍）。36 题：中文问英文 12、英文问中文 12、同语言 12。`--kb-per-dir`，en / zh 两个 kb。
+
+  | 配置 | hit@1 | hit@5 | MRR@10 | doc_lang=zh hit@1 | p50 ms |
+  | --- | --- | --- | --- | --- | --- |
+  | bge-m3 | 0.94 | 1.00 | 0.968 | 0.889 | 15 |
+  | Qwen3-Embedding-0.6B | **0.97** | 1.00 | 0.986 | 0.944 | 6–14 |
+  | multilingual-e5-large | 0.78 | 0.92 | 0.834 | 0.833 | 7 |
+  | MiniLM | 0.72 | 1.00 | 0.833 | 0.667 | 5 |
+  | bge-m3 + rerank | 0.97 | 1.00 | 0.981 | 0.944 | 813 |
+  | Qwen3 + rerank | 0.94 | 1.00 | 0.968 | 0.889 | 786 |
+  | 混用：en 用 bge-m3、zh 用 Qwen3（各自语言最好的） | 0.50 | 1.00 | 0.743 | 0.000 | 7 |
+  | 混用 + rerank | 0.94 | 1.00 | 0.968 | 0.889 | 815 |
+
+  读法：英文文档上 bge-m3 和 Qwen3 都全对，中文文档上 Qwen3 最好，所以"各用各最好的"就是 en bge-m3 + zh Qwen3。可它不开 rerank 是 0.50
+  （S22 的平局：两边第一名同分，en 的总在前）；开 rerank 是 0.94，不如单用 Qwen3（0.97）。rerank 在这组题上本身就让一道中文题掉了名次。
+  lite-eval compare：Qwen3 对混用 + rerank、对 Qwen3 + rerank、对 bge-m3 都是 3 个不一致的题，McNemar p = 1，不显著。
+  结论：给不同语料选不同模型，没有赢过最强的单一多语言模型；默认仍是一个 embedder。按 kb 选 embedder（S22）的价值是让不同模型的 kb
+  共存、方便换模型，不是提高命中。默认模型不改（bge-m3：换成 Qwen3 要所有 kb 重建索引，在 36 题上差 1 题、不显著，值不值得是用户的决定）。
+  - 测试：`test_the_hard_cross_language_set_matches_its_corpus_and_its_generator`（先看到红：把一题的 doc 改成它的兄弟文档）。
 
 ## 13. 待确认
 

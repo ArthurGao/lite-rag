@@ -1,0 +1,5 @@
+# S24: Qwen3-Embedding-0.6B with the cross-encoder rerank
+embedding: {provider: sentence_transformers, model: Qwen/Qwen3-Embedding-0.6B}
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+retrieval: {mode: vector}
+rerank: {enabled: true}
