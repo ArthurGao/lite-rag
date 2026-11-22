@@ -1,0 +1,4 @@
+# S24: bge-m3 vector search with the cross-encoder rerank (the fair baseline for mixed + rerank)
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+retrieval: {mode: vector}
+rerank: {enabled: true}
