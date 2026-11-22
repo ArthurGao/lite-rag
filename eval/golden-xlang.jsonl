@@ -1,0 +1,24 @@
+{"id": "x01", "question": "短途航班可以坐什么舱位？", "doc": "harbourline-travel", "evidence": "Flights shorter than six hours are booked in economy class.", "kind": "cross", "lang": "zh", "doc_lang": "en"}
+{"id": "x02", "question": "首都城市的酒店每晚最多能报销多少？", "doc": "harbourline-travel", "evidence": "Hotel stays are capped at 220 dollars per night in capital cities and 160 dollars elsewhere.", "kind": "cross", "lang": "zh", "doc_lang": "en"}
+{"id": "x03", "question": "出差回来后多久内必须交票据？", "doc": "harbourline-travel", "evidence": "Travel receipts must be submitted within 30 days of returning, or the claim is not paid.", "kind": "cross", "lang": "zh", "doc_lang": "en"}
+{"id": "x04", "question": "设备丢了要在多长时间内报告？", "doc": "harbourline-security", "evidence": "A lost or stolen device must be reported to the security desk within 24 hours.", "kind": "cross", "lang": "zh", "doc_lang": "en"}
+{"id": "x05", "question": "远程登录只用密码可以吗？", "doc": "harbourline-security", "evidence": "Staff sign in with a hardware security key; passwords alone are not accepted for remote access.", "kind": "cross", "lang": "zh", "doc_lang": "en"}
+{"id": "x06", "question": "带薪育儿假有多少周？", "doc": "harbourline-leave", "evidence": "Primary carers receive 26 weeks of paid parental leave.", "kind": "cross", "lang": "zh", "doc_lang": "en"}
+{"id": "x07", "question": "没休完的年假能留到明年几天？", "doc": "harbourline-leave", "evidence": "Up to five days of unused annual leave can be carried into the next year.", "kind": "cross", "lang": "zh", "doc_lang": "en"}
+{"id": "x08", "question": "新员工的试用期是多久？", "doc": "harbourline-onboarding", "evidence": "The probation period lasts 90 days and ends with a review meeting.", "kind": "cross", "lang": "zh", "doc_lang": "en"}
+{"id": "x09", "question": "How much is the daily meal allowance on a business trip?", "doc": "qingliu-reimbursement", "evidence": "出差期间每天的餐费补贴为八十元，无需提供发票。", "kind": "cross", "lang": "en", "doc_lang": "zh"}
+{"id": "x10", "question": "What must be attached to a taxi expense claim?", "doc": "qingliu-reimbursement", "evidence": "乘坐出租车报销时必须附上电子行程单。", "kind": "cross", "lang": "en", "doc_lang": "zh"}
+{"id": "x11", "question": "By what day of the month are expense claims due?", "doc": "qingliu-reimbursement", "evidence": "当月的报销单须在每月二十五日之前提交给财务部。", "kind": "cross", "lang": "en", "doc_lang": "zh"}
+{"id": "x12", "question": "How far ahead must the large meeting room be booked?", "doc": "qingliu-meeting-rooms", "evidence": "大会议室需要至少提前两天在系统中预订。", "kind": "cross", "lang": "en", "doc_lang": "zh"}
+{"id": "x13", "question": "When is a booked room released if nobody checks in?", "doc": "qingliu-meeting-rooms", "evidence": "预订开始后十五分钟内无人签到，会议室将被自动释放。", "kind": "cross", "lang": "en", "doc_lang": "zh"}
+{"id": "x14", "question": "How long is customer data kept after a contract ends?", "doc": "qingliu-data", "evidence": "客户数据在合同结束后保留三年，之后统一删除。", "kind": "cross", "lang": "en", "doc_lang": "zh"}
+{"id": "x15", "question": "Who has to approve an export of customer data?", "doc": "qingliu-data", "evidence": "导出任何客户数据都需要部门经理书面审批。", "kind": "cross", "lang": "en", "doc_lang": "zh"}
+{"id": "x16", "question": "How many free counselling sessions do staff get per year?", "doc": "qingliu-wellbeing", "evidence": "员工每年可以免费使用六次心理咨询服务。", "kind": "cross", "lang": "en", "doc_lang": "zh"}
+{"id": "s01", "question": "Which class are flights under six hours booked in?", "doc": "harbourline-travel", "evidence": "Flights shorter than six hours are booked in economy class.", "kind": "same", "lang": "en", "doc_lang": "en"}
+{"id": "s02", "question": "How many paid volunteer days does an employee get each year?", "doc": "harbourline-leave", "evidence": "Every employee may take two paid volunteer days each year.", "kind": "same", "lang": "en", "doc_lang": "en"}
+{"id": "s03", "question": "When does a new starter's equipment arrive?", "doc": "harbourline-onboarding", "evidence": "New starters receive their equipment by courier five business days before their start date.", "kind": "same", "lang": "en", "doc_lang": "en"}
+{"id": "s04", "question": "Is disk encryption required on company laptops?", "doc": "harbourline-security", "evidence": "Every company laptop has full-disk encryption turned on before it leaves the IT room.", "kind": "same", "lang": "en", "doc_lang": "en"}
+{"id": "s05", "question": "会议室的视频设备由哪个部门维护？", "doc": "qingliu-meeting-rooms", "evidence": "会议室的视频会议设备由行政部负责维护。", "kind": "same", "lang": "zh", "doc_lang": "zh"}
+{"id": "s06", "question": "业务数据库几点备份？", "doc": "qingliu-data", "evidence": "业务数据库每天凌晨两点自动备份。", "kind": "same", "lang": "zh", "doc_lang": "zh"}
+{"id": "s07", "question": "健身补贴每月多少钱？", "doc": "qingliu-wellbeing", "evidence": "员工每月可以领取两百元的健身补贴。", "kind": "same", "lang": "zh", "doc_lang": "zh"}
+{"id": "s08", "question": "员工多久可以做一次免费体检？", "doc": "qingliu-wellbeing", "evidence": "公司每年为每位员工安排一次免费体检。", "kind": "same", "lang": "zh", "doc_lang": "zh"}

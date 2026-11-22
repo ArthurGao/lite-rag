@@ -386,3 +386,18 @@ def test_a_server_with_keys_still_accepts_requests_with_an_origin(
 ) -> None:
     r = client.get("/v1/kbs", headers={**_h(keys["writer"]), "Origin": "https://app.example"})
     assert r.status_code == 200  # keys decide; the Origin rule is for open mode only
+
+
+def test_a_kb_is_created_with_a_named_embedder(store: PgStore) -> None:
+    """S22: `PUT /v1/kbs/{kb}` takes an optional `{"embedding": name}`; the reply names it."""
+    from lite_rag.testing import FakeEmbedder
+
+    settings = load_settings(chunking=CHUNKING)
+    runtime = make_runtime(store, embedders={"alt": FakeEmbedder(dim=16, model="alt")})
+    with TestClient(create_app(settings, runtime), base_url="http://localhost") as c:
+        h = {"X-LiteRag-Namespace": NS}
+        alt = c.put("/v1/kbs/c-alt", headers=h, json={"embedding": "alt"}).json()
+        assert (alt["embedding"], alt["embedding_model"], alt["dim"]) == ("alt", "alt", 16)
+        assert c.put("/v1/kbs/c-def", headers=h).json()["embedding"] == "default"
+        unknown = c.put("/v1/kbs/c-x", headers=h, json={"embedding": "nope"})
+        assert unknown.status_code == 400 and "no embedder 'nope'" in unknown.json()["detail"]

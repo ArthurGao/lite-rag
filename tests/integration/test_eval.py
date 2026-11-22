@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import psycopg
 import pytest
@@ -51,6 +52,21 @@ def test_the_multihop_golden_set_matches_its_corpus() -> None:
     assert len(corpus) == 8 and len(questions) == 16
     assert [q.kind for q in questions].count("multihop") == 12
     assert {q.lang for q in questions} == {"en", "zh"}
+
+
+def test_the_cross_language_golden_set_matches_its_corpus() -> None:
+    """S22: questions in one language about documents in the other, plus same-language ones;
+    the corpus keeps each language in its own subdirectory (for `--kb-per-dir`)."""
+    from lite_rag.eval import corpus_groups
+
+    corpus = load_corpus(REPO / "eval" / "corpus-xlang")
+    questions = load_golden(REPO / "eval" / "golden-xlang.jsonl", corpus)
+    groups = corpus_groups(REPO / "eval" / "corpus-xlang")
+    assert len(corpus) == 8 and len(questions) == 24
+    assert sorted(groups.values()).count("en") == 4 and set(groups.values()) == {"en", "zh"}
+    cross = [q for q in questions if q.kind == "cross"]
+    assert len(cross) == 16 and all(q.lang != q.doc_lang for q in cross)
+    assert all(groups[q.doc] == q.doc_lang for q in questions)  # doc_lang is where it lives
 
 
 def test_a_golden_line_whose_quote_is_not_in_its_document_is_refused(tmp_path: Path) -> None:
@@ -340,3 +356,105 @@ def test_the_cli_works_without_the_eval_extra(tmp_path: Path) -> None:
         "0",
         "1 error: install the eval extra: pip install 'lite-rag[eval]'",
     ]
+
+
+def test_kb_per_dir_builds_a_kb_per_subdirectory_with_its_named_embedder(
+    store: PgStore, pg: psycopg.Connection, tmp_path: Path
+) -> None:
+    """S22: `--kb-per-dir` puts each corpus subdirectory in its own kb, embedded by the named
+    embedder of that name (default otherwise), and searches them together."""
+    corpus = tmp_path / "corpus"
+    (corpus / "en").mkdir(parents=True)
+    (corpus / "zh").mkdir()
+    (corpus / "en" / "refunds.md").write_text("# Refunds\n\nRefunds take seven days.\n")
+    (corpus / "zh" / "shipping.md").write_text("# 运费\n\n满五十元包邮。\n")
+    golden = tmp_path / "golden.jsonl"
+    golden.write_text(
+        "\n".join(
+            json.dumps(q, ensure_ascii=False)
+            for q in [
+                {"id": "a", "question": "refunds seven days", "doc": "refunds",
+                 "evidence": "Refunds take seven days."},
+                {"id": "b", "question": "包邮", "doc": "shipping", "evidence": "满五十元包邮。"},
+            ]
+        )
+    )  # fmt: skip
+    settings = load_settings(
+        chunking=CHUNKING, retrieval={"mode": "vector"}, embeddings={"zh": {"model": "zh-model"}}
+    )
+    built: dict[str, FakeEmbedder] = {}
+
+    def embedder_for(config: Any) -> FakeEmbedder:
+        built[config.model] = FakeEmbedder(dim=8 if config.model == "zh-model" else 16)
+        built[config.model]._model = config.model
+        return built[config.model]
+
+    [result] = evaluate(
+        [("split", settings)], corpus, golden, store, root=tmp_path / "runs",
+        embedder_for=embedder_for, kb_per_dir=True,
+    )  # fmt: skip
+    assert result.record.status == "complete"
+    assert result.record.summary.metrics["hit@5"].value == 1.0
+    # the zh document went through the zh embedder only, the en one through the default
+    assert any("满五十元包邮" in t for c in built["zh-model"].calls for t in c)
+    assert not any("满五十元包邮" in t for c in built[settings.embedding.model].calls for t in c)
+    left = pg.execute(f"SELECT count(*) FROM {TEST_SCHEMA}.kbs").fetchone()
+    assert left == (0,)  # both kbs dropped
+
+
+def test_a_document_language_becomes_a_case_tag() -> None:
+    """S22: reports group cross-language questions by the document's language too."""
+    from lite_rag.eval import Question, golden_cases
+
+    cross = Question(
+        "x", "退款多久？", "refunds", "Refunds", kind="cross", lang="zh", doc_lang="en"
+    )
+    same = Question("s", "refunds", "refunds", "Refunds", lang="en")
+    tags = [c["tags"] for c in golden_cases([cross, same], "query")]
+    assert tags == [
+        {"kind": "cross", "lang": "zh", "doc_lang": "en"},
+        {"kind": "keyword", "lang": "en"},
+    ]
+
+
+def _target(store: PgStore, groups: dict[str, str], **settings: Any) -> Any:
+    from lite_rag.eval import LiteRagTarget
+
+    return LiteRagTarget(
+        load_settings(**settings), store=store, embedder_for=lambda c: FakeEmbedder(),
+        reranker_for=lambda c: None, corpus_for=lambda pdf: {}, groups=groups,  # type: ignore[arg-type, return-value]
+    )  # fmt: skip
+
+
+def test_kb_per_dir_bills_a_paid_named_embedder(store: PgStore) -> None:
+    """Codex S22: a subdirectory on a paid embedder makes the run per-token."""
+    paid = _target(
+        store,
+        {"a": "en", "b": "zh"},
+        embeddings={"zh": {"provider": "voyage", "model": "voyage-4"}},
+    )
+    assert paid.billing() == "per_token"
+    unused = _target(
+        store, {"a": "en"}, embeddings={"zh": {"provider": "voyage", "model": "voyage-4"}}
+    )
+    assert unused.billing() == "free"  # no kb is built with it
+
+
+def test_kb_per_dir_names_are_valid_and_distinct(store: PgStore) -> None:
+    """Codex S22: subdirectory names are not kb names (case, spaces, `root` vs the top)."""
+    from lite_rag.engine import KB_NAME
+
+    t = _target(store, {"a": "", "b": "root", "c": "Field Notes", "d": "x" * 120})
+    assert len(t.kbs) == 4 and all(KB_NAME.match(kb) for kb in t.kbs)
+
+
+def test_a_routed_run_bills_its_router() -> None:
+    """S21 gap found in S22: `mode: route` calls the route role on every question."""
+    from lite_rag.eval import billing
+
+    routed = {"mode": "route", "router": {"modes": ["vector", "bm25"]}}
+    api = load_settings(
+        retrieval=routed, llm={"roles": {"route": {"backend": "openai", "model": "x"}}}
+    )
+    assert billing(api) == "per_token"
+    assert billing(load_settings(retrieval=routed)) == "free"  # local qwen3:1.7b

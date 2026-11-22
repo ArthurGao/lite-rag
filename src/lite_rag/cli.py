@@ -106,6 +106,13 @@ def _engine(config: Path | None, namespace: str | None) -> Iterator[RagEngine]:
 
 
 KbArg = Annotated[str, typer.Argument(help="Knowledge base name")]
+EmbeddingOption = Annotated[
+    str | None,
+    typer.Option(
+        "--embedding",
+        help="A named embedder of `embeddings` (S22) for a new kb; default: `embedding`",
+    ),
+]
 RerankOption = Annotated[
     bool | None,
     typer.Option("--rerank/--no-rerank", help="Re-score candidates with the cross-encoder"),
@@ -124,12 +131,15 @@ def ingest(
     paths: Annotated[list[Path], typer.Argument(help="Files or directories (.md, .txt)")],
     config: ConfigOption = None,
     namespace: NamespaceOption = None,
+    embedding: EmbeddingOption = None,
 ) -> None:
     """Chunk, embed and index files into a knowledge base (unchanged files are skipped)."""
     files = find_files(paths)
     if not files:
         _fail("no supported files found")
     with _engine(config, namespace) as engine:
+        if embedding is not None:  # create the kb with it (an existing kb must match it)
+            engine.create_kb(kb, embedding=embedding)
         for path in files:
             result = engine.ingest(kb, path)
             state = "unchanged" if result.skipped else f"{result.chunks} chunks"
@@ -216,11 +226,12 @@ def reindex(
     into: Annotated[str, typer.Option("--into", help="The new knowledge base to build")],
     config: ConfigOption = None,
     namespace: NamespaceOption = None,
+    embedding: EmbeddingOption = None,
 ) -> None:
     """Rebuild a knowledge base under the current settings (another model or chunker) into a new
     one, from the documents' stored text. The old kb stays; switch clients to the new name."""
     with _engine(config, namespace) as engine:
-        n = engine.reindex(kb, into)
+        n = engine.reindex(kb, into, embedding=embedding)
     typer.echo(f"{n} documents reindexed into {into}")
 
 
@@ -322,6 +333,14 @@ def eval_command(
     ] = "lite_rag_eval",
     out: Annotated[Path | None, typer.Option(help="Also write the full report as JSON")] = None,
     keep: Annotated[bool, typer.Option(help="Keep the evaluation kbs afterwards")] = False,
+    kb_per_dir: Annotated[
+        bool,
+        typer.Option(
+            "--kb-per-dir",
+            help="A kb per corpus subdirectory, embedded by the named embedder of that name "
+            "(`embeddings.<dir>`; default otherwise), searched together (S22)",
+        ),
+    ] = False,
     root: Annotated[
         Path, typer.Option(help="lite-eval evaluation root: generated dataset, suite and runs")
     ] = Path("eval/lite-eval"),
@@ -367,6 +386,7 @@ def eval_command(
                 schema=schema,
                 keep=keep,
                 crosscheck=crosscheck,
+                kb_per_dir=kb_per_dir,
             )
         finally:
             store.close()

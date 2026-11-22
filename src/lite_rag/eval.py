@@ -63,6 +63,7 @@ class Question:
     # A free label; reports group by it (keyword | paraphrase | exact | multihop).
     kind: str = "keyword"
     lang: str = ""
+    doc_lang: str = ""  # S22: the document's language, when it is not the question's
     # S14: a case-insensitive regex a correct answer matches (`literag eval-answers` checks it).
     key_fact: str | None = None
 
@@ -82,6 +83,13 @@ def load_corpus(directory: Path, pdf: PdfLoader = "pypdf") -> Corpus:
         loaded = load_file(p, pdf)
         corpus[p.stem] = (loaded.title, loaded.text)
     return corpus
+
+
+def corpus_groups(directory: Path) -> dict[str, str]:
+    """Each document's subdirectory of `directory` ("" at the top), for `--kb-per-dir` (S22)."""
+    return {
+        p.stem: (p.relative_to(directory).parts[:-1] or ("",))[0] for p in find_files([directory])
+    }
 
 
 def load_golden(path: Path, corpus: Corpus) -> list[Question]:
@@ -153,7 +161,7 @@ _PAID = {"voyage", "cohere", "gemini"}  # embedding providers
 
 
 def billing(
-    settings: Settings, *, answers: bool = False
+    settings: Settings, *, answers: bool = False, embeddings: Sequence[str] = ()
 ) -> Literal["free", "per_token", "unknown"]:
     """For lite-eval's CI guard: free only when every model the run calls is local (`answers`:
     the run also calls the answer LLM). An LLM role counts by the channel lite-model resolves
@@ -162,11 +170,17 @@ def billing(
         "answer": answers,
         "contextual": settings.chunking.contextual.enabled,
         "graph": settings.graph.enabled,
+        "route": settings.retrieval.mode == "route",  # the router, on every question (S21)
     }
     channels = {settings.llm.target_of(role).channel for role, used in on.items() if used}
-    if settings.embedding.provider in _PAID or "api" in channels:
+    # S22: the named embedders a kb is built with (`--kb-per-dir`) are called too
+    providers = {
+        settings.embedding.provider,
+        *(settings.embeddings[n].provider for n in embeddings),
+    }
+    if providers & _PAID or "api" in channels:
         return "per_token"
-    if settings.embedding.provider in _LOCAL_EMBEDDERS and channels <= {"local"}:
+    if providers <= _LOCAL_EMBEDDERS and channels <= {"local"}:
         return "free"
     return "unknown"  # an OpenAI-compatible embedder, or a subscription
 
@@ -224,6 +238,7 @@ class LiteRagTarget:
         corpus_for: CorpusFor,
         llm_for: LlmFor | None = None,  # retrieval never calls an LLM; answers do
         keep: bool = False,
+        groups: dict[str, str] | None = None,  # doc -> subdirectory: a kb per subdirectory
     ) -> None:
         self.settings = settings
         self.store = store
@@ -232,7 +247,23 @@ class LiteRagTarget:
         self._llm_for = llm_for
         self._corpus_for = corpus_for
         self.keep = keep
-        self.kb = kb_for(index_identity(settings))
+        self._groups = groups or {}  # doc -> subdirectory; none: one kb for the corpus
+        self._identity = index_identity(settings)
+        dirs = sorted(set(self._groups.values()))
+        named = {d: settings.embeddings[d] for d in dirs if d in settings.embeddings}
+        if groups is not None:  # S22: which kbs, and the named embedders they are built with
+            self._identity |= {
+                "kb_per_dir": dirs,
+                "embeddings": {d: c.model_dump(exclude=_TRANSPORT_ONLY) for d, c in named.items()},
+            }
+        self.kb = kb_for(self._identity)
+        # kb -> (its subdirectory, its embedder name or None for the default)
+        # kb names by position: a directory name need not be a valid kb name (Codex S22)
+        self.kbs: dict[str, tuple[str, str | None]] = (
+            {f"{self.kb}-d{i}": (d, d if d in named else None) for i, d in enumerate(dirs)}
+            if groups is not None
+            else {self.kb: ("", None)}
+        )
         self.embedder: Embedder | None = None
         self.engine: RagEngine | None = None
         self.owns_kb = False  # the setup group's leader builds the kb and drops it
@@ -247,17 +278,22 @@ class LiteRagTarget:
         return {"latency_scope": latency_scope(self.settings)}
 
     def billing(self) -> Literal["free", "per_token", "unknown"]:
-        return billing(self.settings)
+        used = sorted({e for _, e in self.kbs.values() if e is not None})
+        return billing(self.settings, embeddings=used)
 
     def setup_identity(self) -> dict[str, Any]:
-        return index_identity(self.settings)
+        return self._identity
 
     def _start(self, embedder: Embedder) -> RagEngine:
         self.embedder = embedder
         rerank = self.settings.rerank
         reranker = self._reranker_for(rerank) if rerank.enabled else None
         llm = self._llm_for(self.settings.llm) if self._llm_for else None
-        runtime = RagRuntime(self.settings, self.store, embedder, reranker=reranker, llm=llm)
+        used = {e for _, e in self.kbs.values() if e is not None}  # only what a kb is built with
+        named = {n: self._embedder_for(self.settings.embeddings[n]) for n in used}
+        runtime = RagRuntime(
+            self.settings, self.store, embedder, reranker=reranker, llm=llm, embedders=named
+        )
         self.engine = runtime.engine(NAMESPACE)
         return self.engine
 
@@ -271,11 +307,15 @@ class LiteRagTarget:
         engine = self._start(self._embedder_for(self.settings.embedding))
         self.owns_kb = True
         try:
-            engine.delete_kb(self.kb)  # a leftover from an interrupted run would mix builds
-            for doc_id, (title, text) in self._corpus_for(self.settings.loader.pdf).items():
-                engine.upsert_text(self.kb, doc_id, title, text)
+            corpus = self._corpus_for(self.settings.loader.pdf)
+            for kb, (group, embedding) in self.kbs.items():
+                engine.delete_kb(kb)  # a leftover from an interrupted run would mix builds
+                engine.create_kb(kb, embedding=embedding)
+                for doc_id, (title, text) in corpus.items():
+                    if self._groups.get(doc_id, "") == group:
+                        engine.upsert_text(kb, doc_id, title, text)
             for case in dataset.cases:  # query vectors, kept by the embedding cache
-                engine.search(self.kb, self.query(case), top_k=1, mode="vector")
+                engine.search_kbs(list(self.kbs), self.query(case), top_k=1, mode="vector")
         except BaseException as exc:
             problem = self._drop()
             if problem:
@@ -290,7 +330,7 @@ class LiteRagTarget:
     async def run(self, case: Case) -> Output:
         assert self.engine is not None
         start = time.perf_counter()
-        hits = self.engine.search(self.kb, self.query(case), top_k=TOP_K)
+        hits = self.engine.search_kbs(list(self.kbs), self.query(case), top_k=TOP_K)
         latency_ms = (time.perf_counter() - start) * 1000  # with the routing call, if any
         route = hits[0].route if hits else None
         spans = [] if route is None else [route_span(route)]
@@ -303,14 +343,16 @@ class LiteRagTarget:
         )
 
     def _drop(self) -> str | None:
-        """Delete the kb; returns what failed, if anything."""
+        """Delete the kbs; returns what failed, if anything."""
         if self.keep:
             return None
-        try:
-            self.store.delete_kb(KbRef(NAMESPACE, self.kb))
-        except Exception as exc:
-            return f"{self.kb}: {type(exc).__name__}: {exc}"
-        return None
+        problems = []
+        for kb in self.kbs:
+            try:
+                self.store.delete_kb(KbRef(NAMESPACE, kb))
+            except Exception as exc:
+                problems.append(f"{kb}: {type(exc).__name__}: {exc}")
+        return "; ".join(problems) or None
 
     async def teardown(self) -> None:
         problem = self._drop() if self.owns_kb else None
@@ -361,7 +403,11 @@ def golden_cases(questions: Sequence[Question], input_key: str) -> list[dict[str
                 "evidence": q.evidence,
                 **({"key_fact": q.key_fact} if q.key_fact else {}),
             },
-            "tags": {"kind": q.kind, **({"lang": q.lang} if q.lang else {})},
+            "tags": {
+                "kind": q.kind,
+                **({"lang": q.lang} if q.lang else {}),
+                **({"doc_lang": q.doc_lang} if q.doc_lang else {}),  # S22
+            },
         }
         for q in questions
     ]
@@ -432,6 +478,7 @@ def evaluate(
     keep: bool = False,
     ci: bool | None = None,
     crosscheck: bool = False,
+    kb_per_dir: bool = False,
 ) -> list[RunResult]:
     """One lite-eval run per config, all on `store`, in the order given. The corpus is parsed
     once per PDF loader, embedders and rerankers built once per distinct config; the golden set
@@ -447,6 +494,7 @@ def evaluate(
     suite = load_suite(suite_path, root)
     dataset = load_dataset(suite.dataset_path)
 
+    groups = corpus_groups(corpus) if kb_per_dir else None
     embedders: dict[str, Embedder] = {}
     rerankers: dict[str, Reranker] = {}
     make_embedder = embedder_for or (lambda c: build_embedder(c, cache=store))
@@ -474,6 +522,7 @@ def evaluate(
                 reranker_for=reranker,
                 corpus_for=corpora.__getitem__,
                 keep=keep,
+                groups=groups,
             ),
         )
         for name, (_, settings) in zip(names, configs, strict=True)

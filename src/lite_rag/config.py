@@ -20,7 +20,7 @@ from pydantic_settings import (
 )
 
 from lite_rag.loaders import PdfLoader
-from lite_rag.types import RouteMode, model_id
+from lite_rag.types import DEFAULT_EMBEDDING, RouteMode, model_id
 
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
@@ -448,7 +448,10 @@ class Settings(BaseSettings):
     namespace: str | None = None
     store: StoreConfig = StoreConfig()
     loader: LoaderConfig = LoaderConfig()
-    embedding: EmbeddingConfig = EmbeddingConfig()
+    embedding: EmbeddingConfig = EmbeddingConfig()  # the embedder named `default`
+    # S22: named embedders a kb can be created with (`create_kb(kb, embedding=<name>)`); a kb is
+    # opened with whichever configured embedder matches the identity it recorded.
+    embeddings: dict[str, EmbeddingConfig] = {}
     chunking: ChunkingConfig = ChunkingConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
     graph: GraphConfig = GraphConfig()
@@ -456,6 +459,17 @@ class Settings(BaseSettings):
     llm: LLMConfig = LLMConfig()
     cache: CacheConfig = CacheConfig()
     server: ServerConfig = ServerConfig()
+
+    @field_validator("embeddings")
+    @classmethod
+    def _embedding_names(cls, value: dict[str, EmbeddingConfig]) -> dict[str, EmbeddingConfig]:
+        for name in value:
+            if name == DEFAULT_EMBEDDING or not IDENTIFIER.match(name):
+                raise ValueError(
+                    f"embeddings: {name!r} must be a lowercase identifier other than "
+                    f"{DEFAULT_EMBEDDING!r} (that one is `embedding`)"
+                )
+        return value
 
     @model_validator(mode="after")
     def _cache(self) -> Self:
