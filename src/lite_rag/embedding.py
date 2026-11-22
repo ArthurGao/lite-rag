@@ -7,11 +7,8 @@ errors) — never an empty or partial result, and never a different model.
 """
 
 import hashlib
-import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
-from itertools import batched
 from typing import Any, ClassVar, Literal, Protocol
 
 import httpx2
@@ -20,7 +17,7 @@ from lite_model import ModelsConfig, RolePolicy, RoleSpec
 
 from lite_rag.config import EmbeddingConfig
 from lite_rag.errors import ConfigError, LiteRagError
-from lite_rag.extras import api_key, require_extra
+from lite_rag.extras import require_extra
 from lite_rag.llm import build_model
 from lite_rag.model_profiles import Prefixes, prefixes_for
 from lite_rag.stores.base import VectorCache
@@ -58,16 +55,6 @@ class Embedder(Protocol):
     def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
 
     def embed_query(self, text: str) -> list[float]: ...
-
-
-def _retryable(exc: Exception) -> bool:
-    if isinstance(exc, httpx2.HTTPStatusError):
-        return exc.response.status_code == 429 or exc.response.status_code >= 500
-    return isinstance(exc, httpx2.TransportError)
-
-
-def _too_large(exc: BaseException | None) -> bool:
-    return isinstance(exc, httpx2.HTTPStatusError) and exc.response.status_code in (400, 413)
 
 
 class _Prefixing:
@@ -113,84 +100,6 @@ class _ProbedDim(_Prefixing):
             )
 
 
-class _HTTPEmbedder(_ProbedDim):
-    """Batching, bounded concurrency and retry with exponential backoff, for HTTP embedding APIs.
-    Each provider declares its facts — `default_url`, `key_env` (where its key comes from by
-    default; None: no key unless configured) and `max_batch` (its limit on texts per call) — and
-    implements `_call`."""
-
-    default_url: str
-    key_env: str | None = None
-    max_batch: int | None = None
-
-    def __init__(
-        self,
-        config: EmbeddingConfig,
-        client: httpx2.Client | None = None,
-        sleep: Sleep = time.sleep,
-    ) -> None:
-        super().__init__(config)
-        # A hosted API without its key fails here, before any call.
-        self._key = api_key(f"embedding ({self.provider})", config.api_key_env, self.key_env)
-        self._base_url = (config.base_url or self.default_url).rstrip("/")
-        self._batch = min(config.batch_size, self.max_batch or config.batch_size)
-        self._client = client or httpx2.Client(timeout=config.timeout_s)
-        self._sleep = sleep
-
-    def _embed(self, texts: list[str], role: Role) -> list[list[float]]:
-        batches = [list(b) for b in batched(texts, self._batch)]
-        if len(batches) <= 1 or self._config.max_concurrency == 1:
-            results = [self._fitting(b, role) for b in batches]
-        else:
-            with ThreadPoolExecutor(self._config.max_concurrency) as pool:
-                results = list(pool.map(lambda b: self._fitting(b, role), batches))
-        vectors = [v for batch in results for v in batch]
-        self._check(vectors, len(texts))
-        return vectors
-
-    def _check(self, vectors: list[list[float]], expected: int) -> None:
-        if len(vectors) != expected:
-            raise EmbeddingError(f"{self.model}: asked for {expected} vectors, got {len(vectors)}")
-        self._check_dim(vectors)
-
-    def _fitting(self, batch: list[str], role: Role) -> list[list[float]]:
-        """One batch. A batch the API refuses as too large (400 / 413 — e.g. a limit on total
-        tokens per request, which depends on the model) is halved and each half sent
-        again, down to a single text; a single text that is refused is an error."""
-        try:
-            return self._with_retry(batch, role)
-        except EmbeddingError as exc:
-            if len(batch) == 1 or not _too_large(exc.__cause__):
-                raise
-            half = len(batch) // 2
-            return self._fitting(batch[:half], role) + self._fitting(batch[half:], role)
-
-    def _with_retry(self, batch: list[str], role: Role) -> list[list[float]]:
-        attempts = self._config.max_retries + 1
-        for attempt in range(attempts):
-            try:
-                return self._call(batch, role)
-            except Exception as exc:
-                if not _retryable(exc) or attempt == attempts - 1:
-                    raise EmbeddingError(
-                        f"{model_id(self.provider, self.model)} failed after {attempt + 1} "
-                        f"attempt(s): {type(exc).__name__}: {exc}"
-                    ) from exc
-                self._sleep(min(0.5 * 2**attempt, 8.0))
-        raise AssertionError("unreachable")
-
-    def _call(self, batch: list[str], role: Role) -> list[list[float]]:
-        raise NotImplementedError
-
-    def _bearer(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._key}"} if self._key else {}
-
-    def _post(self, url: str, body: dict[str, Any], headers: dict[str, str]) -> Any:
-        response = self._client.post(url, json=body, headers=headers)
-        response.raise_for_status()
-        return response.json()
-
-
 class _LiteModelEmbedder(_ProbedDim):
     """An embedder whose calls are lite-model's `embed()` (S19; its design §3.2): batching,
     bounded concurrency, halving a batch refused as too large, retries of the same model on
@@ -227,12 +136,14 @@ class _LiteModelEmbedder(_ProbedDim):
         """The API root lite-model sends to (its resolved target)."""
         return self._model.target(ROLE).base_url
 
-    # Whether the API takes the call's role as lite-model's `input_type` (Voyage, S20).
-    input_type: ClassVar[bool] = False
+    def _input_type(self, role: Role) -> Role | None:
+        """The role sent as lite-model's `input_type`: none by default (the prefixes carry it);
+        the APIs that take one say so (Voyage S20, Cohere and Gemini S23)."""
+        return None
 
     def _embed(self, texts: list[str], role: Role) -> list[list[float]]:
         try:
-            kind = role if self.input_type else None
+            kind = self._input_type(role)
             vectors = self._model.embed(ROLE, texts, input_type=kind).vectors
         except lite_model.ModelError as exc:
             raise EmbeddingError(str(exc)) from exc
@@ -270,9 +181,10 @@ class OpenAICompatEmbedder(_LiteModelEmbedder):
         return where | {"keyless": True}
 
 
-def voyage_backend(base_url: str | None, api_key_env: str | None) -> dict[str, Any]:
-    """lite-model's `voyage` backend entry for the embedder and the reranker (S20)."""
-    where: dict[str, Any] = {"type": "voyage"}
+def vendor_backend(kind: str, base_url: str | None, api_key_env: str | None) -> dict[str, Any]:
+    """lite-model's backend entry for a hosted vendor type (voyage S20, cohere / gemini S23):
+    the type's own endpoint and key variable unless configured."""
+    where: dict[str, Any] = {"type": kind}
     if base_url:
         where["base_url"] = base_url.rstrip("/")
     if api_key_env:
@@ -287,72 +199,51 @@ class VoyageEmbedder(_LiteModelEmbedder):
     float32 (the SDK's default; Voyage takes no "float"), the same numbers as its JSON floats."""
 
     provider = "voyage"
-    input_type = True
+
+    def _input_type(self, role: Role) -> Role | None:
+        return role
 
     def _backend(self, config: EmbeddingConfig) -> dict[str, Any]:
-        return voyage_backend(config.base_url, config.api_key_env)
+        return vendor_backend("voyage", config.base_url, config.api_key_env)
 
     def _role(self, config: EmbeddingConfig) -> dict[str, Any]:
         # Voyage takes at most 1000 texts per request
         return super()._role(config) | {"batch_size": min(config.batch_size, 1000)}
 
 
-class CohereEmbedder(_HTTPEmbedder):
-    """Cohere `POST /v2/embed` (paid): `input_type` search_document / search_query, float
-    vectors; at most 96 texts per call."""
+class CohereEmbedder(_LiteModelEmbedder):
+    """Cohere `POST /v2/embed` (paid), through lite-model's `cohere` type (0.8.0, S23): the role
+    as `input_type` (search_document / search_query), float vectors, `output_dimension`; at most
+    96 texts per call."""
 
     provider = "cohere"
-    default_url = "https://api.cohere.com/v2"
-    key_env = "CO_API_KEY"
-    max_batch = 96
-    INPUT_TYPES: ClassVar[dict[Role, str]] = {
-        "document": "search_document",
-        "query": "search_query",
-    }
 
-    def _call(self, batch: list[str], role: Role) -> list[list[float]]:
-        body: dict[str, Any] = {
-            "model": self.model,
-            "texts": batch,
-            "input_type": self.INPUT_TYPES[role],
-            "embedding_types": ["float"],
-        }
-        if self._config.dimensions:
-            body["output_dimension"] = self._config.dimensions
-        reply = self._post(f"{self._base_url}/embed", body, self._bearer())
-        embeddings: list[list[float]] = reply["embeddings"]["float"]
-        return embeddings
+    def _input_type(self, role: Role) -> Role | None:
+        return role
+
+    def _backend(self, config: EmbeddingConfig) -> dict[str, Any]:
+        return vendor_backend("cohere", config.base_url, config.api_key_env)
+
+    def _role(self, config: EmbeddingConfig) -> dict[str, Any]:
+        return super()._role(config) | {"batch_size": min(config.batch_size, 96)}
 
 
-class GeminiEmbedder(_HTTPEmbedder):
-    """Gemini `POST /v1beta/models/{model}:batchEmbedContents` (paid, free tier). One Content per
-    text: several parts in one Content are merged into a single vector. The role is a text
-    prefix where the model profile gives one (gemini-embedding-2, which has no task type) and
-    a `taskType` otherwise (gemini-embedding-001 and other models): never neither."""
+class GeminiEmbedder(_LiteModelEmbedder):
+    """Gemini `POST /v1beta/models/{model}:batchEmbedContents` (paid, free tier), through
+    lite-model's `gemini` type (0.8.0, S23). One Content per text. The role is a text prefix
+    where the model profile gives one (gemini-embedding-2, which has no task type) and a
+    `taskType` otherwise (gemini-embedding-001 and other models): never neither."""
 
     provider = "gemini"
-    default_url = "https://generativelanguage.googleapis.com/v1beta"
-    key_env = "GEMINI_API_KEY"
-    max_batch = 100
-    TASK_TYPES: ClassVar[dict[Role, str]] = {
-        "document": "RETRIEVAL_DOCUMENT",
-        "query": "RETRIEVAL_QUERY",
-    }
 
-    def _call(self, batch: list[str], role: Role) -> list[list[float]]:
-        name = f"models/{self.model}"
-        shared: dict[str, Any] = {"model": name}
-        if not (self.prefixes.query or self.prefixes.document):
-            shared["taskType"] = self.TASK_TYPES[role]
-        if self._config.dimensions:
-            shared["outputDimensionality"] = self._config.dimensions
-        requests = [{**shared, "content": {"parts": [{"text": t}]}} for t in batch]
-        reply = self._post(
-            f"{self._base_url}/{name}:batchEmbedContents",
-            {"requests": requests},
-            {"x-goog-api-key": self._key or ""},
-        )
-        return [e["values"] for e in reply["embeddings"]]
+    def _input_type(self, role: Role) -> Role | None:
+        return None if self.prefixes.query or self.prefixes.document else role
+
+    def _backend(self, config: EmbeddingConfig) -> dict[str, Any]:
+        return vendor_backend("gemini", config.base_url, config.api_key_env)
+
+    def _role(self, config: EmbeddingConfig) -> dict[str, Any]:
+        return super()._role(config) | {"batch_size": min(config.batch_size, 100)}
 
 
 class FastEmbedEmbedder(_Prefixing):
