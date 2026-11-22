@@ -365,6 +365,7 @@ lite-rag/
 | S19 embedding 走 lite-model | `OllamaEmbedder`、`OpenAICompatEmbedder` 改由 lite-model 0.6.0 的 `embed()` 调用（分批、并发、400/413 对半拆、同模型重试都是它的）；lite-rag 的 `EmbeddingConfig` 不变，由它生成 lite-model 的配置；前缀（`_Prefixing`）、向量缓存（`CachingEmbedder`）、索引身份留在 lite-rag；Voyage / Cohere / Gemini / fastembed / sentence-transformers 不动 | 索引身份不变（provider、model、`model_id`、前缀）；`-m ollama` 下 `/v1/embeddings` 与 `/api/embed` 的向量逐元素相等（含 query / document 前缀）；吞吐不变（同一批文本、默认并发 4 × 批 32）；Ollama 不发 `dimensions`（以前也不发） |
 | S20 Voyage 走 lite-model、Voyage rerank | `VoyageEmbedder` 改由 lite-model 0.7.0 的 `voyage` 类型调用（`input_type` 按 query / document、`dimensions` 作 `output_dimension`、对半拆与重试都是 lite-model 的）；`rerank.provider: voyage`：`VoyageReranker` 走 lite-model 的 `rerank()`（`/v1/rerank`，付费），默认 `rerank-2.5`；`-m voyage` opt-in | 索引身份不变（provider `voyage`、model、前缀为空、dim）；请求体只多了 SDK 的 `encoding_format: "base64"`；reranker 按输入顺序给每条打分、`model_id` 为 `voyage/<model>`；缺 key 在构建时报 `ConfigError`；fastembed 的 reranker 不变、拒绝 voyage 专用字段；`-m voyage` 没有 key 时失败而不是跳过 |
 | S21 检索路由（先量上限） | `eval/route_ceiling.py`（只读已有的 lite-eval 运行：每题选对配置时的上限、最好的固定配置、延迟）；`mode: route`、`retrieval.router.modes`、`route` role（可路由，默认 ollama/qwen3:1.7b 不思考，最多 256 token）；`Router`（每个 router 的 JSON schema 只含它提供的模式，偏离就再问一次，仍不行报 `BadReply`）；`prompts/route_*.j2`（问题放在 nonce 块里当材料）；`Hit.route`；eval 输出里的 `route` span；`eval/configs/route-*.yaml`（qwen3:1.7b、llm-gateway 的 gpt-sub / claude-sub-haiku） | 路由选的模式就是实际执行的（与直接指定该模式的结果逐条相同）；每次搜索一次路由调用，固定模式不调用；没有 kb 时不调用；调用失败、两次都不在 schema 内都报错；`route` 模式里有 graph 而 graph 没开时配置报错；用 lite-eval 比较路由与最好的固定配置 |
+| S22 每个 kb 选自己的 embedder | `embeddings.<name>`（命名 embedder，`embedding` 即 `default`）；`create_kb(kb, embedding=)`、`literag ingest/reindex --embedding`、`PUT /v1/kbs/{kb}` 的 `{embedding}`；打开 kb 时按它记录的身份（provider、model、前缀，再到 dim）找回 embedder，不加迁移；`search_kbs` 每个 embedder 只 embed 一次 query，各 embedder 的列表用 RRF 合并；跨 embedder 又没开 rerank 时警告一次；`literag eval --kb-per-dir`、跨语言评测集 `golden-xlang` | 只配一个 embedder 时结果逐条不变（分数是原始相似度）；新 kb 用指定的 embedder，已有 kb 换名字报错，未知名字 400；写已有 kb 用它自己的 embedder；`reindex --embedding` 换模型；评测：单一模型 vs 混用 vs 混用 + rerank |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -529,6 +530,44 @@ lite-rag/
     `hybrid_paths` 里的 graph 不该要求 graph.enabled"：`hybrid_paths` 也给按次指定的 `search(mode="hybrid")` 用，这条检查一直与 `mode` 无关。
     缓存：`route` 不在 `cache.roles` 的默认里，要缓存路由就把它加进去。
   - 检查：pytest 584 passed（PG），mypy、ruff 干净。
+- **S22 每个 kb 选自己的 embedder（2026-11-22）**：S21 的下一阶段，用户定的：建 kb 时指定（不自动挑），新写跨语言语料。
+  - 做法：`Settings.embeddings` 是命名的额外 embedder；runtime 按名字持有 `Indexer`（embedder、token 计数器、chunker），非 default 的第一次
+    用到才建（只查 default kb 的服务不需要别家的 key）。kb 表本来就记了 provider、model、dim、前缀，所以不加迁移：打开 kb 时按记录的
+    身份找回已配置的 embedder（`RagRuntime.signature` 只读配置、不建 embedder；同模型不同维度时才比 dim）。找不到就 `KbMismatch`，信息
+    列出已配置的名字；只配 default 时行为和以前一样。`search_kbs` 按 embedder 分组，每组 embed 一次 query，组内按相似度合并（和以前
+    一样），组间用 RRF；`Hit.scores["vector"]` 仍是它在自己模型下的相似度。contextualizer 的上下文预算仍用 default 的计数器（只影响
+    LLM 输入的截断，不进索引身份）。
+  - 跨语言评测集（`eval/corpus-xlang/{en,zh}`，各 4 篇虚构制度文档；`golden-xlang.jsonl` 24 题：中文问英文文档 8、英文问中文文档 8、同语言 8；
+    新字段 `doc_lang`，报告按它分组）。`literag eval --kb-per-dir`：每个子目录一个 kb，子目录名等于某个命名 embedder 时用它。
+    结果（hit@1 / hit@5 / MRR@10，用最终代码重跑，数字一致）：
+
+    | 配置 | hit@1 | hit@5 | MRR@10 | p50 ms |
+    | --- | --- | --- | --- | --- |
+    | bge-m3（两个 kb 都用） | 1.00 | 1.00 | 1.000 | 7 |
+    | Qwen3-Embedding-0.6B | 0.92 | 1.00 | 0.951 | 8 |
+    | MiniLM | 0.92 | 1.00 | 0.918 | 5 |
+    | multilingual-e5-large | 0.58 | 0.83 | 0.683 | 7 |
+    | 混用：en 用 Qwen3、zh 用 bge-m3 | 0.46 | 1.00 | 0.717 | 10 |
+    | 混用：en 用 e5、zh 用 bge-m3 | 0.50 | 1.00 | 0.750 | 8 |
+    | 混用 Qwen3 / bge-m3 + rerank | **1.00** | 1.00 | 1.000 | 813 |
+    | 混用 Qwen3 / bge-m3，hybrid | 0.42 | 0.92 | 0.587 | 14 |
+
+    读法：bge-m3 单独就全对，这组题对它太容易，混用不可能更好。混用时 hit@5 不变，但 hit@1 掉到一半：两个 kb 各自的第一名在 RRF 里
+    同分（都是 1/(k+1)），按 key 排时总是先出 en kb 的；doc_lang=zh 的题 hit@1 全是 0。rank 融合分不出哪个 kb 的第一名更好，这是方案里
+    预料的风险。cross-encoder rerank 让两边的分数可比，恢复到 1.00（+0.8 秒）；hybrid 加 BM25 反而更差。
+  - 结论：能力保留（让 Voyage 这类 kb 和本地 kb 共存、用 `reindex --embedding` 换模型）；跨 embedder 的 `search_kbs` 应开 rerank。
+    引擎在跨 embedder 又没开 rerank 时警告一次（`RagRuntime.warn_once`）。
+  - 测试：`tests/unit/test_kb_embedders.py`、`tests/integration/test_kb_embedders.py`、`test_eval.py`（`--kb-per-dir`、xlang 金标、`doc_lang`、计费、kb 名）、
+    `test_cli.py`、`test_server.py`；都先看到红。"只有一个 embedder 时和以前一样"的测试第一版太弱（把融合改成总走 RRF 仍然通过），
+    改成和余弦相似度逐条比对后再验证变红。
+  - /simplify 采纳：`Indexer`/默认属性只存一份（`embedder`/`counter`/`chunker` 变成派生属性）；`KbMismatch` 文本合成 `_mismatch`；`KbInfo.signature()`；
+    `DEFAULT_EMBEDDING` 放到 `types.py`；`_open` 写路径一次 `get_or_create_kb`、检查过且名字相同就跳过；`create_kb` 不再多读一次；`_search` 不再
+    在两处判断 embedder 数（单组时就是按相似度合并）；`warn_once` 用 runtime 的锁；eval 只建用到的命名 embedder、无分组时当成一组。
+    拒绝：kb 表存 embedder 名（要迁移；按身份匹配可以经受改名）；签名缓存（开销小）；contextualizer 按 kb 用计数器（只影响预算）；
+    去掉 `RagEngine._chunker`（`test_parent_child.py` 直接改它来模拟估计偏低，按规则不改已有测试，保留并写明）。
+  - Codex：两条 P2，都成立，先写失败的测试再修：`--kb-per-dir` 的计费只看 default embedder（命名的付费 embedder 会被标成 free）；kb 名
+    直接用目录名，可能重名或不合法，改为按位置编号。顺带发现 S21 的缺口：`mode: route` 时计费没算 route role，补上并先写测试。
+  - 检查：pytest 606 passed（PG），`-m ollama` 10 passed，mypy、ruff 干净。llm-steward 只用 `upsert_text` 和 `search_kbs`，接口不变，这次不升它的 pin。
 
 ## 13. 待确认
 

@@ -64,6 +64,9 @@ class Hit:
     route: "Route | None" = field(default=None, kw_only=True)  # mode="route": what was chosen
 
 
+# The name of `settings.embedding` among the named embedders (S22).
+DEFAULT_EMBEDDING = "default"
+
 # What the router may pick (S21); `retrieval.mode` adds "route" itself (config.Mode).
 RouteMode = Literal["vector", "bm25", "graph", "hybrid"]
 

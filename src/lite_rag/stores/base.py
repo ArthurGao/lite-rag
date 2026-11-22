@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from lite_rag.errors import InvalidRequest
-from lite_rag.types import Chunk, ChunkGraph, Document
+from lite_rag.model_profiles import Prefixes
+from lite_rag.types import DEFAULT_EMBEDDING, Chunk, ChunkGraph, Document
 
 SCALARS = (str, int, float, bool)
 
@@ -49,12 +50,25 @@ class KbInfo:
     query_prefix: str
     document_prefix: str
     chunker: dict[str, Any]
+    # The configured embedder (S22) that matches this identity; not stored: it is resolved from
+    # the fields above when the kb is opened.
+    embedding: str = dataclasses.field(default=DEFAULT_EMBEDDING, compare=False)
+
+    def signature(self) -> tuple[str, str, Prefixes]:
+        """What it records of its embedder besides the dim (S22: matched against the configured
+        embedders' `RagRuntime.signature`)."""
+        return (
+            self.embedding_provider,
+            self.embedding_model,
+            Prefixes(self.query_prefix, self.document_prefix),
+        )
 
     def differences(self, other: "KbInfo") -> list[str]:
         return [
             f"{f.name}: built with {getattr(self, f.name)!r}, configured {getattr(other, f.name)!r}"
             for f in dataclasses.fields(self)
-            if f.name != "ref" and getattr(self, f.name) != getattr(other, f.name)
+            if f.name not in ("ref", "embedding")
+            and getattr(self, f.name) != getattr(other, f.name)
         ]
 
 

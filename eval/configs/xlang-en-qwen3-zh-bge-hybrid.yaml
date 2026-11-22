@@ -1,0 +1,5 @@
+# S22 (--kb-per-dir): as xlang-en-qwen3-zh-bge, hybrid
+embeddings:
+  en: {provider: sentence_transformers, model: Qwen/Qwen3-Embedding-0.6B}
+chunking: {strategy: markdown, unit: tokens, size: 120, overlap: 20, min_size: 20}
+retrieval: {mode: hybrid}

@@ -27,11 +27,15 @@ def make_runtime(
     graph_llm: LLM | None = None,
     route_llm: LLM | None = None,
     llm_settings: dict[str, Any] | None = None,
+    embedders: dict[str, Embedder] | None = None,
     **chunking: Any,
 ) -> RagRuntime:
+    """`embedders`: named embedders besides the default (S22): each name is added to the
+    settings' `embeddings` (a placeholder config) and served by the instance given."""
     settings = load_settings(
         chunking={**CHUNKING, **chunking},
         embedding={"cache": cache},
+        embeddings={name: {"model": f"placeholder-{name}"} for name in embedders or {}},
         retrieval=retrieval or {},
         rerank=rerank or {},
         graph=graph or {},
@@ -47,6 +51,7 @@ def make_runtime(
         llm=llm,
         graph_llm=graph_llm,
         route_llm=route_llm,
+        embedders=embedders,
     )
 
 

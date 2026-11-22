@@ -106,6 +106,10 @@ PROBLEM = "application/problem+json"
 TITLES = {401: "Unauthorized", 403: "Forbidden"}
 
 
+class KbIn(BaseModel):
+    embedding: str | None = None  # a named embedder of `embeddings` (S22); default: `default`
+
+
 class DocumentIn(BaseModel):
     title: str
     text: str
@@ -239,8 +243,8 @@ def create_app(settings: Settings, runtime: RagRuntime) -> FastAPI:
         return {"namespace": eng.namespace, "kbs": kbs}
 
     @app.put("/v1/kbs/{kb}")
-    def create_kb(kb: str, eng: Write) -> dict[str, Any]:
-        info = eng.create_kb(kb)
+    def create_kb(kb: str, eng: Write, body: KbIn | None = None) -> dict[str, Any]:
+        info = eng.create_kb(kb, embedding=body.embedding if body else None)
         return {k: v for k, v in dataclasses.asdict(info).items() if k != "ref"} | {"kb": kb}
 
     @app.get("/v1/kbs/{kb}")
