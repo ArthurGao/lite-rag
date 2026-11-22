@@ -357,7 +357,9 @@ class LLMConfig(ModelsConfig):
             )
         # The top level tunes answers, as `llm` did before S15: its call settings go to the answer
         # role (whose own wins), so contexts and graphs stay as their index was built.
-        moved = {k: value[k] for k in _ANSWER_ONLY if k in value}
+        # A null stays at the top level: no cap / value for every role that unsets its own (S21:
+        # a backend that cannot cap output, e.g. llm-gateway's Claude subscription profiles).
+        moved = {k: value[k] for k in _ANSWER_ONLY if value.get(k) is not None}
         if not moved:
             return value
         roles = dict(value.get("roles") or {})

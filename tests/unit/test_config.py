@@ -250,3 +250,29 @@ def test_the_8b_eval_configs_rebuild_an_index_role_as_before_s17(
     s = load_settings(**yaml.safe_load(path.read_text()))
     target = s.llm.target_of(role)
     assert (s.llm.role_id(role), target.reasoning_effort) == (f"ollama/{model}", effort)
+
+
+def test_a_top_level_null_cap_lets_a_role_run_uncapped() -> None:
+    """A role on a backend that cannot cap output (llm-gateway's Claude subscription profiles
+    report `max_completion_tokens` ignored, which lite-model refuses) needs no cap at all: a
+    top-level null stays at the top level, so a role that sets null inherits it (S21)."""
+    s = load_settings(
+        llm={
+            "max_output_tokens": None,
+            "roles": {"route": {"backend": "gateway", "model": "claude-sub-haiku",
+                                "reasoning_effort": None, "max_output_tokens": None}},
+        }
+    )  # fmt: skip
+    assert s.llm.target_of("route").max_output_tokens is None
+    assert s.llm.target_of("answer").max_output_tokens is None  # as a null moved to it before
+    # index roles keep their own caps unless they unset them themselves
+    assert s.llm.target_of("graph").max_output_tokens == 2048
+    assert s.llm.target_of("contextual").max_output_tokens == 1024
+    # a value (not null) still moves to answers only, as since S15
+    t = load_settings(
+        llm={"max_output_tokens": 300, "roles": {"route": {"max_output_tokens": None}}}
+    )
+    assert (
+        t.llm.target_of("answer").max_output_tokens,
+        t.llm.target_of("route").max_output_tokens,
+    ) == (300, 1024)
