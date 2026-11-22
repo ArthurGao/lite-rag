@@ -505,7 +505,13 @@ lite-rag/
     也就是正好到了按题型选的上限；多跳题剩下的 4 题是图检索本身没找到。lite-eval compare 都不显著（McNemar p ≥ 0.5，题太少）。
     代价：每次搜索多一次模型调用，p50 约 650–750 ms（本地 qwen3:1.7b），原来是 4–15 ms。
   - 结论：不推翻 2026-11-11 的决定，默认不路由；`mode: route` 作为 opt-in 留下，适合问题里混有多跳题、又不想对所有问题都走图检索的场景。
-    llm-gateway 上 gpt-sub / claude-sub-haiku 的对比：配置已写好（`route-gateway-*.yaml`），gateway 这次没在运行，等用户启动后再跑。
+    llm-gateway 上的对比（2026-11-22，用户启动 gateway 后；四个配置在同一次 eval、同一个图索引）：
+    - gpt-sub：56/60（32、12、12），选择和 qwen3:1.7b 一样全对（多跳集里 4 道关键词题都选了 vector），p50 1.5–1.7 s，是本地 qwen3:1.7b 的两倍多。
+      结论：更大的模型在这组题上没有可提升的地方，本地小模型就够了。
+    - claude-sub-haiku：60 次全失败。gateway 回了 200，但用 `X-LLMGW-Ignored-Params` 说明 claude-agent-sdk 后端不支持输出上限
+      （`max_completion_tokens`），lite-model 按规则报 `IgnoredParameter`（另有 1 次 500）。路由报错、没有退回默认模式，这正是设计要的行为。
+      要在 lite-rag 里用 gateway 的 Claude profile，需要能把一个 role 的 `max_output_tokens` 设成"不限"：现在的 `LLMConfig` 做不到
+      （role 上写 null 会继承顶层的默认 1024，顶层写 null 又按 S15 的规则挪给 answer）。这是 lite-rag 配置的限制，留作后续。
   - 测试：`tests/unit/test_route.py`、`tests/integration/test_route.py`，导入失败时全部红；后补的 span 测试改坏 span 的 kind 后变红。
   - /simplify 采纳：每个 router 的 schema 只含它提供的模式（偏离由 schema 拒绝，结构和 graph 的两次尝试一样）；`_answered()` 共用；
     `Route.mode` 用 `RouteMode`，去掉 cast；`router()` 建好后不再拿锁；提示词里重复的句子用变量；ceiling 脚本改用 lite-eval 的 `load_run`。
