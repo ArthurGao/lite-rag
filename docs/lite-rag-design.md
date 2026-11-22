@@ -511,7 +511,15 @@ lite-rag/
     - claude-sub-haiku：60 次全失败。gateway 回了 200，但用 `X-LLMGW-Ignored-Params` 说明 claude-agent-sdk 后端不支持输出上限
       （`max_completion_tokens`），lite-model 按规则报 `IgnoredParameter`（另有 1 次 500）。路由报错、没有退回默认模式，这正是设计要的行为。
       要在 lite-rag 里用 gateway 的 Claude profile，需要能把一个 role 的 `max_output_tokens` 设成"不限"：现在的 `LLMConfig` 做不到
-      （role 上写 null 会继承顶层的默认 1024，顶层写 null 又按 S15 的规则挪给 answer）。这是 lite-rag 配置的限制，留作后续。
+      （role 上写 null 会继承顶层的默认 1024，顶层写 null 又按 S15 的规则挪给 answer）。
+      修复（用户同意，2026-11-22）：顶层的 null 留在顶层，只有非 null 的值按 S15 挪给 answer。answer 的结果和以前一样（以前挪过去的 null 也是
+      继承顶层）；index role 和 route 照旧用自己的值，只有自己写了 null 的 role 才变成不限。测试 `test_a_top_level_null_cap_lets_a_role_run_uncapped`
+      （先红后绿）。`route-gateway-claude-haiku.yaml` 改为顶层和 route 都写 `max_output_tokens: null`。
+    - claude-sub-haiku 重跑（修复后，和 graph-hybrid 同一次 eval）：回答了的 57 题选择全对；3 次调用在重试后仍是 gateway 的 502
+      （这次 gateway 日志里约 120 次请求中有 21 次 502，`profile=-`，多数被 lite-model 的同目标重试接住），这 3 次搜索报错，没有退回默认模式。
+      命中 53/60（29、12、12），p50 3.2–3.6 s。
+    - 小结：三个路由模型在答出来的题上都没选错；本地 qwen3:1.7b 最快（0.7 s），gpt-sub 1.6 s，claude-sub-haiku 3.4 s 且有间歇 502。默认保持
+      本地 qwen3:1.7b。
   - 测试：`tests/unit/test_route.py`、`tests/integration/test_route.py`，导入失败时全部红；后补的 span 测试改坏 span 的 kind 后变红。
   - /simplify 采纳：每个 router 的 schema 只含它提供的模式（偏离由 schema 拒绝，结构和 graph 的两次尝试一样）；`_answered()` 共用；
     `Route.mode` 用 `RouteMode`，去掉 cast；`router()` 建好后不再拿锁；提示词里重复的句子用变量；ceiling 脚本改用 lite-eval 的 `load_run`。

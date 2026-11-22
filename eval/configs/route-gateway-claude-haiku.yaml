@@ -6,5 +6,9 @@ retrieval:
   hybrid_paths: [vector, bm25, graph]
   router: {modes: [vector, hybrid]}
 llm:
+  # No output cap: the gateway's claude-agent-sdk backend cannot cap output and says so
+  # (X-LLMGW-Ignored-Params), which lite-model refuses (IgnoredParameter). The top-level null
+  # stays at the top level; the route role unsets its own 256 and inherits it.
+  max_output_tokens: null
   roles:
-    route: {backend: gateway, model: claude-sub-haiku, reasoning_effort: null}
+    route: {backend: gateway, model: claude-sub-haiku, reasoning_effort: null, max_output_tokens: null}
