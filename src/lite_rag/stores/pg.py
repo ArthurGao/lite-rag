@@ -24,8 +24,16 @@ from psycopg_pool import ConnectionPool
 
 from lite_rag.config import IDENTIFIER
 from lite_rag.db import check_vector, connection_error, pending, require_url
-from lite_rag.errors import ConfigError, KbNotFound, StoreError
+from lite_rag.errors import ConfigError, KbNotFound, StoreError, lineage_disabled
 from lite_rag.keyword import Bm25Inputs, Posting, bm25
+from lite_rag.lineage import Ledger, ledger_for
+from lite_rag.provenance import (
+    DocVersion,
+    chunk_keys,
+    record_document,
+    recorded,
+    retire_document,
+)
 from lite_rag.stores.base import (
     IndexedChunk,
     KbInfo,
@@ -137,9 +145,12 @@ class PgStore:
         *,
         max_connections: int = 4,
         bm25_impl: Literal["sql", "python"] = "sql",
+        lineage: bool = True,
     ) -> None:
         """`bm25_impl`: score BM25 in SQL (fast) or in Python with `keyword.bm25` (readable);
-        both use the same statistics and agree (tested)."""
+        both use the same statistics and agree (tested). `lineage`: record every write in the
+        provenance ledger, in the write's transaction."""
+        self._lineage = lineage
         if not IDENTIFIER.match(schema):  # it goes into the connection's search_path option
             raise ConfigError(f"invalid schema {schema!r}: must be a lowercase SQL identifier")
         url = require_url(database_url)
@@ -179,6 +190,17 @@ class PgStore:
     def _tx(self) -> Iterator[psycopg.Connection]:
         with self._pool.connection() as conn, conn.transaction():
             yield conn
+
+    @contextmanager
+    def ledger(self) -> Iterator[Ledger]:
+        if not self._lineage:
+            raise lineage_disabled()
+        with self._tx() as conn:
+            yield ledger_for(conn)
+
+    def _ledger_in(self, conn: psycopg.Connection) -> Ledger | None:
+        """The ledger inside a write's transaction; None when lineage is off."""
+        return ledger_for(conn) if self._lineage else None
 
     # --- knowledge bases ---------------------------------------------------------------------
 
@@ -220,10 +242,11 @@ class PgStore:
         with self._tx() as conn:
             return self._get_kb(conn, kb)
 
-    def _get_kb(self, conn: psycopg.Connection, kb: KbRef) -> KbInfo | None:
+    def _get_kb(self, conn: psycopg.Connection, kb: KbRef, *, lock: bool = False) -> KbInfo | None:
+        """`lock`: take the kb's row lock too (serialising its writers, like `_lock_kb`)."""
         row = conn.execute(
             "SELECT embedding_provider, embedding_model, dim, query_prefix, document_prefix,"
-            " chunker FROM kbs WHERE name = %s",
+            " chunker FROM kbs WHERE name = %s" + (" FOR UPDATE" if lock else ""),
             (kb.key,),
         ).fetchone()
         return KbInfo(kb, *row) if row else None
@@ -231,7 +254,10 @@ class PgStore:
     def delete_kb(self, kb: KbRef) -> bool:
         with self._tx() as conn:
             # documents → chunks → postings and embeddings_<dim> all cascade from here
-            return conn.execute("DELETE FROM kbs WHERE name = %s", (kb.key,)).rowcount > 0
+            deleted = conn.execute("DELETE FROM kbs WHERE name = %s", (kb.key,)).rowcount > 0
+            if deleted and (ledger := self._ledger_in(conn)):
+                ledger.retire_namespace(kb.key)
+            return deleted
 
     def list_kbs(self, namespace: str) -> list[str]:
         with self._tx() as conn:
@@ -386,7 +412,7 @@ class PgStore:
             rows = conn.execute(
                 "SELECT c.id, c.doc_id, d.title, c.text, c.start_offset, c.end_offset,"
                 " c.heading_path, c.page,"
-                " p.n, p.text, p.start_offset, p.end_offset, p.heading_path, p.page"
+                " p.n, p.text, p.start_offset, p.end_offset, p.heading_path, p.page, c.lineage_key"
                 " FROM chunks c"
                 " JOIN documents d ON d.kb = c.kb AND d.doc_id = c.doc_id"
                 " LEFT JOIN parents p ON p.kb = c.kb AND p.doc_id = c.doc_id AND p.n = c.parent_n"
@@ -394,19 +420,24 @@ class PgStore:
                 (kb.key, chunk_ids),
             ).fetchall()
         out = {}
-        for chunk, doc, title, text, start, end, path, page, pn, pt, ps, pe, pp, ppage in rows:
+        for chunk, doc, title, text, start, end, path, page, pn, pt, ps, pe, pp, ppage, key in rows:
             parent = StoredParent(pn, pt, ps, pe, tuple(pp), ppage) if pn is not None else None
-            out[chunk] = StoredChunk(chunk, doc, title, text, start, end, tuple(path), page, parent)
+            out[chunk] = StoredChunk(
+                chunk, doc, title, text, start, end, tuple(path), page, parent, key
+            )
         return out
 
     # --- documents ---------------------------------------------------------------------------
 
     def document_hash(self, kb: KbRef, doc_id: str) -> str | None:
         with self._tx() as conn:
-            row = conn.execute(
-                "SELECT content_hash FROM documents WHERE kb = %s AND doc_id = %s",
-                (kb.key, doc_id),
-            ).fetchone()
+            return self._document_hash(conn, kb, doc_id)
+
+    def _document_hash(self, conn: psycopg.Connection, kb: KbRef, doc_id: str) -> str | None:
+        row = conn.execute(
+            "SELECT content_hash FROM documents WHERE kb = %s AND doc_id = %s",
+            (kb.key, doc_id),
+        ).fetchone()
         return row[0] if row else None
 
     def upsert_document(
@@ -418,13 +449,17 @@ class PgStore:
         parents: list[Chunk] | None = None,
     ) -> None:
         with self._tx() as conn:
-            dim = self._lock_kb(conn, kb)
+            info = self._get_kb(conn, kb, lock=True)
+            if info is None:
+                raise KbNotFound.of(kb.name, kb.namespace)
+            dim = info.dim
             for c in chunks:  # before anything is written
                 if len(c.vector) != dim:
                     raise StoreError(
                         f"{c.chunk.chunk_id}: {len(c.vector)}-d vector in a {dim}-d kb"
                     )
             _, removed, removed_length = self._remove(conn, kb, doc.doc_id)
+            keys = chunk_keys(doc.doc_id, [c.chunk.text for c in chunks])
             conn.execute(
                 "INSERT INTO documents (kb, doc_id, title, source, content_hash, chunk_count,"
                 " metadata, text, pages) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
@@ -441,14 +476,69 @@ class PgStore:
                 ),
             )
             self._copy_parents(conn, kb, parents or [])  # first: chunks reference them
-            self._copy_chunks(conn, kb, dim, chunks)
+            self._copy_chunks(conn, kb, dim, chunks, keys)
             self._copy_graph(conn, kb, chunks)
+            if ledger := self._ledger_in(conn):
+                version = DocVersion(doc.doc_id, doc.title, doc.source, content_hash)
+                pairs = [(c.chunk, c.context) for c in chunks]
+                record_document(ledger, info, version, pairs, keys)
             self._adjust_stats(
                 conn,
                 kb,
                 len(chunks) - removed,
                 sum(len(c.terms) for c in chunks) - removed_length,
             )
+
+    def backfill_lineage(self, kb: KbRef) -> int:
+        if not self._lineage:
+            raise lineage_disabled()
+        with self._tx() as conn:
+            if self._get_kb(conn, kb) is None:
+                raise KbNotFound.of(kb.name, kb.namespace)
+            docs = [
+                DocVersion(*row)
+                for row in conn.execute(
+                    "SELECT doc_id, title, source, content_hash FROM documents WHERE kb = %s"
+                    " ORDER BY doc_id",
+                    (kb.key,),
+                )
+            ]
+        done = 0
+        for doc in docs:  # one transaction per document, under the kb's write lock
+            with self._tx() as conn:
+                info = self._get_kb(conn, kb, lock=True)
+                if info is None:
+                    raise KbNotFound.of(kb.name, kb.namespace)
+                ledger = ledger_for(conn)
+                if recorded(ledger, kb.key, doc.doc_id, doc.content_hash):
+                    continue
+                rows = conn.execute(
+                    "SELECT c.id, c.n, c.text, c.start_offset, c.end_offset, c.tokens,"
+                    " c.heading_path, c.page, c.parent_n, c.context, c.lineage_key"
+                    " FROM chunks c JOIN documents d ON d.kb = c.kb AND d.doc_id = c.doc_id"
+                    " WHERE c.kb = %s AND c.doc_id = %s AND d.content_hash = %s ORDER BY c.n",
+                    (kb.key, doc.doc_id, doc.content_hash),
+                ).fetchall()
+                if not rows and self._document_hash(conn, kb, doc.doc_id) != doc.content_hash:
+                    continue  # deleted or rewritten since the list was read: recorded then
+                pairs = [
+                    (Chunk(cid, doc.doc_id, n, t, s, e, tok, tuple(path), page, pn), ctx)
+                    for cid, n, t, s, e, tok, path, page, pn, ctx, _ in rows
+                ]
+                keys = chunk_keys(doc.doc_id, [c.text for c, _ in pairs])
+                missing = [
+                    (k, kb.key, row[0])
+                    for row, k in zip(rows, keys, strict=True)
+                    if row[-1] is None
+                ]
+                if missing:
+                    with conn.cursor() as cur:
+                        cur.executemany(
+                            "UPDATE chunks SET lineage_key = %s WHERE kb = %s AND id = %s", missing
+                        )
+                record_document(ledger, info, doc, pairs, keys)
+                done += 1
+        return done
 
     def delete_document(self, kb: KbRef, doc_id: str) -> bool:
         """False when the document — or the whole kb — does not exist."""
@@ -457,6 +547,8 @@ class PgStore:
                 return False
             existed, removed, removed_length = self._remove(conn, kb, doc_id)
             self._adjust_stats(conn, kb, -removed, -removed_length)
+            if existed and (ledger := self._ledger_in(conn)):
+                retire_document(ledger, kb.key, doc_id)
             return existed
 
     # --- vector cache ------------------------------------------------------------------------
@@ -554,16 +646,21 @@ class PgStore:
                 )
 
     def _copy_chunks(
-        self, conn: psycopg.Connection, kb: KbRef, dim: int, chunks: list[IndexedChunk]
+        self,
+        conn: psycopg.Connection,
+        kb: KbRef,
+        dim: int,
+        chunks: list[IndexedChunk],
+        keys: list[str],
     ) -> None:
         if not chunks:
             return
         with conn.cursor() as cur:
             with cur.copy(
                 "COPY chunks (kb, id, doc_id, n, text, start_offset, end_offset, tokens, length,"
-                " heading_path, page, parent_n, context) FROM STDIN"
+                " heading_path, page, parent_n, context, lineage_key) FROM STDIN"
             ) as copy:
-                for c in chunks:
+                for c, key in zip(chunks, keys, strict=True):
                     ch = c.chunk
                     copy.write_row(
                         (
@@ -580,6 +677,7 @@ class PgStore:
                             ch.page,
                             ch.parent,
                             c.context,
+                            key,
                         )
                     )
             with cur.copy(

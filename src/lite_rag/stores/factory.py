@@ -10,18 +10,24 @@ from lite_rag.stores.pg import PgStore
 
 
 def open_store(
-    store: StoreConfig, database_url: str | None, *, max_connections: int = 4
+    store: StoreConfig,
+    database_url: str | None,
+    *,
+    max_connections: int = 4,
+    lineage: bool = True,
 ) -> CachedStore:
+    """`lineage`: record writes in the provenance ledger (settings `lineage.enabled`)."""
     if store.backend == "chroma":
         require_extra("chromadb", "chroma")
         from lite_rag.stores.chroma import ChromaStore
 
-        return ChromaStore(store.data_dir)
+        return ChromaStore(store.data_dir, lineage=lineage)
     return PgStore(
         database_url,
         store.schema_name,
         max_connections=max_connections,
         bm25_impl=store.bm25_impl,
+        lineage=lineage,
     )
 
 

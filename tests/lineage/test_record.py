@@ -1,6 +1,6 @@
 import pytest
 
-from lite_rag.lineage import Ledger
+from lite_rag.lineage import Item, Ledger
 from tests.lineage.conftest import Clock
 
 NS = "ns"
@@ -131,3 +131,25 @@ def test_cascade_works_across_parameter_batches(
     ]
     assert ledger.retire_namespace(NS) == 10
     assert {a.status for a in ledger.get(chunks).values()} == {"deleted"}
+
+
+def test_record_many_records_each_item_under_the_same_parents(ledger: Ledger) -> None:
+    d1 = _doc(ledger, "h1")
+    first = ledger.record_many(
+        NS, "chunk", [Item("a", "ha", payload="A", edge_metadata={"n": 0}), Item("b", "hb")],
+        parents=[d1], producer="p", metadata={"m": 1},
+    )  # fmt: skip
+    assert [r.artifact.key for r in first] == ["a", "b"]
+    assert (first[0].artifact.payload, first[0].artifact.producer) == ("A", "p")
+    assert first[0].artifact.metadata == {"m": 1}
+    d2 = ledger.record(NS, "document", "a", "h2").artifact.id
+    again = ledger.record_many(NS, "chunk", [Item("a", "ha"), Item("b", "hb2")], parents=[d2])
+    assert (again[0].reused, again[1].reused) == (True, False)
+    assert again[1].artifact.version == 2 and again[1].replaced is not None
+    assert {r.via.metadata.get("n") for r in ledger.children(d1)} == {0, None}
+
+
+def test_record_many_with_an_unknown_parent_writes_nothing(ledger: Ledger) -> None:
+    with pytest.raises(ValueError, match="nope"):
+        ledger.record_many(NS, "chunk", [Item("a", "ha")], parents=["nope"])
+    assert ledger.active(NS, "chunk", "a") is None

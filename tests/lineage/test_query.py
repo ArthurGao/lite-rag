@@ -66,3 +66,13 @@ def test_gc_clears_the_text_of_ended_artifacts_only(ledger: Ledger, clock: Clock
     assert [found[i].payload for i in (old, late, live)] == [None, "late text", "live text"]
     assert found[old].status == "superseded"  # the row stays
     assert ledger.gc(cutoff) == 0
+
+
+def test_count_active_counts_one_kind_in_one_namespace(ledger: Ledger) -> None:
+    d = ledger.record(NS, "document", "a", "h").artifact.id
+    ledger.record(NS, "chunk", "c1", "c1", parents=[d])
+    ledger.record(NS, "chunk", "c2", "c2", parents=[d])
+    ledger.record("other", "chunk", "c3", "c3")
+    assert ledger.count_active(NS, "chunk") == 2
+    ledger.retire(d, status="deleted")
+    assert ledger.count_active(NS, "chunk") == 0

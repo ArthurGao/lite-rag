@@ -11,6 +11,7 @@ import psycopg
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
+from lite_rag import lineage
 from lite_rag.errors import StoreError
 
 MIGRATIONS = "lite_rag.migrations"
@@ -52,9 +53,17 @@ def migration_files(package: str = MIGRATIONS) -> list[tuple[str, str]]:
     return [(name.removesuffix(".sql"), files.joinpath(name).read_text("utf-8")) for name in names]
 
 
-def use_schema(conn: psycopg.Connection, schema: str) -> None:
-    """Point the current transaction at `schema` (`vector` stays reachable through public)."""
-    conn.execute(sql.SQL("SET LOCAL search_path TO {}, public").format(sql.Identifier(schema)))
+def use_schema(conn: psycopg.Connection, schema: str, *, public: bool = True) -> None:
+    """Point the current transaction at `schema`; `public` keeps `vector` reachable. The
+    ledger's migrations run without it, so its unqualified tables never resolve to a
+    same-named table in public."""
+    path = sql.SQL(", public" if public else "")
+    conn.execute(sql.SQL("SET LOCAL search_path TO {}{}").format(sql.Identifier(schema), path))
+
+
+def _lock_schema(conn: psycopg.Connection, schema: str) -> None:
+    """Serialise concurrent migrators on this schema (until the transaction ends)."""
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"lite_rag:{schema}",))
 
 
 def migrate(conn: psycopg.Connection, schema: str, until: str | None = None) -> list[str]:
@@ -77,8 +86,7 @@ def migrate(conn: psycopg.Connection, schema: str, until: str | None = None) -> 
             break
         with conn.transaction():
             use_schema(conn, schema)
-            # Serialise concurrent migrators on this schema; the check below then sees their work.
-            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"lite_rag:{schema}",))
+            _lock_schema(conn, schema)  # the check below then sees concurrent migrators' work
             done = conn.execute(
                 "SELECT 1 FROM schema_migrations WHERE version = %s", (version,)
             ).fetchone()
@@ -87,6 +95,11 @@ def migrate(conn: psycopg.Connection, schema: str, until: str | None = None) -> 
             conn.execute(script.encode())  # trusted SQL file shipped in the package
             conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
             applied.append(version)
+    if until is None:  # the lineage ledger's tables live in the same schema (lineage §5.2)
+        with conn.transaction():
+            use_schema(conn, schema, public=False)
+            _lock_schema(conn, schema)
+            applied += lineage.migrate(conn)
     return applied
 
 
@@ -118,6 +131,8 @@ def pending(conn: psycopg.Connection, schema: str) -> list[str]:
         if row and row[0] is not None:
             rows = conn.execute(sql.SQL("SELECT version FROM {}").format(table))
             applied = {version for (version,) in rows}
+        use_schema(conn, schema, public=False)
+        ledger = lineage.pending(conn)
     files = resources.files(MIGRATIONS).iterdir()
     versions = sorted(f.name.removesuffix(".sql") for f in files if f.name.endswith(".sql"))
-    return [v for v in versions if v not in applied]
+    return [v for v in versions if v not in applied] + ledger

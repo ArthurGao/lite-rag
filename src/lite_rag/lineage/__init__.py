@@ -9,12 +9,13 @@ nothing else of lite-rag, so other projects can use it on their own connection:
 
 from lite_rag.lineage.ledger import Ledger, PgLedger, SqliteLedger, ledger_for, utcnow
 from lite_rag.lineage.migrate import migrate, pending
-from lite_rag.lineage.types import Artifact, Edge, Ended, Recorded, Related, Status
+from lite_rag.lineage.types import Artifact, Edge, Ended, Item, Recorded, Related, Status
 
 __all__ = [
     "Artifact",
     "Edge",
     "Ended",
+    "Item",
     "Ledger",
     "PgLedger",
     "Recorded",

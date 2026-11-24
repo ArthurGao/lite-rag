@@ -13,6 +13,7 @@ from tests.conftest import TEST_SCHEMA
 
 TABLES = {"schema_migrations", "kbs", "documents", "chunks", "postings", "parents"}
 TABLES |= {"graph_mentions", "graph_relations"}  # 0006
+TABLES |= {"lineage_schema_migrations", "lineage_artifacts", "lineage_edges"}  # S25 ledger
 
 
 def _tables(conn: psycopg.Connection) -> set[str]:
@@ -30,6 +31,8 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         "0004_pages_parents_context",
         "0005_documents_text",
         "0006_graph",
+        "0007_lineage_key",
+        "lineage:0001_ledger",
     ]
     assert _tables(pg) == TABLES
     assert migrate(pg, TEST_SCHEMA) == []  # second run: nothing pending
@@ -43,6 +46,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         ("0004_pages_parents_context",),
         ("0005_documents_text",),
         ("0006_graph",),
+        ("0007_lineage_key",),
     ]
 
 
@@ -138,3 +142,39 @@ def test_opening_a_store_on_an_outdated_schema_says_to_migrate(
         PgStore(pg_url, TEST_SCHEMA)
     migrate(pg, TEST_SCHEMA)
     PgStore(pg_url, TEST_SCHEMA).close()  # up to date: opens
+
+
+def test_the_store_refuses_a_schema_whose_ledger_is_behind(
+    pg: psycopg.Connection, pg_url: str
+) -> None:
+    """Hosts such as llm-steward call `lite_rag.db.migrate` and open the store themselves: the
+    ledger's migrations come with it, and its pending ones block opening like lite-rag's."""
+    migrate(pg, TEST_SCHEMA)
+    pg.execute(f"DELETE FROM {TEST_SCHEMA}.lineage_schema_migrations")
+    with pytest.raises(StoreError, match="lineage:0001_ledger"):
+        PgStore(pg_url, TEST_SCHEMA)
+
+
+def test_backfill_fills_keys_of_chunks_written_before_s25(
+    pg: psycopg.Connection, pg_url: str
+) -> None:
+    """Chunks from before migration 0007 have no lineage key, and old documents no text."""
+    from lite_rag.provenance import chunk_keys
+    from tests.contract.test_lineage import assert_consistent, write
+    from tests.contract.test_store import KB, info
+
+    migrate(pg, TEST_SCHEMA)
+    store = PgStore(pg_url, TEST_SCHEMA, lineage=False)
+    store.create_kb(info())
+    write(store, "d1", ["a", "b"], h="h1")
+    store.close()
+    pg.execute(f"UPDATE {TEST_SCHEMA}.chunks SET lineage_key = NULL")
+    pg.execute(f"UPDATE {TEST_SCHEMA}.documents SET text = NULL")
+    store = PgStore(pg_url, TEST_SCHEMA)
+    try:
+        assert store.backfill_lineage(KB) == 1
+        got = store.chunks(KB, ["d1#0", "d1#1"])
+        assert [got[c].lineage_key for c in ("d1#0", "d1#1")] == chunk_keys("d1", ["a", "b"])
+        assert_consistent(store)
+    finally:
+        store.close()

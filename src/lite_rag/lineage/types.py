@@ -55,3 +55,13 @@ class Related:
 
     artifact: Artifact
     via: Edge
+
+
+@dataclass(frozen=True)
+class Item:
+    """One of several artifacts recorded at once under the same parents (`record_many`)."""
+
+    key: str
+    content_hash: str
+    payload: str | None = None
+    edge_metadata: dict[str, Any] | None = None

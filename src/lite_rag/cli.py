@@ -252,6 +252,22 @@ def drop_kb(
     typer.echo("dropped" if found else "not found")
 
 
+lineage_app = typer.Typer(help="The provenance ledger (lineage design)", no_args_is_help=True)
+app.add_typer(lineage_app, name="lineage")
+
+
+@lineage_app.command("backfill")
+def lineage_backfill(
+    kb: KbArg, config: ConfigOption = None, namespace: NamespaceOption = None
+) -> None:
+    """Record documents stored before lineage was kept (or with it off)."""
+    with _engine(config, namespace) as engine:
+        recorded = engine.lineage_backfill(kb)
+        stats = engine.stats(kb)
+    total = stats.documents if stats else 0
+    typer.echo(f"recorded {recorded} of {total} documents")
+
+
 @app.command()
 def search(
     kb: KbArg,

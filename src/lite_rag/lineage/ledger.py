@@ -18,7 +18,7 @@ from typing import Any, Protocol
 import psycopg
 from psycopg.types.json import Jsonb
 
-from lite_rag.lineage.types import Artifact, Edge, Ended, Recorded, Related
+from lite_rag.lineage.types import Artifact, Edge, Ended, Item, Recorded, Related
 
 Clock = Callable[[], datetime]
 # ids per IN (...) list: PostgreSQL allows 65535 parameters, SQLite 32766
@@ -72,6 +72,20 @@ class Ledger(Protocol):
         new version, superseding the active one without touching its descendants."""
         ...
 
+    def record_many(
+        self,
+        namespace: str,
+        kind: str,
+        items: Sequence[Item],
+        *,
+        parents: Sequence[str] = (),
+        producer: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[Recorded]:
+        """`record` for each item, under the same parents (checked once), producer and
+        metadata — what a document's chunks are."""
+        ...
+
     def retire(self, artifact_id: str, *, status: Ended = "superseded") -> list[Artifact]:
         """End the artifact if active, then every descendant left without an active parent;
         returns what ended now, level by level (the artifact first)."""
@@ -84,6 +98,8 @@ class Ledger(Protocol):
     def get(self, ids: Sequence[str]) -> dict[str, Artifact]: ...
 
     def children(self, artifact_id: str) -> list[Related]: ...
+
+    def count_active(self, namespace: str, kind: str) -> int: ...
 
     def as_of(self, namespace: str, kind: str, key: str, at: datetime) -> Artifact | None:
         """The version that was current at `at` (None: none yet, or deleted by then)."""
@@ -191,6 +207,14 @@ class _SqlLedger(ABC):
             for r in rows
         ]
 
+    def count_active(self, namespace: str, kind: str) -> int:
+        [(n,)] = self._rows(
+            "SELECT count(*) FROM lineage_artifacts"
+            " WHERE namespace = ? AND kind = ? AND status = 'active'",
+            (namespace, kind),
+        )
+        return int(n)
+
     def as_of(self, namespace: str, kind: str, key: str, at: datetime) -> Artifact | None:
         when = self._to_time(at)
         found = self._artifacts(
@@ -247,17 +271,70 @@ class _SqlLedger(ABC):
         metadata: dict[str, Any] | None = None,
         edge_metadata: dict[str, Any] | None = None,
     ) -> Recorded:
-        if parents:  # checked before anything is written
-            known = {
-                i
-                for (i,) in self._rows(
-                    f"SELECT id FROM lineage_artifacts WHERE id IN ({self._marks(parents)})",
-                    parents,
-                )
-            }
-            if missing := set(parents) - known:
-                raise ValueError(f"unknown parent artifact(s): {', '.join(sorted(missing))}")
-        current = self.active(namespace, kind, key)
+        self._check_parents(parents)
+        return self._record(
+            namespace, kind, key, content_hash, parents, producer, payload, metadata, edge_metadata
+        )
+
+    def record_many(
+        self,
+        namespace: str,
+        kind: str,
+        items: Sequence[Item],
+        *,
+        parents: Sequence[str] = (),
+        producer: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[Recorded]:
+        self._check_parents(parents)
+        return [
+            self._record(
+                namespace,
+                kind,
+                i.key,
+                i.content_hash,
+                parents,
+                producer,
+                i.payload,
+                metadata,
+                i.edge_metadata,
+            )
+            for i in items
+        ]
+
+    def _check_parents(self, parents: Sequence[str]) -> None:
+        """Before anything is written: an unknown parent is the caller's mistake."""
+        if not parents:
+            return
+        known = {
+            i
+            for (i,) in self._rows(
+                f"SELECT id FROM lineage_artifacts WHERE id IN ({self._marks(parents)})", parents
+            )
+        }
+        if missing := set(parents) - known:
+            raise ValueError(f"unknown parent artifact(s): {', '.join(sorted(missing))}")
+
+    def _record(
+        self,
+        namespace: str,
+        kind: str,
+        key: str,
+        content_hash: str,
+        parents: Sequence[str],
+        producer: str | None,
+        payload: str | None,
+        metadata: dict[str, Any] | None,
+        edge_metadata: dict[str, Any] | None,
+    ) -> Recorded:
+        # The latest version answers both questions: is one active (only the latest can be),
+        # and which number comes next.
+        latest = self._artifacts(
+            f"SELECT {COLUMNS} FROM lineage_artifacts WHERE namespace = ? AND kind = ? AND key = ?"
+            " ORDER BY version DESC LIMIT 1",
+            (namespace, kind, key),
+        )
+        current = latest[0] if latest and latest[0].status == "active" else None
         if current is not None and current.content_hash == content_hash:
             self._link(parents, current.id, edge_metadata)
             return Recorded(current, replaced=None, reused=True)
@@ -265,14 +342,6 @@ class _SqlLedger(ABC):
         replaced = None
         if current is not None:
             [replaced] = self._end([current.id], "superseded", now)
-            version = current.version + 1  # the active version is always the latest
-        else:
-            (last,) = self._rows(
-                "SELECT max(version) FROM lineage_artifacts"
-                " WHERE namespace = ? AND kind = ? AND key = ?",
-                (namespace, kind, key),
-            )[0]
-            version = (last or 0) + 1
         [created] = self._artifacts(
             f"INSERT INTO lineage_artifacts ({COLUMNS})"
             f" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL) RETURNING {COLUMNS}",
@@ -281,7 +350,7 @@ class _SqlLedger(ABC):
                 namespace,
                 kind,
                 key,
-                version,
+                latest[0].version + 1 if latest else 1,
                 content_hash,
                 producer,
                 payload,

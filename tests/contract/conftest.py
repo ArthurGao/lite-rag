@@ -12,15 +12,23 @@ from lite_rag.stores.base import CachedStore
 from lite_rag.stores.factory import migrate_store, open_store
 from tests.conftest import TEST_SCHEMA
 
+Migrated = tuple[StoreConfig, str | None]
+
 
 @pytest.fixture(params=["postgres", "chroma"], ids=["pg", "chroma"])
-def store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[CachedStore]:
+def migrated(request: pytest.FixtureRequest, tmp_path: Path) -> Migrated:
+    """A migrated, empty backend: its config and database URL (None for chroma)."""
     config = StoreConfig(backend=request.param, schema=TEST_SCHEMA, data_dir=tmp_path / "data")
     url = None
     if request.param == "postgres":
         request.getfixturevalue("pg")  # an empty test schema, dropped afterwards
         url = request.getfixturevalue("pg_url")
     migrate_store(config, url)
-    s = open_store(config, url)
+    return config, url
+
+
+@pytest.fixture
+def store(migrated: Migrated) -> Iterator[CachedStore]:
+    s = open_store(*migrated)
     yield s
     s.close()

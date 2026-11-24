@@ -423,6 +423,14 @@ class ApiKeyConfig(BaseModel):
     mode: Literal["read", "write"] = "read"
 
 
+class LineageConfig(BaseModel):
+    """The provenance ledger (lineage design §6.4): every write records the document version
+    and its chunks, in the write's transaction."""
+
+    enabled: bool = True
+    keep_text_days: int = Field(default=90, gt=0)  # `lineage gc` clears ended versions' text
+
+
 class ServerConfig(BaseModel):
     """`literag serve` (design §7). Keys come from YAML or `LITERAG_SERVER__KEYS` (JSON)."""
 
@@ -458,6 +466,7 @@ class Settings(BaseSettings):
     rerank: RerankConfig = RerankConfig()
     llm: LLMConfig = LLMConfig()
     cache: CacheConfig = CacheConfig()
+    lineage: LineageConfig = LineageConfig()
     server: ServerConfig = ServerConfig()
 
     @field_validator("embeddings")

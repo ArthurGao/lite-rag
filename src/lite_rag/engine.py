@@ -152,7 +152,12 @@ class RagRuntime:
         secret), like the reranker: a server must not start healthy and fail on a request."""
         if settings.cache.enabled:
             check_cache(settings)
-        store = open_store(settings.store, settings.database_url, max_connections=max_connections)
+        store = open_store(
+            settings.store,
+            settings.database_url,
+            max_connections=max_connections,
+            lineage=settings.lineage.enabled,
+        )
         try:
             embedder = build_embedder(settings.embedding, cache=store)
             # Built now when enabled, so a misconfigured reranker fails at startup (its model
@@ -819,6 +824,11 @@ class RagEngine:
 
     def stats(self, kb: str) -> KbStats | None:
         return self._store.stats(self._ref(kb))
+
+    def lineage_backfill(self, kb: str) -> int:
+        """Record in the provenance ledger the documents of `kb` it lacks (written before S25 or
+        with lineage off); returns how many were recorded. Raises `KbNotFound`."""
+        return self._store.backfill_lineage(self._ref(kb))
 
     def close(self) -> None:
         """Closes the runtime — shared by every engine it handed out."""
