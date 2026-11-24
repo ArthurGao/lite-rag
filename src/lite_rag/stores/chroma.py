@@ -43,6 +43,7 @@ from lite_rag.lineage import pending as ledger_pending
 from lite_rag.provenance import (
     DocVersion,
     chunk_keys,
+    end_missing,
     record_document,
     recorded,
     retire_document,
@@ -490,8 +491,7 @@ class ChromaStore:
                 self._insert(db, kb, doc, content_hash, chunks, parents or [], keys)
                 if ledger := self._ledger_in(db):
                     version = DocVersion(doc.doc_id, doc.title, doc.source, content_hash)
-                    pairs = [(c.chunk, c.context) for c in chunks]
-                    record_document(ledger, info, version, pairs, keys)
+                    record_document(ledger, info, version, [c.chunk for c in chunks], keys)
             try:
                 collection = self._collection(kb)  # 2. vectors: the old ones out, the new in
                 if old:  # by id: a filtered delete would scan the collection on every insert
@@ -532,7 +532,7 @@ class ChromaStore:
                         continue
                     rows = db.execute(
                         "SELECT c.id, c.n, c.text, c.start_offset, c.end_offset, c.tokens,"
-                        " c.heading_path, c.page, c.parent_n, c.context, c.lineage_key"
+                        " c.heading_path, c.page, c.parent_n, c.lineage_key"
                         " FROM chunks c JOIN documents d ON d.kb = c.kb AND d.doc_id = c.doc_id"
                         " WHERE c.kb = ? AND c.doc_id = ? AND d.content_hash = ?"
                         " AND d.status = 'ready' ORDER BY c.n",
@@ -540,16 +540,11 @@ class ChromaStore:
                     ).fetchall()
                     if not rows and self._document_hash(db, kb, doc.doc_id) != doc.content_hash:
                         continue  # deleted or rewritten since the list was read: recorded then
-                    pairs = [
-                        (
-                            Chunk(
-                                cid, doc.doc_id, n, t, s, e, tok, tuple(json.loads(path)), pg, pn
-                            ),
-                            ctx,
-                        )
-                        for cid, n, t, s, e, tok, path, pg, pn, ctx, _ in rows
+                    chunks = [
+                        Chunk(cid, doc.doc_id, n, t, s, e, tok, tuple(json.loads(path)), pg, pn)
+                        for cid, n, t, s, e, tok, path, pg, pn, _ in rows
                     ]
-                    keys = chunk_keys(doc.doc_id, [c.text for c, _ in pairs])
+                    keys = chunk_keys(doc.doc_id, [c.text for c in chunks])
                     db.executemany(
                         "UPDATE chunks SET lineage_key = ? WHERE kb = ? AND id = ?",
                         [
@@ -558,8 +553,11 @@ class ChromaStore:
                             if row[-1] is None
                         ],
                     )
-                    record_document(ledger, info, doc, pairs, keys)
+                    record_document(ledger, info, doc, chunks, keys)
                     done += 1
+        with self._lock, self._tx() as db:  # deleted while lineage was off: end them now
+            present = db.execute("SELECT doc_id FROM documents WHERE kb = ?", (kb.key,))
+            end_missing(ledger_for(db), kb.key, {d for (d,) in present})
         return done
 
     def delete_document(self, kb: KbRef, doc_id: str) -> bool:

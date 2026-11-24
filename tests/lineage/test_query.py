@@ -94,3 +94,13 @@ def test_started_by_is_the_latest_version_begun_by_then_even_if_ended(
     assert at_end is not None and at_end < v2.valid_from
     assert ledger.started_by(NS, "chunk", "k", at_end).id == v1.id  # type: ignore[union-attr]
     assert ledger.started_by(NS, "chunk", "k", v2.valid_from).id == v2.id  # type: ignore[union-attr]
+
+
+def test_gc_with_a_limit_clears_at_most_that_many(ledger: Ledger, clock: Clock) -> None:
+    ids = [ledger.record(NS, "chunk", f"c{i}", "h", payload="t").artifact.id for i in range(3)]
+    for i in ids:
+        ledger.retire(i)
+    cutoff = clock.now + timedelta(seconds=1)
+    assert ledger.gc(cutoff, limit=2) == 2
+    assert ledger.gc(cutoff, limit=2) == 1
+    assert ledger.gc(cutoff, limit=2) == 0

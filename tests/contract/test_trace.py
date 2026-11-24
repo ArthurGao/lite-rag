@@ -8,6 +8,7 @@ import pytest
 
 from lite_rag.engine import RagEngine
 from lite_rag.errors import InvalidRequest
+from lite_rag.lineage import utcnow
 from lite_rag.stores.base import CachedStore
 from lite_rag.testing import FakeLLM, FakeReranker
 from lite_rag.tracing import TracedSource, TraceRecord, TraceSource
@@ -278,3 +279,16 @@ def test_an_edit_between_the_read_and_the_trace_time_is_still_stale(
     ]  # type: ignore[arg-type]
     assert used.state == "stale" and used.artifact is not None
     assert used.artifact.payload == "The visa fee is 100 dollars."
+
+
+def test_a_trace_that_stored_its_in_context_rows_reads_them_once(store: CachedStore) -> None:
+    """Traces written before in_context was derived (S25c) stored it: read back as stored."""
+    record = TraceRecord("t-old", NS, ["kb"], "search", "q", {"top_k": 1}, utcnow())
+    rows = [
+        TraceSource(f"{NS}:kb", "k1", "d#0", "retrieved", 1, 0.9),
+        TraceSource(f"{NS}:kb", "k1", "d#0", "in_context", 1, 0.9),
+    ]
+    with store.traces() as log:
+        log.write(record, rows)
+    _, sources = _trace(store, "t-old")
+    assert [(s.stage, s.chunk_id) for s in sources] == [("retrieved", "d#0"), ("in_context", "d#0")]

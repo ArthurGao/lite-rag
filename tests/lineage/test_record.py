@@ -168,3 +168,12 @@ def test_deleting_clears_the_text_at_once_superseding_keeps_it(ledger: Ledger) -
     other = ledger.record("x", "chunk", "c", "c", payload="x text").artifact.id
     ledger.retire_namespace("x")
     assert ledger.get([other])[other].payload is None
+
+
+def test_deleting_clears_the_metadata_too(ledger: Ledger) -> None:
+    d = ledger.record(NS, "document", "a", "h", metadata={"title": "Confidential"}).artifact.id
+    [gone] = ledger.retire(d, status="deleted")
+    assert gone.metadata == {}
+    kept = ledger.record(NS, "document", "b", "h", metadata={"title": "Old"}).artifact.id
+    ledger.record(NS, "document", "b", "h2")
+    assert ledger.get([kept])[kept].metadata == {"title": "Old"}  # superseded: kept

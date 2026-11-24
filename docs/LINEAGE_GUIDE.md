@@ -1,3 +1,5 @@
+> **Superseded (2026-11-25):** the decided design is `docs/superpowers/specs/2026-11-24-lineage-design.md`, built in S25 (design §12). This guide is kept as the original intent.
+
 # Lite Lineage 实现指导（给 Claude Code）
 
 > 目标读者：在 lite-rag 仓库中工作的 Claude Code。

@@ -53,11 +53,12 @@ def record_document(
     ledger: Ledger,
     kb: KbInfo,
     doc: DocVersion,
-    chunks: Sequence[tuple[Chunk, str | None]],
+    chunks: Sequence[Chunk],
     keys: Sequence[str],
 ) -> None:
-    """Record a document version and its chunks (each with its contextual header, or None),
-    inside the store's write transaction: chunks with unchanged text keep their artifact and
+    """Record a document version and its chunks, inside the store's write transaction (a
+    chunk's contextual header is not recorded: model-written text about the content, it would
+    outlive a delete): chunks with unchanged text keep their artifact and
     gain an edge from the new version; those the new version no longer has end with the old
     one. What the kb embeds with is recorded once, on the document version."""
     ns = kb.ref.key
@@ -88,10 +89,9 @@ def record_document(
                     "end": ch.end,
                     "page": ch.page,
                     "parent_n": ch.parent,
-                    "context": context,
                 },
             )
-            for (ch, context), key in zip(chunks, keys, strict=True)
+            for ch, key in zip(chunks, keys, strict=True)
         ],
         parents=[rec.artifact.id],
         producer=producer(kb.chunker),
@@ -105,6 +105,15 @@ def recorded(ledger: Ledger, kb_key: str, doc_id: str, content_hash: str) -> boo
     it without reading its chunks)."""
     current = ledger.active(kb_key, "document", doc_id)
     return current is not None and current.content_hash == content_hash
+
+
+def end_missing(ledger: Ledger, kb_key: str, present: set[str]) -> int:
+    """Documents the ledger holds as current but the store no longer has (deleted while lineage
+    was off) end as `deleted`; returns how many."""
+    gone = [d for d in ledger.active_keys(kb_key, "document") if d not in present]
+    for doc_id in gone:
+        retire_document(ledger, kb_key, doc_id)
+    return len(gone)
 
 
 def retire_document(ledger: Ledger, kb_key: str, doc_id: str) -> None:

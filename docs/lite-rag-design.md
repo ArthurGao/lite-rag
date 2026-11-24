@@ -173,6 +173,22 @@ engine.stats(kb)
 - **幂等**：`content_hash` 和 chunker 配置都没变时，`upsert_text` 直接返回；否则整篇替换。
 - **换 embedding 模型**：`kbs` 表记录了每个 kb 的模型和维度。配置与记录不一致时拒绝打开，并提示运行 `literag reindex <kb>`。
 
+### Lineage 与查询 trace（S25）
+
+详细设计见 `docs/superpowers/specs/2026-11-24-lineage-design.md`。这里只列表和规则：
+
+| 表 | 内容 |
+| --- | --- |
+| `lineage_artifacts` / `lineage_edges` / `lineage_schema_migrations` | 通用账本（`lite_rag.lineage`，不认识 RAG）：产物的版本、派生边；迁移由 `literag migrate` / `lite_rag.db.migrate` 一起执行 |
+| `chunks.lineage_key`（0007） | chunk 的账本 key `{doc_id}/{原文 hash 前 16 位}/{k}`，写入时算好，检索时读出 |
+| `rag_query_traces` / `rag_query_sources`（0008） | 一次检索或问答，以及各阶段用到的 chunk（按检索时读到的 `lineage_key`）；`in_context` 不存，读时取最后一个排序阶段的前 `top_k` |
+
+- 每次 upsert / delete / delete_kb 在同一事务里记账（`lineage.enabled`，默认开）。chunk 按原文认身份：原文没变的 chunk 复用旧产物、补一条边，位置和 context 记在边上；文档的新版本不再含有的 chunk 才结束。
+- 删除的产物立即清空原文和 metadata（title / source）；被取代的保留原文 `lineage.keep_text_days`（`literag lineage gc` 清），行永久保留。contextual 上下文不进账本。
+- `literag lineage backfill` 也把关账本期间删除的文档记为 deleted；关账本期间 drop 掉的整个 kb 修不回来。
+- trace（`trace.enabled`，默认关）的时间取在读完 chunk 之后；`trace show` 用 `started_by` 找当时读到的版本：已结束即"过期"，并显示原文。
+- 账本调用方必须串行化同一 namespace 的写入；lite-rag 的 namespace 就是 kb 物理键，PG 写入持有 kb 行锁。
+
 ## 5. 检索
 
 - **向量**：先对 query 做 embedding，再取 top-n（n = `top_k × candidate_factor`，默认取 4 倍）。
@@ -299,6 +315,8 @@ llm: {backend: ollama, model: qwen3:8b, max_output_tokens: 1024, connect_timeout
       roles: {graph: {model: qwen3:1.7b}},
       backends: {openai: {type: openai, base_url: "https://…/v1", api_key_env: OPENAI_API_KEY}}}
 cache: {enabled: false, roles: [answer, contextual, graph], ttl_s: null, schema: lite_cache}   # S18
+lineage: {enabled: true, keep_text_days: 90}                 # S25 provenance ledger
+trace: {enabled: false, query: text, retention_days: 90}     # S25 query traces (query: text | hash | none)
 server: {host: 127.0.0.1, port: 8700}
 ```
 
@@ -327,6 +345,8 @@ lite-rag/
   src/lite_rag/
     config.py loaders.py chunking.py embedding.py keyword.py fusion.py rerank.py llm.py engine.py
     stores/ base.py pg.py chroma.py          # Store Protocol + 两个后端
+    lineage/                                 # 通用账本（S25）：不 import lite-rag 的其他模块
+    provenance.py tracing.py                 # 账本里怎么记 RAG 的产物；查询 trace（S25）
     migrations/                              # PG schema（literag migrate）
     server/ app.py auth.py schemas.py        # FastAPI（extra [server]）
     cli.py prompts/answer_system.j2 prompts/answer_user.j2
@@ -368,6 +388,7 @@ lite-rag/
 | S22 每个 kb 选自己的 embedder | `embeddings.<name>`（命名 embedder，`embedding` 即 `default`）；`create_kb(kb, embedding=)`、`literag ingest/reindex --embedding`、`PUT /v1/kbs/{kb}` 的 `{embedding}`；打开 kb 时按它记录的身份（provider、model、前缀，再到 dim）找回 embedder，不加迁移；`search_kbs` 每个 embedder 只 embed 一次 query，各 embedder 的列表用 RRF 合并；跨 embedder 又没开 rerank 时警告一次；`literag eval --kb-per-dir`、跨语言评测集 `golden-xlang` | 只配一个 embedder 时结果逐条不变（分数是原始相似度）；新 kb 用指定的 embedder，已有 kb 换名字报错，未知名字 400；写已有 kb 用它自己的 embedder；`reindex --embedding` 换模型；评测：单一模型 vs 混用 vs 混用 + rerank |
 | S23 Cohere / Gemini 走 lite-model | `CohereEmbedder`、`GeminiEmbedder` 改由 lite-model 0.8.0 的 `cohere` / `gemini` 类型调用；`_HTTPEmbedder` 删除；`_LiteModelEmbedder._input_type(role)` 由各 embedder 决定是否把角色作 `input_type` 发出（Gemini 有前缀时不发） | 原有 vendor 测试（请求 URL、鉴权头、请求体、角色映射、批上限、前缀、缺 key）一条不改就通过，索引身份不变 |
 | S24 更难的跨语言评测 | `eval/make_xlang_hard.py` 生成 `corpus-xlang-hard/{en,zh}`（15 篇几乎相同的档位 / 地区 / 版本文档）和 `golden-xlang-hard.jsonl`（36 题，24 道跨语言，每题证据只在一篇里）；`vector-rerank.yaml`、`embed-qwen3-0.6b-rerank.yaml`、`xlang-en-bge-zh-qwen3*.yaml` | 回答：给不同语料选不同 embedding 模型，是否比最好的单一模型更好 |
+| S25 Lineage | S25a 通用账本 `lite_rag.lineage`；S25b 写入路径记账、`chunks.lineage_key`、backfill；S25c 查询 trace（`search_traced` / `search_kbs_traced` / `ask` / `record_cited` / `trace show`）；S25d `lineage gc`、`lineage show/upstream/downstream`、文档 | 见下方 S25 记录与 spec §9：改一段只出该段的新版本；删除级联；trace 判断当时用的数据是否已过期；`lite_rag.lineage` 不 import lite-rag 其他模块；现有检索与 eval 行为不变 |
 | S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
 
 - **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
@@ -600,6 +621,17 @@ lite-rag/
   结论：给不同语料选不同模型，没有赢过最强的单一多语言模型；默认仍是一个 embedder。按 kb 选 embedder（S22）的价值是让不同模型的 kb
   共存、方便换模型，不是提高命中。默认模型不改（bge-m3：换成 Qwen3 要所有 kb 重建索引，在 36 题上差 1 题、不显著，值不值得是用户的决定）。
   - 测试：`test_the_hard_cross_language_set_matches_its_corpus_and_its_generator`（先看到红：把一题的 doc 改成它的兄弟文档）。
+
+- **S25 Lineage（2026-11-24/25）**：owner 要把 lite-rag 做成通用模块，并具备答案溯源。对照代码后发现"增量重处理"已经有了（文档 hash 跳过、
+  `embedding_cache_<dim>`、lite-cache L1、外键级联删除），所以选"账本"方案：通用层只记录和查询，不驱动计算；lite-rag 的流程不变，在已有事务里记账。
+  rule 3（换模型 = 新 kb）、rule 4（chunk id 固定、整篇替换）不变。决定与理由见 spec；实现计划 `docs/superpowers/plans/2026-11-25-lineage.md`。
+  - 测试抓到并修掉：trace 时间原来在模型回答之后取（回答期间改文档会显示"未记录"）；读 chunk 与取时间之间的竞态（Codex，改用 `started_by`）。
+  - 安全审查：删除的产物原文立即清空（原来要等 gc）。
+  - trace 存储：每条 trace 约 2×`top_k`（rerank 关）到 2×`top_n`+`top_k`（rerank 开）行；`in_context` 不存、读时推出：rerank 关（默认）时 search 的 trace 行数减半，ask 的少约三分之一。
+    估算：每天 1 万次、保留 90 天、rerank 开，PG 约 5–10 GB。
+  - 没做的：账本的集合式批量写入（逐 chunk 两三条语句，远小于 embedding 的耗时）；不剪稳定 chunk 指向旧文档版本的边（那是来历本身）；
+    账本的 HTTP 查询接口；llm-steward 改用 `search_kbs_traced` + `record_cited` 是它升级 pin 之后的事。
+  - 收尾记录（simplify、Codex）：每个阶段的提交信息里有；S25d 见其提交。
 
 ## 13. 待确认
 

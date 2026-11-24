@@ -99,6 +99,11 @@ Every command takes `-c/--config <file.yaml>` and `-n/--namespace` (or `LITERAG_
 | `literag stats <kb>` | Size of a kb and how it was built |
 | `literag delete <kb> <doc_id>` · `literag drop-kb <kb> --yes` | Remove a document or a whole kb |
 | `literag reindex <kb> --into <new-kb>` | Rebuild under the current settings (another model or chunker) from the stored text |
+| `literag lineage show <kb> <doc_id>` | Every recorded version of a document, newest first, with its chunks |
+| `literag lineage upstream\|downstream <artifact_id>` | What an artifact came from / everything derived from it |
+| `literag lineage backfill <kb>` | Record documents stored before lineage was kept (or with it off) |
+| `literag lineage gc` | Clear old versions' text past `lineage.keep_text_days`, delete traces past `trace.retention_days` (whole store) |
+| `literag trace show <trace_id>` | What each stage of a traced search or answer used, and whether it is still current |
 | `literag eval -c a.yaml -c b.yaml` | Compare configurations on a corpus and golden questions |
 | `literag key create --name <who> --namespace '<glob>' [--kb '<glob>'] --mode read\|write` | Create an API key for the service |
 | `literag serve [--host] [--port]` | Run the HTTP API (extra `server`) |
@@ -126,6 +131,11 @@ hits = engine.search(
 hits = engine.search_kbs(["handbook", "faq"], "annual leave", top_k=5)
 answer = engine.ask("handbook", "How many days of annual leave do I get?")
 print(answer.text, [c.chunk_id for c in answer.citations], answer.model_id)
+# with trace.enabled: answer.trace_id names what each stage used (see Lineage below)
+report = engine.trace_report(answer.trace_id)
+# a host that writes its own answers: trace the search, then record what it cited
+traced = engine.search_kbs_traced(["handbook", "faq"], "annual leave")
+engine.record_cited(traced.trace_id, traced.hits[:1])
 engine.close()
 
 # Several namespaces in one process (what the HTTP service does): build the runtime once,
@@ -206,6 +216,8 @@ llm:                                                   # lite-model's config (it
 server: {host: 127.0.0.1, port: 8700}
 loader: {pdf: pypdf}                                   # or docling
 cache: {enabled: false, roles: [answer, contextual, graph]}   # lite-cache L1 (extra `cache`), below
+lineage: {enabled: true, keep_text_days: 90}           # the provenance ledger, below
+trace: {enabled: false, query: text, retention_days: 90}   # query traces; query: text | hash | none
 ```
 
 Keep `LITERAG_DATABASE_URL` and API keys in the environment; a key is read from `api_key_env` or
@@ -248,6 +260,40 @@ is an HMAC of the prompt under that secret instead — the same prompt gives the
 document still cannot predict it. Changing the secret changes every nonce, so it invalidates every cached
 entry (the calls are simply made again). `cache.question_log: <path>` appends each `ask` question to a
 JSONL file (for a later replay evaluation). PostgreSQL store only.
+
+## Lineage
+
+Every write records, in the same transaction, which document version each indexed chunk came
+from (a provenance ledger). A chunk is known by its text: when a document changes, only the
+chunks whose text changed get a new version; renumbered or re-contextualised ones stay the same.
+With `trace.enabled`, `search_traced` / `ask` also record which chunk versions each stage used
+(retrieved, reranked, in context, cited), so `literag trace show` can tell whether an answer
+used text that has since changed — and show what it said then. A deleted document's text, title
+and source leave the ledger at once (contextual headers are never recorded); a replaced version's
+text stays `lineage.keep_text_days` (until `literag lineage gc`), its row for good. Existing kbs:
+run `literag lineage backfill <kb>` once — it also ends documents deleted while lineage was off (a
+kb dropped while it was off stays in the ledger as it was). `trace.query: hash` is an unsalted
+sha256: short questions can be guessed from it; use `none` if that matters.
+Design: [docs/superpowers/specs/2026-11-24-lineage-design.md](docs/superpowers/specs/2026-11-24-lineage-design.md).
+
+The ledger itself (`lite_rag.lineage`) knows nothing of RAG and imports nothing else of lite-rag,
+so another project can use it on its own PostgreSQL or SQLite connection:
+
+```python
+from lite_rag.lineage import ledger_for, migrate
+
+with conn.transaction():
+    migrate(conn)  # its own tables, lineage_*
+with conn.transaction():  # inside the transaction that writes your data
+    ledger = ledger_for(conn)
+    doc = ledger.record("myproject", "document", "contract-7", content_hash)
+    ledger.record("myproject", "clause", "contract-7/3", clause_hash, parents=[doc.artifact.id])
+    if doc.replaced:  # a new version: end what only the old one had
+        ledger.retire(doc.replaced.id)
+    ledger.downstream(doc.artifact.id)  # what a change to it affects
+```
+
+Writers to one namespace must be serialised by the caller (lite-rag holds the kb's row lock).
 
 ## Evaluation
 

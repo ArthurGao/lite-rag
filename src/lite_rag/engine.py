@@ -39,7 +39,7 @@ from lite_rag.embedding import Embedder, build_embedder
 from lite_rag.errors import ConfigError, InvalidRequest, KbMismatch, KbNotFound, StoreError
 from lite_rag.fusion import rrf, weighted
 from lite_rag.graph import GraphExtractor, entity_key, seeds, walk
-from lite_rag.lineage import utcnow
+from lite_rag.lineage import Artifact, Ledger, Related, utcnow
 from lite_rag.llm import LLM, Completion, RoleLLM, build_model
 from lite_rag.loaders import doc_id_for, file_doc_id, load_file
 from lite_rag.model_profiles import Prefixes, prefixes_for
@@ -327,14 +327,15 @@ class _Retrieved:
 
     hits: list[Hit]
     refs: list[KbRef]
-    stages: dict[Stage, list[tuple[Key, float]]]
+    stages: dict[Stage, list[tuple[Key, float]]]  # what a trace stores
+    context: list[tuple[Key, float]]  # the hits' keys: in_context, derived on read (tracing)
     stored: dict[Key, StoredChunk]
     settings: dict[str, Any]
     at: datetime  # when the chunks were read: a later write (say, during an answer) is after it
 
     @classmethod
     def empty(cls, refs: list[KbRef], settings: dict[str, Any]) -> "_Retrieved":
-        return cls([], refs, {}, {}, settings, utcnow())
+        return cls([], refs, {}, [], {}, settings, utcnow())
 
 
 class RagEngine:
@@ -728,7 +729,6 @@ class RagEngine:
         if reranking and candidates:
             candidates = rankings["rerank"] = self._rerank(query, candidates, stored)
             stages["reranked"] = candidates
-        stages["in_context"] = candidates[:k]
         ranks = {s: {c: i for i, (c, _) in enumerate(r, start=1)} for s, r in rankings.items()}
         scores = {s: dict(r) for s, r in rankings.items()}
         # a hit's vector / graph score stays its similarity under its own kb's model
@@ -739,7 +739,7 @@ class RagEngine:
         ]
         if route is not None:
             settings["route"] = {"mode": route.mode, "model_id": route.model_id}
-        return _Retrieved(hits, refs, stages, stored, settings, at)
+        return _Retrieved(hits, refs, stages, candidates[:k], stored, settings, at)
 
     def _across_embedders(
         self, per_kb: list[dict[str, list[tuple[str, float]]]], names: list[str], path: str, n: int
@@ -883,12 +883,11 @@ class RagEngine:
         with cache_context(self._settings, self.namespace, "answer", question):
             completion = self.runtime.llm().complete(prompt(question, hits))
         text, citations, dropped = check_citations(completion.text, hits)
-        in_context = found.stages["in_context"]
         trace_id = self._trace(
             "ask",
             question,
             found,
-            cited=[in_context[c.n - 1] for c in citations],
+            cited=[found.context[c.n - 1] for c in citations],
             completion=completion,
             status="answered",
         )
@@ -904,6 +903,29 @@ class RagEngine:
             cached=completion.cached,
             trace_id=trace_id,
         )
+
+    def lineage_document(self, kb: str, doc_id: str) -> list[tuple[Artifact, list[Related]]]:
+        """Every recorded version of a document, newest first, each with its chunks."""
+        ns = self._ref(kb).key
+        with self._store.ledger() as ledger:
+            return [(v, ledger.children(v.id)) for v in ledger.history(ns, "document", doc_id)]
+
+    def lineage_upstream(self, artifact_id: str) -> list[Related]:
+        """What an artifact of this namespace was derived from (`InvalidRequest` otherwise)."""
+        with self._store.ledger() as ledger:
+            self._own_artifact(ledger, artifact_id)
+            return ledger.upstream(artifact_id)
+
+    def lineage_downstream(self, artifact_id: str) -> list[Related]:
+        """Everything derived from an artifact of this namespace (impact analysis)."""
+        with self._store.ledger() as ledger:
+            self._own_artifact(ledger, artifact_id)
+            return ledger.downstream(artifact_id)
+
+    def _own_artifact(self, ledger: Ledger, artifact_id: str) -> None:
+        found = ledger.get([artifact_id]).get(artifact_id)
+        if found is None or not KbRef.in_namespace(found.namespace, self.namespace):
+            raise InvalidRequest(f"no artifact {artifact_id!r} in namespace {self.namespace!r}")
 
     def trace_report(self, trace_id: str) -> TraceReport:
         """A trace of this namespace with, for each source, whether the chunk version it used is

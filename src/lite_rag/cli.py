@@ -12,12 +12,15 @@ import typer
 
 from lite_rag import __version__
 from lite_rag.chunking import chunk_context
-from lite_rag.config import Mode, Settings, load_settings
+from lite_rag.config import Mode, Settings, StoreConfig, load_settings
 from lite_rag.db import redact_conninfo
 from lite_rag.engine import RagEngine, RagRuntime
 from lite_rag.errors import LiteRagError
 from lite_rag.extras import require_extra
+from lite_rag.lineage import Related
 from lite_rag.loaders import find_files
+from lite_rag.maintenance import collect
+from lite_rag.stores.base import CachedStore
 from lite_rag.stores.factory import evaluation_store, location, migrate_store, open_store
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -92,6 +95,16 @@ def migrate_command(config: ConfigOption = None) -> None:
         applied = migrate_store(store, settings.database_url)
     target = location(store, settings.database_url)
     typer.echo(f"applied {', '.join(applied)} to {target}" if applied else f"{target}: up to date")
+
+
+@contextmanager
+def _store(config: StoreConfig, url: str | None, **kwargs: Any) -> Iterator[CachedStore]:
+    """A store, closed afterwards (commands that work on a whole store, not one namespace)."""
+    store = open_store(config, url, **kwargs)
+    try:
+        yield store
+    finally:
+        store.close()
 
 
 @contextmanager
@@ -268,6 +281,70 @@ def lineage_backfill(
     typer.echo(f"recorded {recorded} of {total} documents")
 
 
+ArtifactArg = Annotated[str, typer.Argument(help="An artifact id (from `lineage show`)")]
+
+
+def _related(items: list[Related]) -> None:
+    for r in items:
+        a = r.artifact
+        where = r.via.metadata.get("chunk_id")
+        at = f"  as {where}" if where else ""
+        typer.echo(f"{a.kind} {a.key} v{a.version} {a.status}  {a.id}{at}")
+
+
+@lineage_app.command("show")
+def lineage_show(
+    kb: KbArg,
+    doc_id: Annotated[str, typer.Argument(help="Document id")],
+    config: ConfigOption = None,
+    namespace: NamespaceOption = None,
+) -> None:
+    """Every recorded version of a document, newest first, with its chunks."""
+    with _engine(config, namespace) as engine:
+        history = engine.lineage_document(kb, doc_id)
+    if not history:
+        _fail(f"no lineage recorded for {doc_id!r} in {kb!r}")
+    for version, chunks in history:
+        ended = f" (ended {version.ended_at:%Y-%m-%d %H:%M:%S})" if version.ended_at else ""
+        typer.echo(f"v{version.version} {version.status}{ended}  {version.id}")
+        for r in chunks:
+            text = (r.artifact.payload or "(text cleared)").replace("\n", " ")[:60]
+            typer.echo(f"  {r.via.metadata.get('chunk_id')}  {r.artifact.id}  {text}")
+
+
+@lineage_app.command("upstream")
+def lineage_upstream(
+    artifact_id: ArtifactArg, config: ConfigOption = None, namespace: NamespaceOption = None
+) -> None:
+    """What an artifact was derived from."""
+    with _engine(config, namespace) as engine:
+        _related(engine.lineage_upstream(artifact_id))
+
+
+@lineage_app.command("downstream")
+def lineage_downstream(
+    artifact_id: ArtifactArg, config: ConfigOption = None, namespace: NamespaceOption = None
+) -> None:
+    """Everything derived from an artifact (what a change to it affects)."""
+    with _engine(config, namespace) as engine:
+        _related(engine.lineage_downstream(artifact_id))
+
+
+@lineage_app.command("gc")
+def lineage_gc(config: ConfigOption = None) -> None:
+    """Clear the text of versions ended more than `lineage.keep_text_days` ago and delete
+    traces older than `trace.retention_days` — in every namespace of the store."""
+    settings = _settings(config)
+    lineage = settings.lineage
+    with _errors(), _store(settings.store, settings.database_url, lineage=lineage.enabled) as store:
+        cleared, deleted = collect(
+            store,
+            keep_text_days=lineage.keep_text_days if lineage.enabled else None,
+            retention_days=settings.trace.retention_days,
+        )
+    typer.echo(f"cleared {cleared} texts, deleted {deleted} traces")
+
+
 trace_app = typer.Typer(help="Query traces (lineage design §6.3)", no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 
@@ -420,8 +497,7 @@ def eval_command(
         first = loaded[0][1]
         apart = evaluation_store(first.store, schema)
         migrate_store(apart, first.database_url)
-        store = open_store(apart, first.database_url)
-        try:
+        with _store(apart, first.database_url) as store:
             results = evaluate(
                 loaded,
                 corpus,
@@ -433,8 +509,6 @@ def eval_command(
                 crosscheck=crosscheck,
                 kb_per_dir=kb_per_dir,
             )
-        finally:
-            store.close()
     typer.echo(table(results))
     for r in results:  # status, errors and warnings of each run, not only its numbers
         typer.echo("\n" + render_run(r.record, str(r.directory)))
@@ -491,8 +565,7 @@ def eval_answers_command(
         calibrated_judge(calibration)  # a bad calibration fails before the store is touched
         apart = evaluation_store(settings.store, schema)
         migrate_store(apart, settings.database_url)
-        store = open_store(apart, settings.database_url)
-        try:
+        with _store(apart, settings.database_url) as store:
             result = judge_answers(
                 config.stem,
                 settings,
@@ -505,7 +578,5 @@ def eval_answers_command(
                 schema=schema,
                 limit=limit,
             )
-        finally:
-            store.close()
     typer.echo(render_run(result.record, str(result.directory), result.scores))
     typer.echo(report(flagged_answers(result), missed_facts(result)), nl=False)

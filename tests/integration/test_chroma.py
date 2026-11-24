@@ -18,7 +18,13 @@ from lite_rag.stores.factory import evaluation_store, migrate_store
 from tests.contract.test_lineage import active_doc, assert_consistent
 from tests.contract.test_store import KB, NS, info, put
 
-MIGRATIONS = ["0001_initial", "0002_lineage_key", "0003_traces", "lineage:0001_ledger"]
+MIGRATIONS = [
+    "0001_initial",
+    "0002_lineage_key",
+    "0003_traces",
+    "lineage:0001_ledger",
+    "lineage:0002_gc_index",
+]
 
 
 class Crash(BaseException):
@@ -394,3 +400,27 @@ def test_cli_trace_show_marks_a_stale_source_with_its_old_text(data_dir: Path) -
     assert "The visa fee is 100 dollars." in out.output
     missing = CliRunner().invoke(app, ["trace", "show", "nope", "-n", ENGINE_NS], env=env)
     assert missing.exit_code != 0 and "no trace" in missing.output
+
+
+def test_cli_lineage_show_upstream_and_gc(data_dir: Path) -> None:
+    from tests.integration.support import NS as ENGINE_NS
+    from tests.integration.support import make_engine
+
+    store = ChromaStore(data_dir)
+    engine = make_engine(store, size=200)
+    engine.upsert_text("kb", "d1", "D1", "first text")
+    engine.upsert_text("kb", "d1", "D1", "second text")
+    [(_, chunks), _] = engine.lineage_document("kb", "d1")
+    chunk_id = chunks[0].artifact.id
+    store.close()
+    env = {"LITERAG_STORE__BACKEND": "chroma", "LITERAG_STORE__DATA_DIR": str(data_dir)}
+    runner = CliRunner()
+    show = runner.invoke(app, ["lineage", "show", "kb", "d1", "-n", ENGINE_NS], env=env)
+    assert show.exit_code == 0, show.output
+    lines = show.output.splitlines()
+    assert lines[0].startswith("v2 active") and any(x.startswith("v1 superseded") for x in lines)
+    assert "second text" in show.output and "d1#0" in show.output
+    up = runner.invoke(app, ["lineage", "upstream", chunk_id, "-n", ENGINE_NS], env=env)
+    assert up.exit_code == 0 and "document d1 v2" in up.output, up.output
+    gc = runner.invoke(app, ["lineage", "gc"], env=env)
+    assert gc.exit_code == 0 and "cleared 0 texts, deleted 0 traces" in gc.output, gc.output

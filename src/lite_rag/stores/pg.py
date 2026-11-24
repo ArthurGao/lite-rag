@@ -30,6 +30,7 @@ from lite_rag.lineage import Ledger, ledger_for
 from lite_rag.provenance import (
     DocVersion,
     chunk_keys,
+    end_missing,
     record_document,
     recorded,
     retire_document,
@@ -488,8 +489,7 @@ class PgStore:
             self._copy_graph(conn, kb, chunks)
             if ledger := self._ledger_in(conn):
                 version = DocVersion(doc.doc_id, doc.title, doc.source, content_hash)
-                pairs = [(c.chunk, c.context) for c in chunks]
-                record_document(ledger, info, version, pairs, keys)
+                record_document(ledger, info, version, [c.chunk for c in chunks], keys)
             self._adjust_stats(
                 conn,
                 kb,
@@ -522,18 +522,18 @@ class PgStore:
                     continue
                 rows = conn.execute(
                     "SELECT c.id, c.n, c.text, c.start_offset, c.end_offset, c.tokens,"
-                    " c.heading_path, c.page, c.parent_n, c.context, c.lineage_key"
+                    " c.heading_path, c.page, c.parent_n, c.lineage_key"
                     " FROM chunks c JOIN documents d ON d.kb = c.kb AND d.doc_id = c.doc_id"
                     " WHERE c.kb = %s AND c.doc_id = %s AND d.content_hash = %s ORDER BY c.n",
                     (kb.key, doc.doc_id, doc.content_hash),
                 ).fetchall()
                 if not rows and self._document_hash(conn, kb, doc.doc_id) != doc.content_hash:
                     continue  # deleted or rewritten since the list was read: recorded then
-                pairs = [
-                    (Chunk(cid, doc.doc_id, n, t, s, e, tok, tuple(path), page, pn), ctx)
-                    for cid, n, t, s, e, tok, path, page, pn, ctx, _ in rows
+                chunks = [
+                    Chunk(cid, doc.doc_id, n, t, s, e, tok, tuple(path), page, pn)
+                    for cid, n, t, s, e, tok, path, page, pn, _ in rows
                 ]
-                keys = chunk_keys(doc.doc_id, [c.text for c, _ in pairs])
+                keys = chunk_keys(doc.doc_id, [c.text for c in chunks])
                 missing = [
                     (k, kb.key, row[0])
                     for row, k in zip(rows, keys, strict=True)
@@ -544,8 +544,12 @@ class PgStore:
                         cur.executemany(
                             "UPDATE chunks SET lineage_key = %s WHERE kb = %s AND id = %s", missing
                         )
-                record_document(ledger, info, doc, pairs, keys)
+                record_document(ledger, info, doc, chunks, keys)
                 done += 1
+        with self._tx() as conn:  # deleted while lineage was off: end them now
+            self._get_kb(conn, kb, lock=True)
+            present = conn.execute("SELECT doc_id FROM documents WHERE kb = %s", (kb.key,))
+            end_missing(ledger_for(conn), kb.key, {d for (d,) in present})
         return done
 
     def delete_document(self, kb: KbRef, doc_id: str) -> bool:

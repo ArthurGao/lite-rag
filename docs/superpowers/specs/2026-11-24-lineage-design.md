@@ -180,7 +180,7 @@ CREATE TABLE rag_query_traces (
 CREATE TABLE rag_query_sources (
   trace_id     TEXT NOT NULL REFERENCES rag_query_traces (id) ON DELETE CASCADE,
   artifact_ns  TEXT NOT NULL,            -- kb 物理键
-  artifact_key TEXT NOT NULL,            -- chunk 的账本 key "{doc_id}/{text_hash}/{k}"
+  artifact_key TEXT NOT NULL,            -- （实现：可为 NULL，见 §12）chunk 的账本 key "{doc_id}/{text_hash}/{k}"
   chunk_id     TEXT NOT NULL,            -- 检索时的位置，便于阅读
   stage        TEXT NOT NULL,            -- retrieved / reranked / in_context / cited
   rank         INT,
@@ -192,11 +192,11 @@ CREATE TABLE rag_query_sources (
 - 阶段定义：`retrieved` = 融合后进入候选池的 chunk（`pool` 个）；`reranked` = rerank 后的顺序（仅启用 rerank 时）；`in_context` = 最终返回 / 放进 prompt 的 hits；`cited` = `check_citations` 后保留的引用。parent_child 下记的是**命中的子 chunk**。
 - **在检索那一刻钉住版本（实现者的决定，审阅后定）**：trace 不在写入时去查"当前 active 的 artifact"，而是用检索时读到的 chunk 原文（`StoredChunk.text`）直接算出账本 key。这样 `ask` 在检索和写 trace 之间（模型调用期间）文档被改，trace 记的仍是当时真正读到的那段文字。为此 `chunks` 表加一列 `lineage_key`，upsert 时算好写入（与账本开关无关，key 只由文档 id 和原文决定），检索读 chunk 时一并读出，trace 直接用它，不需要再推算 `k`。
 - 因此 `rag_query_sources` 不对 `lineage_artifacts` 加外键：账本里查不到这个 key（kb 还没回填、或记账关闭时写入的）也能正常写 trace，`trace show` 把它显示为"未记录"。
-- 过期判断（`trace show` 时算）：取该 key 在 `trace.created_at` 时刻有效的 artifact（`as_of`）。它之后被结束 → "当时有效、之后过期"，并显示它的原文（若未被 gc）；仍 active → "仍然有效"；找不到 → "未记录"。这是标记，不抛错。
+- 过期判断（`trace show` 时算）：取该 key 在 `trace.created_at` 时刻有效的 artifact（`as_of`；实现改用 `started_by`，见 §12）。它之后被结束 → "当时有效、之后过期"，并显示它的原文（若未被 gc）；仍 active → "仍然有效"；找不到 → "未记录"。这是标记，不抛错。
 - `Answer` 增加 `trace_id`（未开启时为 None）；HTTP `ask` 响应带上它。
 - **search 的 trace（owner 决定，2026-11-24）**：现有 `search` / `search_kbs` 签名和行为不变，不记 trace。新增：
   - `search_traced(...)` / `search_kbs_traced(...)`：参数与原方法相同，返回 `Traced(hits: list[Hit], trace_id: str | None)`；记 `retrieved` / `reranked` / `in_context` 三个阶段，`operation='search'`。
-  - `record_cited(trace_id, chunk_ids)`：自己生成答案的宿主（llm-steward 只调用 `search_kbs`）把最终引用的 chunk 补记为 `cited` 阶段；chunk_id 必须是该 trace `in_context` 里出现过的，否则抛 `InvalidRequest`。
+  - `record_cited(trace_id, chunk_ids)`（实现：接收 Hit，见 §12）：自己生成答案的宿主（llm-steward 只调用 `search_kbs`）把最终引用的 chunk 补记为 `cited` 阶段；chunk_id 必须是该 trace `in_context` 里出现过的，否则抛 `InvalidRequest`。
   - 理由：llm-steward 消费 `list[Hit]`，不能改返回类型；`ask` 内部改为调用 traced 版本。
   - HTTP 本期不加 traced search 端点，llm-steward 走进程内调用。
 - trace 写入失败时抛错（rule 5）。trace 写在检索读取之后的独立小事务里。
@@ -262,3 +262,20 @@ trace:
 - CLI 输出格式。
 - 一致性测试是用随机操作序列（property-based）还是固定场景。
 - llm-steward 改用 `search_kbs_traced` + `record_cited` 是 llm-steward 自己的后续工作（pin 升级之后），不在 S25 范围内。
+
+## 12. 实现中的决定（2026-11-25，S25a–d）
+
+实现时改动或补充了上文，以这里为准：
+
+- **账本 API**：入口是 `migrate(conn)` / `pending(conn)` / `ledger_for(conn)`，按连接类型选 PG 或 SQLite（不是 `migrate_pg` 等四个函数）。另加 `record_many`（一组 chunk 一次检查父节点）、`count_active`（一致性检查）、`history`（某个 key 的全部版本）、`started_by`（某时刻已开始的最新版本，不论是否已结束）。PG / SQLite 的差异集中在 `lineage.dialect`，账本和 lite-rag 的 trace 表共用。
+- **并发**：调用方必须串行化同一 namespace 的写入（lite-rag：PG 持有 kb 行锁，Chroma 是进程锁）。账本本身不加锁。
+- **账本不记 contextual 上下文**：它是模型根据内容写的文字，存在边上会比删除活得久（终审 #1）。边上只记位置（`chunk_id`、`n`、`start`、`end`、`page`、`parent_n`）。
+- **删除即清原文**：`deleted` 的产物立即清空 `payload` 和 `metadata`（文档的 title / source）（安全审查、终审 #1）；`superseded` 的保留到 `keep_text_days` 后由 gc 清。`trace show` 对已删除文档的 chunk 显示"过期"但没有原文。
+- **文档 artifact 的 metadata** 记 `title`、`source`、`embedding`、`dim`；chunk artifact 的 metadata 为空（同一 kb 的 chunk 都一样，不重复记）。
+- **backfill 修复关账本期间的删除**：账本里仍 active、store 里已没有的文档记为 `deleted`（终审 #2）。关账本期间整个 drop 掉的 kb 修不回来（store 里已无 kb，backfill 报 `KbNotFound`）：它的产物保持原样。
+- **`chunks.lineage_key`**：写入时算好（与账本开关无关），检索时读出；trace 直接用它，不推算 `k`。
+- **trace 存储**：`artifact_key` 可为 NULL（未记录）；`in_context` 不存，读取时取最后一个排序阶段（有 rerank 用 reranked，否则 retrieved）的前 `top_k`。Store 协议只有一个 `traces()`，返回在一个事务里的 `TraceLog`；读 trace 时 SQL 按 namespace 过滤。
+- **trace 时间**：读完 chunk 之后立即取（不是模型回答之后）。`trace_report` 用 `started_by(key, 时间)` 找当时读到的版本：已结束即"过期"，仍有效即"有效"，找不到即"未记录"。
+- **`record_cited(trace_id, cited: Sequence[Hit])`**：接收 Hit 而不是 chunk_id，因为 chunk_id 只在 kb 内唯一，跨 kb 的 trace 需要 kb 名。
+- **gc**：`literag lineage gc` 不分 namespace，作用于整个 store；清原文和删 trace 都按 1000 条一批、每批一个事务（`lineage_artifacts_gc` 部分索引只含还有原文的已结束行）。`lineage.enabled: false` 时只删 trace，不动账本。不剪"稳定 chunk 指向旧文档版本"的边：那是来历本身，增长为每次编辑每个 chunk 一条边。
+- **存储估算**：每条 trace 约 2×`top_k` 行（rerank 关，默认）或 2×`top_n`+`top_k` 行（rerank 开）。每天 1 万次、保留 90 天、rerank 开时，PG 约 5–10 GB。

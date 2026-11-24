@@ -2,7 +2,7 @@ import sqlite3
 
 from tests.lineage.conftest import Conn, migrated, pending_of
 
-ALL = ["lineage:0001_ledger"]
+ALL = ["lineage:0001_ledger", "lineage:0002_gc_index"]
 
 
 def _tables(conn: Conn) -> set[str]:

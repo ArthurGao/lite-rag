@@ -42,6 +42,11 @@ class KbRef:
     def key(self) -> str:
         return f"{self.namespace}:{self.name}"
 
+    @staticmethod
+    def in_namespace(key: str, namespace: str) -> bool:
+        """Whether a physical key belongs to `namespace` (a namespace has no ':')."""
+        return key.startswith(f"{namespace}:")
+
 
 @dataclass(frozen=True)
 class KbInfo:

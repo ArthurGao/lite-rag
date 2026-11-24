@@ -5,7 +5,7 @@ document was deleted), or did the ledger never record it."""
 
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import astuple, dataclass
+from dataclasses import astuple, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
 
@@ -115,16 +115,23 @@ class TraceLog:
             None if cached is None else bool(cached),
             status,
         )
-        return record, self.sources(trace_id)
-
-    def sources(self, trace_id: str, stage: Stage | None = None) -> list[TraceSource]:
-        where = "" if stage is None else " AND stage = ?"
-        rows = self._d.rows(
-            f"SELECT {SOURCE_COLUMNS} FROM rag_query_sources WHERE trace_id = ?{where}",
-            (trace_id,) if stage is None else (trace_id, stage),
+        rows = d.rows(
+            f"SELECT {SOURCE_COLUMNS} FROM rag_query_sources WHERE trace_id = ?", (trace_id,)
         )
-        found = [TraceSource(*r) for r in rows]
-        return sorted(found, key=lambda s: (STAGES.index(s.stage), s.rank or 0))
+        stored = [TraceSource(*r) for r in rows]
+        found = stored
+        if not any(s.stage == "in_context" for s in stored):  # S25c traces stored it
+            found = stored + in_context(stored, int(record.retrieval["top_k"]))
+        return record, sorted(found, key=lambda s: (STAGES.index(s.stage), s.rank or 0))
+
+    def delete_before(self, before: datetime, *, limit: int) -> int:
+        """Delete up to `limit` traces made before `before` (their sources cascade); returns
+        how many went."""
+        return self._d.run(
+            "DELETE FROM rag_query_traces WHERE id IN"
+            " (SELECT id FROM rag_query_traces WHERE created_at < ? ORDER BY created_at LIMIT ?)",
+            (self._d.to_time(before), limit),
+        )
 
     def ids(self, namespace: str) -> list[str]:
         """The namespace's traces, oldest first."""
@@ -133,6 +140,17 @@ class TraceLog:
             (namespace,),
         )
         return [i for (i,) in rows]
+
+
+def in_context(stored: Sequence[TraceSource], top_k: int) -> list[TraceSource]:
+    """The hits that were returned (and put in the prompt): the first `top_k` of the last
+    ranking stage — derived on read rather than stored, since with rerank off (the default)
+    they are exactly the retrieved stage. The engine's side of this rule: `_Retrieved.context`
+    is `candidates[:top_k]` of that same ranking."""
+    last = "reranked" if any(s.stage == "reranked" for s in stored) else "retrieved"
+    return [
+        replace(s, stage="in_context") for s in stored if s.stage == last and (s.rank or 0) <= top_k
+    ]
 
 
 @dataclass(frozen=True)

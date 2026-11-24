@@ -35,6 +35,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         "0007_lineage_key",
         "0008_traces",
         "lineage:0001_ledger",
+        "lineage:0002_gc_index",
     ]
     assert _tables(pg) == TABLES
     assert migrate(pg, TEST_SCHEMA) == []  # second run: nothing pending
@@ -154,7 +155,7 @@ def test_the_store_refuses_a_schema_whose_ledger_is_behind(
     ledger's migrations come with it, and its pending ones block opening like lite-rag's."""
     migrate(pg, TEST_SCHEMA)
     pg.execute(f"DELETE FROM {TEST_SCHEMA}.lineage_schema_migrations")
-    with pytest.raises(StoreError, match="lineage:0001_ledger"):
+    with pytest.raises(StoreError, match="lineage:0001_ledger, lineage:0002_gc_index"):
         PgStore(pg_url, TEST_SCHEMA)
 
 
@@ -220,5 +221,40 @@ def test_a_report_shows_an_unrecorded_source(pg: psycopg.Connection, pg_url: str
             ("retrieved", "unrecorded", None),
             ("in_context", "unrecorded", None),
         }
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("rerank", [False, True], ids=["plain", "reranked"])
+def test_in_context_rows_are_derived_not_stored(
+    pg: psycopg.Connection, pg_url: str, rerank: bool
+) -> None:
+    """in_context is the first top_k of the last ranking stage: stored once, read back whole."""
+    from lite_rag.testing import FakeReranker
+    from tests.integration.support import make_engine
+
+    migrate(pg, TEST_SCHEMA)
+    store = PgStore(pg_url, TEST_SCHEMA)
+    try:
+        engine = make_engine(
+            store,
+            size=200,
+            trace={"enabled": True},
+            rerank={"enabled": rerank, "top_n": 3},
+            reranker=FakeReranker(),
+        )
+        for doc_id, text in [("a", "refunds take days"), ("b", "refunds and shipping"),
+                             ("c", "refunds weekly")]:  # fmt: skip
+            engine.upsert_text("kb", doc_id, doc_id, text)
+        traced = engine.search_traced("kb", "refunds shipping", top_k=2, mode="bm25")
+        stored = pg.execute(
+            f"SELECT count(*) FROM {TEST_SCHEMA}.rag_query_sources WHERE stage = 'in_context'"
+        ).fetchone()
+        assert stored == (0,)
+        with store.traces() as log:
+            found = log.get(engine.namespace, traced.trace_id)  # type: ignore[arg-type]
+        assert found is not None
+        in_context = [(s.chunk_id, s.rank) for s in found[1] if s.stage == "in_context"]
+        assert in_context == [(h.chunk_id, n) for n, h in enumerate(traced.hits, start=1)]
     finally:
         store.close()

@@ -43,10 +43,11 @@ N = len(FIELDS)
 
 
 def _end_set(status: Ended) -> str:
-    """The SET clause that ends an artifact: a deleted one loses its text at once (whoever
-    deleted it meant the content to go); a superseded one keeps it until `gc`, so history can
-    still show what it said."""
-    return "status = ?, ended_at = ?" + (", payload = NULL" if status == "deleted" else "")
+    """The SET clause that ends an artifact: a deleted one loses its text and metadata at once
+    (whoever deleted it meant the content to go); a superseded one keeps them (its text until
+    `gc`), so history can still show what it said."""
+    gone = ", payload = NULL, metadata = '{}'" if status == "deleted" else ""
+    return "status = ?, ended_at = ?" + gone
 
 
 def utcnow() -> datetime:
@@ -107,8 +108,16 @@ class Ledger(Protocol):
 
     def count_active(self, namespace: str, kind: str) -> int: ...
 
+    def active_keys(self, namespace: str, kind: str) -> list[str]:
+        """The keys of `kind` with an active version in `namespace`."""
+        ...
+
     def as_of(self, namespace: str, kind: str, key: str, at: datetime) -> Artifact | None:
         """The version that was current at `at` (None: none yet, or deleted by then)."""
+        ...
+
+    def history(self, namespace: str, kind: str, key: str) -> list[Artifact]:
+        """Every version of a key, newest first."""
         ...
 
     def started_by(self, namespace: str, kind: str, key: str, at: datetime) -> Artifact | None:
@@ -125,8 +134,9 @@ class Ledger(Protocol):
         """Everything derived from it (impact analysis), nearest first, each once."""
         ...
 
-    def gc(self, ended_before: datetime) -> int:
-        """Clear the payload of artifacts that ended before `ended_before`; rows stay, so
+    def gc(self, ended_before: datetime, *, limit: int | None = None) -> int:
+        """Clear the payload of artifacts that ended before `ended_before` — at most `limit`,
+        oldest first (call again, one transaction each, until it returns less); rows stay, so
         history and traces keep resolving. Returns how many were cleared."""
         ...
 
@@ -214,6 +224,14 @@ class _SqlLedger:
             for r in rows
         ]
 
+    def active_keys(self, namespace: str, kind: str) -> list[str]:
+        rows = self._rows(
+            "SELECT key FROM lineage_artifacts"
+            " WHERE namespace = ? AND kind = ? AND status = 'active' ORDER BY key",
+            (namespace, kind),
+        )
+        return [k for (k,) in rows]
+
     def count_active(self, namespace: str, kind: str) -> int:
         [(n,)] = self._rows(
             "SELECT count(*) FROM lineage_artifacts"
@@ -231,6 +249,13 @@ class _SqlLedger:
             (namespace, kind, key, when, when),
         )
         return found[0] if found else None
+
+    def history(self, namespace: str, kind: str, key: str) -> list[Artifact]:
+        return self._artifacts(
+            f"SELECT {COLUMNS} FROM lineage_artifacts"
+            " WHERE namespace = ? AND kind = ? AND key = ? ORDER BY version DESC",
+            (namespace, kind, key),
+        )
 
     def started_by(self, namespace: str, kind: str, key: str, at: datetime) -> Artifact | None:
         found = self._artifacts(
@@ -437,11 +462,19 @@ class _SqlLedger:
         ]
         return len(roots) + len(self._cascade(roots, status, now))
 
-    def gc(self, ended_before: datetime) -> int:
+    def gc(self, ended_before: datetime, *, limit: int | None = None) -> int:
+        # ended_at < ? excludes active rows (their ended_at is NULL); the partial index
+        # lineage_artifacts_gc holds exactly the rows with text left.
+        due = "payload IS NOT NULL AND ended_at < ?"
+        if limit is None:
+            return self._run(
+                f"UPDATE lineage_artifacts SET payload = NULL WHERE {due}",
+                (self._to_time(ended_before),),
+            )
         return self._run(
-            "UPDATE lineage_artifacts SET payload = NULL"
-            " WHERE status <> 'active' AND ended_at < ? AND payload IS NOT NULL",
-            (self._to_time(ended_before),),
+            "UPDATE lineage_artifacts SET payload = NULL WHERE id IN"
+            f" (SELECT id FROM lineage_artifacts WHERE {due} ORDER BY ended_at LIMIT ?)",
+            (self._to_time(ended_before), limit),
         )
 
 
