@@ -76,3 +76,21 @@ def test_count_active_counts_one_kind_in_one_namespace(ledger: Ledger) -> None:
     assert ledger.count_active(NS, "chunk") == 2
     ledger.retire(d, status="deleted")
     assert ledger.count_active(NS, "chunk") == 0
+
+
+def test_started_by_is_the_latest_version_begun_by_then_even_if_ended(
+    ledger: Ledger, clock: Clock
+) -> None:
+    before = clock.now
+    v1 = ledger.record(NS, "chunk", "k", "h").artifact
+    [ended] = ledger.retire(v1.id)
+    assert ledger.started_by(NS, "chunk", "k", before) is None
+    later = ended.ended_at + timedelta(days=1)  # type: ignore[operator]
+    assert ledger.as_of(NS, "chunk", "k", later) is None  # not current then
+    found = ledger.started_by(NS, "chunk", "k", later)
+    assert found is not None and (found.id, found.status) == (v1.id, "superseded")
+    v2 = ledger.record(NS, "chunk", "k", "h").artifact
+    at_end = ended.ended_at
+    assert at_end is not None and at_end < v2.valid_from
+    assert ledger.started_by(NS, "chunk", "k", at_end).id == v1.id  # type: ignore[union-attr]
+    assert ledger.started_by(NS, "chunk", "k", v2.valid_from).id == v2.id  # type: ignore[union-attr]

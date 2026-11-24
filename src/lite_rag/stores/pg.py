@@ -43,6 +43,7 @@ from lite_rag.stores.base import (
     StoredDocument,
     StoredParent,
 )
+from lite_rag.tracing import TraceLog
 from lite_rag.types import Chunk, Document
 
 MAX_VECTOR_DIM = 2000  # HNSW on `vector`; above it we store `halfvec` (HNSW up to 4000)
@@ -185,6 +186,13 @@ class PgStore:
 
     def close(self) -> None:
         self._pool.close()
+
+    # --- query traces (lineage §6.3) ---------------------------------------------------------
+
+    @contextmanager
+    def traces(self) -> Iterator[TraceLog]:
+        with self._tx() as conn:
+            yield TraceLog(conn)
 
     @contextmanager
     def _tx(self) -> Iterator[psycopg.Connection]:

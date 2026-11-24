@@ -268,6 +268,35 @@ def lineage_backfill(
     typer.echo(f"recorded {recorded} of {total} documents")
 
 
+trace_app = typer.Typer(help="Query traces (lineage design §6.3)", no_args_is_help=True)
+app.add_typer(trace_app, name="trace")
+
+
+@trace_app.command("show")
+def trace_show(
+    trace_id: Annotated[str, typer.Argument(help="A trace id (Answer.trace_id)")],
+    config: ConfigOption = None,
+    namespace: NamespaceOption = None,
+) -> None:
+    """What each stage of a search or answer used, and whether it is still current."""
+    with _engine(config, namespace) as engine:
+        rep = engine.trace_report(trace_id)
+    r = rep.record
+    typer.echo(f"trace {r.id}  {r.operation}  {r.created_at:%Y-%m-%d %H:%M:%S} UTC")
+    typer.echo(f"kbs: {', '.join(r.kbs)}  query: {r.query if r.query is not None else '-'}")
+    if r.operation == "ask":
+        typer.echo(f"answer: {r.status} by {r.model_id or '-'}")
+    for s in rep.sources:
+        src, version = s.source, s.artifact
+        state: str = s.state
+        if s.state == "stale" and version is not None and version.ended_at is not None:
+            state = f"stale since {version.ended_at:%Y-%m-%d %H:%M:%S}"
+        typer.echo(f"{src.stage:<10} {src.rank or '-':>3}  {s.kb}/{src.chunk_id}  {state}")
+        if s.state == "stale" and version is not None:
+            was = version.payload
+            typer.echo(f"    was: {was}" if was is not None else "    was: (text cleared)")
+
+
 @app.command()
 def search(
     kb: KbArg,

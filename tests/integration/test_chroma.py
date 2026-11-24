@@ -18,7 +18,7 @@ from lite_rag.stores.factory import evaluation_store, migrate_store
 from tests.contract.test_lineage import active_doc, assert_consistent
 from tests.contract.test_store import KB, NS, info, put
 
-MIGRATIONS = ["0001_initial", "0002_lineage_key", "lineage:0001_ledger"]
+MIGRATIONS = ["0001_initial", "0002_lineage_key", "0003_traces", "lineage:0001_ledger"]
 
 
 class Crash(BaseException):
@@ -370,3 +370,27 @@ def test_cli_lineage_backfill_reports_what_it_recorded(data_dir: Path) -> None:
     assert "recorded 2 of 2 documents" in first.output
     again = runner.invoke(app, ["lineage", "backfill", KB.name, "-n", NS], env=env)
     assert "recorded 0 of 2 documents" in again.output
+
+
+def test_cli_trace_show_marks_a_stale_source_with_its_old_text(data_dir: Path) -> None:
+    from lite_rag.testing import FakeLLM
+    from tests.integration.support import NS as ENGINE_NS
+    from tests.integration.support import make_engine
+
+    store = ChromaStore(data_dir)
+    engine = make_engine(
+        store, size=200, trace={"enabled": True}, llm=FakeLLM(reply="It is 100 [1].")
+    )
+    engine.upsert_text("kb", "visa", "Visa", "The visa fee is 100 dollars.")
+    answer = engine.ask("kb", "visa fee", top_k=1, mode="bm25")
+    engine.upsert_text("kb", "visa", "Visa", "The visa fee is 120 dollars.")
+    store.close()
+    env = {"LITERAG_STORE__BACKEND": "chroma", "LITERAG_STORE__DATA_DIR": str(data_dir)}
+    out = CliRunner().invoke(app, ["trace", "show", str(answer.trace_id), "-n", ENGINE_NS], env=env)
+    assert out.exit_code == 0, out.output
+    assert "ask" in out.output and "visa fee" in out.output
+    cited = [line for line in out.output.splitlines() if line.startswith("cited")]
+    assert cited and "visa#0" in cited[0] and "stale since" in cited[0]
+    assert "The visa fee is 100 dollars." in out.output
+    missing = CliRunner().invoke(app, ["trace", "show", "nope", "-n", ENGINE_NS], env=env)
+    assert missing.exit_code != 0 and "no trace" in missing.output

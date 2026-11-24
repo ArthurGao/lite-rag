@@ -14,6 +14,7 @@ from tests.conftest import TEST_SCHEMA
 TABLES = {"schema_migrations", "kbs", "documents", "chunks", "postings", "parents"}
 TABLES |= {"graph_mentions", "graph_relations"}  # 0006
 TABLES |= {"lineage_schema_migrations", "lineage_artifacts", "lineage_edges"}  # S25 ledger
+TABLES |= {"rag_query_traces", "rag_query_sources"}  # 0008
 
 
 def _tables(conn: psycopg.Connection) -> set[str]:
@@ -32,6 +33,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         "0005_documents_text",
         "0006_graph",
         "0007_lineage_key",
+        "0008_traces",
         "lineage:0001_ledger",
     ]
     assert _tables(pg) == TABLES
@@ -47,6 +49,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         ("0005_documents_text",),
         ("0006_graph",),
         ("0007_lineage_key",),
+        ("0008_traces",),
     ]
 
 
@@ -176,5 +179,46 @@ def test_backfill_fills_keys_of_chunks_written_before_s25(
         got = store.chunks(KB, ["d1#0", "d1#1"])
         assert [got[c].lineage_key for c in ("d1#0", "d1#1")] == chunk_keys("d1", ["a", "b"])
         assert_consistent(store)
+    finally:
+        store.close()
+
+
+def test_a_chunk_without_a_lineage_key_is_traced_as_unrecorded(
+    pg: psycopg.Connection, pg_url: str
+) -> None:
+    """A kb from before S25, not backfilled: tracing still works, its sources unrecorded."""
+    from tests.integration.support import make_engine
+
+    migrate(pg, TEST_SCHEMA)
+    store = PgStore(pg_url, TEST_SCHEMA)
+    try:
+        engine = make_engine(store, size=200, trace={"enabled": True})
+        engine.upsert_text("kb", "d1", "D1", "refunds take seven days")
+        pg.execute(f"UPDATE {TEST_SCHEMA}.chunks SET lineage_key = NULL")
+        traced = engine.search_traced("kb", "refunds", mode="bm25")
+        with store.traces() as log:
+            found = log.get(engine.namespace, traced.trace_id)  # type: ignore[arg-type]
+        assert found is not None
+        assert {s.artifact_key for s in found[1]} == {None}
+        assert {s.chunk_id for s in found[1]} == {"d1#0"}
+    finally:
+        store.close()
+
+
+def test_a_report_shows_an_unrecorded_source(pg: psycopg.Connection, pg_url: str) -> None:
+    from tests.integration.support import make_engine
+
+    migrate(pg, TEST_SCHEMA)
+    store = PgStore(pg_url, TEST_SCHEMA)
+    try:
+        engine = make_engine(store, size=200, trace={"enabled": True})
+        engine.upsert_text("kb", "d1", "D1", "refunds take seven days")
+        pg.execute(f"UPDATE {TEST_SCHEMA}.chunks SET lineage_key = NULL")
+        traced = engine.search_traced("kb", "refunds", mode="bm25")
+        sources = engine.trace_report(traced.trace_id).sources  # type: ignore[arg-type]
+        assert {(s.source.stage, s.state, s.artifact) for s in sources} == {
+            ("retrieved", "unrecorded", None),
+            ("in_context", "unrecorded", None),
+        }
     finally:
         store.close()

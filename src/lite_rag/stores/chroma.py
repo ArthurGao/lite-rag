@@ -58,6 +58,7 @@ from lite_rag.stores.base import (
     StoredDocument,
     StoredParent,
 )
+from lite_rag.tracing import TraceLog
 from lite_rag.types import Chunk, Document
 
 MIGRATIONS = "lite_rag.migrations_sqlite"
@@ -226,6 +227,13 @@ class ChromaStore:
             raise lineage_disabled()
         with self._lock, self._tx() as db:
             yield ledger_for(db)
+
+    # --- query traces (lineage §6.3) ---------------------------------------------------------
+
+    @contextmanager
+    def traces(self) -> Iterator[TraceLog]:
+        with self._lock, self._tx() as db:
+            yield TraceLog(db)
 
     def _ledger_in(self, db: sqlite3.Connection) -> Ledger | None:
         """The ledger inside a write's transaction; None when lineage is off."""

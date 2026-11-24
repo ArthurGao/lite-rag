@@ -19,10 +19,12 @@ import json
 import logging
 import re
 import threading
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import lite_model
 from lite_model import LiteModel
@@ -37,9 +39,11 @@ from lite_rag.embedding import Embedder, build_embedder
 from lite_rag.errors import ConfigError, InvalidRequest, KbMismatch, KbNotFound, StoreError
 from lite_rag.fusion import rrf, weighted
 from lite_rag.graph import GraphExtractor, entity_key, seeds, walk
-from lite_rag.llm import LLM, RoleLLM, build_model
+from lite_rag.lineage import utcnow
+from lite_rag.llm import LLM, Completion, RoleLLM, build_model
 from lite_rag.loaders import doc_id_for, file_doc_id, load_file
 from lite_rag.model_profiles import Prefixes, prefixes_for
+from lite_rag.provenance import text_hash
 from lite_rag.ranking import Key, ranked
 from lite_rag.rerank import Reranker, build_reranker
 from lite_rag.route import Router
@@ -55,7 +59,8 @@ from lite_rag.stores.base import (
 )
 from lite_rag.stores.factory import open_store
 from lite_rag.text import TokenCounter, build_counter, terms
-from lite_rag.types import DEFAULT_EMBEDDING, ChunkGraph, Document, Hit, Route, RouteMode
+from lite_rag.tracing import Stage, TraceRecord, TraceReport, TraceSource, report
+from lite_rag.types import DEFAULT_EMBEDDING, ChunkGraph, Document, Hit, Route, RouteMode, Traced
 
 NAMESPACE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}(/[a-z0-9][a-z0-9_.-]{0,62}){0,3}$")
 KB_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,99}$")
@@ -308,6 +313,30 @@ class RagRuntime:
         self.store.close()
 
 
+def _kept_query(query: str, keep: Literal["text", "hash", "none"]) -> str | None:
+    """What a trace keeps of the question (settings `trace.query`)."""
+    if keep == "hash":
+        return text_hash(query)
+    return query if keep == "text" else None
+
+
+@dataclass(frozen=True)
+class _Retrieved:
+    """What one search found: the hits, and for a trace what each stage held (keys into
+    `refs` and `stored`) and the settings it ran with."""
+
+    hits: list[Hit]
+    refs: list[KbRef]
+    stages: dict[Stage, list[tuple[Key, float]]]
+    stored: dict[Key, StoredChunk]
+    settings: dict[str, Any]
+    at: datetime  # when the chunks were read: a later write (say, during an answer) is after it
+
+    @classmethod
+    def empty(cls, refs: list[KbRef], settings: dict[str, Any]) -> "_Retrieved":
+        return cls([], refs, {}, {}, settings, utcnow())
+
+
 class RagEngine:
     def __init__(self, runtime: RagRuntime, namespace: str) -> None:
         self.namespace = check_namespace(namespace)
@@ -497,7 +526,87 @@ class RagEngine:
         `where` keeps only documents whose metadata has each key equal to its scalar value. Each
         hit carries every stage's score and rank; `score` is the final one."""
         refs = [self._open(kb, create=False)]
-        return self._search(refs, query, top_k=top_k, mode=mode, rerank=rerank, where=where)
+        return self._search(refs, query, top_k=top_k, mode=mode, rerank=rerank, where=where).hits
+
+    def search_traced(
+        self,
+        kb: str,
+        query: str,
+        *,
+        top_k: int | None = None,
+        mode: Mode | None = None,
+        rerank: bool | None = None,
+        where: dict[str, Any] | None = None,
+    ) -> Traced:
+        """`search`, recording a trace of what each stage used (lineage §6.3) when settings
+        `trace.enabled`; the plain `search` never does."""
+        refs = [self._open(kb, create=False)]
+        found = self._search(refs, query, top_k=top_k, mode=mode, rerank=rerank, where=where)
+        return Traced(found.hits, self._trace("search", query, found))
+
+    def search_kbs_traced(
+        self,
+        kbs: Sequence[str],
+        query: str,
+        *,
+        top_k: int | None = None,
+        mode: Mode | None = None,
+        rerank: bool | None = None,
+        where: dict[str, Any] | None = None,
+    ) -> Traced:
+        """`search_kbs` with a trace, as `search_traced`."""
+        found = self._search(
+            self._refs(kbs), query, top_k=top_k, mode=mode, rerank=rerank, where=where
+        )
+        return Traced(found.hits, self._trace("search", query, found))
+
+    def _trace(
+        self,
+        operation: Literal["search", "ask"],
+        query: str,
+        found: "_Retrieved",
+        *,
+        cited: Sequence[tuple[Key, float]] = (),
+        completion: Completion | None = None,
+        status: Literal["answered", "no_sources"] | None = None,
+    ) -> str | None:
+        """Write the trace of one search or answer (`cited`: what the answer cited, from the
+        in_context stage); None when tracing is off. A failed write raises (no silent
+        fallbacks)."""
+        cfg = self._settings.trace
+        if not cfg.enabled:
+            return None
+        record = TraceRecord(
+            id=uuid.uuid4().hex,
+            namespace=self.namespace,
+            kbs=[ref.name for ref in found.refs],
+            operation=operation,
+            query=_kept_query(query, cfg.query),
+            retrieval=found.settings,
+            created_at=found.at,
+            model_id=completion.model_id if completion else None,
+            usage=completion.usage if completion else None,
+            cached=completion.cached if completion else None,
+            status=status,
+        )
+        stages: dict[Stage, Sequence[tuple[Key, float]]] = {**found.stages}
+        if cited:
+            stages["cited"] = cited
+        sources = [
+            TraceSource(
+                found.refs[key[0]].key,
+                found.stored[key].lineage_key,
+                key[1],
+                stage,
+                rank,
+                score,
+            )
+            for stage, ranking in stages.items()
+            for rank, (key, score) in enumerate(ranking, start=1)
+        ]
+        with self._store.traces() as log:
+            log.write(record, sources)
+        return record.id
 
     def search_kbs(
         self,
@@ -512,16 +621,24 @@ class RagEngine:
         """`search` over several kbs of this namespace as one (design §5: one query embedding,
         one fusion, one rerank; each hit names its `kb`). A kb that does not exist yet is
         skipped, so a mistyped (valid) name returns nothing rather than an error."""
+        found = self._search(
+            self._refs(kbs), query, top_k=top_k, mode=mode, rerank=rerank, where=where
+        )
+        return found.hits
+
+    def _refs(self, kbs: Sequence[str]) -> list[KbRef]:
+        """The kbs of a multi-kb search: names all checked before any read; one that does not
+        exist yet is skipped."""
         if not kbs:
             raise InvalidRequest("search_kbs needs at least one knowledge base")
-        names = [self._ref(kb).name for kb in dict.fromkeys(kbs)]  # all checked before any read
+        names = [self._ref(kb).name for kb in dict.fromkeys(kbs)]
         refs = []
         for kb in names:
             try:
                 refs.append(self._open(kb, create=False))
             except KbNotFound:
                 pass
-        return self._search(refs, query, top_k=top_k, mode=mode, rerank=rerank, where=where)
+        return refs
 
     def _search(
         self,
@@ -532,7 +649,7 @@ class RagEngine:
         mode: Mode | None,
         rerank: bool | None,
         where: dict[str, Any] | None,
-    ) -> list[Hit]:
+    ) -> "_Retrieved":
         cfg = self._settings.retrieval
         where = check_where(where)
         k = cfg.top_k if top_k is None else top_k
@@ -540,16 +657,17 @@ class RagEngine:
             raise InvalidRequest(f"top_k must be at least 1, got {k}")
         mode = mode or cfg.mode
         route = None
+        reranking = self._settings.rerank.enabled if rerank is None else rerank
+        settings = {"mode": mode, "top_k": k, "rerank": reranking, "where": where}
         if mode == "route":  # one routing call per search, before any retrieval (S21)
             if not refs:  # no kb to search: no model call either (Codex S21)
-                return []
+                return _Retrieved.empty(refs, settings)
             with cache_context(self._settings, self.namespace, "route", query):
                 route = self.runtime.router().choose(query)
             mode = route.mode
         paths = self._paths(mode)
-        reranking = self._settings.rerank.enabled if rerank is None else rerank
         if not refs:
-            return []
+            return _Retrieved.empty(refs, settings)
         # `pool` candidates reach the end (all of them re-scored when reranking); each path
         # returns `n` — more in hybrid, where fusion needs candidates from both lists, and more
         # when several chunks share a parent (parent_child), which count once.
@@ -604,17 +722,24 @@ class RagEngine:
             if len(candidates) >= pool or not full:
                 break
             n *= 2
+        at = utcnow()  # the chunks were read just now: a trace judges them as of this time
         candidates = candidates[:pool]
+        stages: dict[Stage, list[tuple[Key, float]]] = {"retrieved": candidates}
         if reranking and candidates:
             candidates = rankings["rerank"] = self._rerank(query, candidates, stored)
+            stages["reranked"] = candidates
+        stages["in_context"] = candidates[:k]
         ranks = {s: {c: i for i, (c, _) in enumerate(r, start=1)} for s, r in rankings.items()}
         scores = {s: dict(r) for s, r in rankings.items()}
         # a hit's vector / graph score stays its similarity under its own kb's model
         scores |= {p: merged[p] for p in merged.keys() & {"vector", "graph"}}
-        return [
+        hits = [
             self._hit(refs[key[0]].name, key, stored[key], score, scores, ranks, route)
             for key, score in candidates[:k]
         ]
+        if route is not None:
+            settings["route"] = {"mode": route.mode, "model_id": route.model_id}
+        return _Retrieved(hits, refs, stages, stored, settings, at)
 
     def _across_embedders(
         self, per_kb: list[dict[str, list[tuple[str, float]]]], names: list[str], path: str, n: int
@@ -741,8 +866,11 @@ class RagEngine:
         first (S18)."""
         if self._settings.cache.question_log is not None:
             log_question(self._settings.cache.question_log, self.namespace, question)
-        hits = self.search(kb, question, top_k=top_k, mode=mode, rerank=rerank, where=where)
+        refs = [self._open(kb, create=False)]
+        found = self._search(refs, question, top_k=top_k, mode=mode, rerank=rerank, where=where)
+        hits = found.hits
         if not hits:
+            trace_id = self._trace("ask", question, found, status="no_sources")
             return Answer(
                 question=question,
                 status="no_sources",
@@ -750,10 +878,20 @@ class RagEngine:
                 citations=[],
                 sources=[],
                 model_id=None,
+                trace_id=trace_id,
             )
         with cache_context(self._settings, self.namespace, "answer", question):
             completion = self.runtime.llm().complete(prompt(question, hits))
         text, citations, dropped = check_citations(completion.text, hits)
+        in_context = found.stages["in_context"]
+        trace_id = self._trace(
+            "ask",
+            question,
+            found,
+            cited=[in_context[c.n - 1] for c in citations],
+            completion=completion,
+            status="answered",
+        )
         return Answer(
             question=question,
             status="answered",
@@ -764,7 +902,40 @@ class RagEngine:
             usage=completion.usage,
             dropped=dropped,
             cached=completion.cached,
+            trace_id=trace_id,
         )
+
+    def trace_report(self, trace_id: str) -> TraceReport:
+        """A trace of this namespace with, for each source, whether the chunk version it used is
+        still current, has gone stale since, or was never recorded (`InvalidRequest` for a trace
+        that is not here)."""
+        found = self._own_trace(trace_id)
+        if not self._settings.lineage.enabled:
+            return report(*found, None)
+        with self._store.ledger() as ledger:
+            return report(*found, ledger)
+
+    def _own_trace(self, trace_id: str) -> tuple[TraceRecord, list[TraceSource]]:
+        with self._store.traces() as log:
+            found = log.get(self.namespace, trace_id)
+        if found is None:
+            raise InvalidRequest(f"no trace {trace_id!r} in namespace {self.namespace!r}")
+        return found
+
+    def record_cited(self, trace_id: str, cited: Sequence[Hit]) -> None:
+        """For a host that answers from `search_traced` hits itself: record the hits its answer
+        cited, in order, as the trace's `cited` stage. Each must be one of the trace's
+        `in_context` hits; otherwise nothing is written (`InvalidRequest`)."""
+        _, sources = self._own_trace(trace_id)
+        used = {(s.artifact_ns, s.chunk_id): s for s in sources if s.stage == "in_context"}
+        rows = []
+        for rank, hit in enumerate(cited, start=1):
+            source = used.get((self._ref(hit.kb).key, hit.chunk_id))
+            if source is None:
+                raise InvalidRequest(f"{hit.kb}/{hit.chunk_id} was not in trace {trace_id!r}")
+            rows.append(replace(source, stage="cited", rank=rank))
+        with self._store.traces() as log:
+            log.add_sources(trace_id, rows)
 
     def _rerank(
         self, query: str, candidates: list[tuple[Key, float]], stored: dict[Key, StoredChunk]

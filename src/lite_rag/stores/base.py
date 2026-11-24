@@ -6,10 +6,13 @@ import dataclasses
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from lite_rag.errors import InvalidRequest
 from lite_rag.lineage import Ledger
+
+if TYPE_CHECKING:  # tracing reads KbRef from here
+    from lite_rag.tracing import TraceLog
 from lite_rag.model_profiles import Prefixes
 from lite_rag.types import DEFAULT_EMBEDDING, Chunk, ChunkGraph, Document
 
@@ -219,6 +222,10 @@ class Store(Protocol):
     def ledger(self) -> AbstractContextManager[Ledger]:
         """The provenance ledger in a transaction of its own (reads, backfill, gc); raises
         `ConfigError` when lineage is disabled."""
+        ...
+
+    def traces(self) -> AbstractContextManager["TraceLog"]:
+        """The query-trace tables in a transaction of their own (lineage §6.3)."""
         ...
 
     def close(self) -> None: ...

@@ -49,6 +49,8 @@ class Answer:
     # From lite-cache (S18): the same question over the same sources was answered before;
     # `model_id` and `usage` are that answer's (callers mark it as a cached answer).
     cached: bool = False
+    # S25c: the trace that recorded this answer (None: settings `trace.enabled` is off).
+    trace_id: str | None = None
 
 
 def prompt(question: str, hits: list[Hit]) -> list[Message]:

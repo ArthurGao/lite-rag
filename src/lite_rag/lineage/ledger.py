@@ -7,17 +7,15 @@ run the same SQL; each states its own parameter style and how it encodes JSON an
 Times come from `clock` (Python, UTC), not the database: SQLite's CURRENT_TIMESTAMP has second
 resolution, and `as_of` needs versions ordered exactly."""
 
-import json
 import sqlite3
 import uuid
-from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import psycopg
-from psycopg.types.json import Jsonb
 
+from lite_rag.lineage.dialect import Dialect, PgDialect
 from lite_rag.lineage.types import Artifact, Edge, Ended, Item, Recorded, Related
 
 Clock = Callable[[], datetime]
@@ -42,6 +40,13 @@ FIELDS = (
 COLUMNS = ", ".join(FIELDS)
 A_COLUMNS = ", ".join(f"a.{f}" for f in FIELDS)  # the same, from lineage_artifacts AS a
 N = len(FIELDS)
+
+
+def _end_set(status: Ended) -> str:
+    """The SET clause that ends an artifact: a deleted one loses its text at once (whoever
+    deleted it meant the content to go); a superseded one keeps it until `gc`, so history can
+    still show what it said."""
+    return "status = ?, ended_at = ?" + (", payload = NULL" if status == "deleted" else "")
 
 
 def utcnow() -> datetime:
@@ -88,7 +93,8 @@ class Ledger(Protocol):
 
     def retire(self, artifact_id: str, *, status: Ended = "superseded") -> list[Artifact]:
         """End the artifact if active, then every descendant left without an active parent;
-        returns what ended now, level by level (the artifact first)."""
+        returns what ended now, level by level (the artifact first). `deleted` clears their
+        payload at once; `superseded` keeps it until `gc`."""
         ...
 
     def retire_namespace(self, namespace: str, *, status: Ended = "deleted") -> int: ...
@@ -105,6 +111,12 @@ class Ledger(Protocol):
         """The version that was current at `at` (None: none yet, or deleted by then)."""
         ...
 
+    def started_by(self, namespace: str, kind: str, key: str, at: datetime) -> Artifact | None:
+        """The latest version that had begun by `at`, ended or not: for a reader who saw this
+        key at `at` (a version replaced just before the reader's clock read is still the one it
+        saw, where `as_of` would find none)."""
+        ...
+
     def upstream(self, artifact_id: str) -> list[Related]:
         """Everything it was derived from, nearest first, each once."""
         ...
@@ -119,37 +131,32 @@ class Ledger(Protocol):
         ...
 
 
-class _SqlLedger(ABC):
-    """The shared SQL, written with `?` placeholders; a dialect states the rest."""
+class _SqlLedger:
+    """The ledger's SQL, written once with `?` placeholders over a `Dialect`."""
 
-    def __init__(self, conn: Any, clock: Clock) -> None:
-        self._conn = conn
+    def __init__(self, dialect: Dialect, clock: Clock) -> None:
+        self._d = dialect
         self._clock = clock
 
-    # --- dialect ------------------------------------------------------------------------------
+    def _to_json(self, value: dict[str, Any]) -> Any:
+        return self._d.to_json(value)
 
-    @abstractmethod
-    def _sql(self, query: str) -> str: ...
+    def _from_json(self, value: Any) -> dict[str, Any]:
+        return dict(self._d.from_json(value))
 
-    @abstractmethod
-    def _to_json(self, value: dict[str, Any]) -> Any: ...
+    def _to_time(self, value: datetime) -> Any:
+        return self._d.to_time(value)
 
-    @abstractmethod
-    def _from_json(self, value: Any) -> dict[str, Any]: ...
-
-    @abstractmethod
-    def _to_time(self, value: datetime) -> Any: ...
-
-    @abstractmethod
-    def _from_time(self, value: Any) -> datetime: ...
+    def _from_time(self, value: Any) -> datetime:
+        return self._d.from_time(value)
 
     # --- plumbing -----------------------------------------------------------------------------
 
     def _rows(self, query: str, params: Sequence[Any] = ()) -> list[tuple[Any, ...]]:
-        return list(self._conn.execute(self._sql(query), tuple(params)).fetchall())
+        return self._d.rows(query, params)
 
     def _run(self, query: str, params: Sequence[Any] = ()) -> int:
-        return int(self._conn.execute(self._sql(query), tuple(params)).rowcount)
+        return self._d.run(query, params)
 
     def _artifact(self, row: Sequence[Any]) -> Artifact:
         id_, ns, kind, key, version, h, producer, payload, meta, status, start, end = row
@@ -222,6 +229,15 @@ class _SqlLedger(ABC):
             " WHERE namespace = ? AND kind = ? AND key = ? AND valid_from <= ?"
             " AND (ended_at IS NULL OR ended_at > ?) ORDER BY version DESC LIMIT 1",
             (namespace, kind, key, when, when),
+        )
+        return found[0] if found else None
+
+    def started_by(self, namespace: str, kind: str, key: str, at: datetime) -> Artifact | None:
+        found = self._artifacts(
+            f"SELECT {COLUMNS} FROM lineage_artifacts"
+            " WHERE namespace = ? AND kind = ? AND key = ? AND valid_from <= ?"
+            " ORDER BY version DESC LIMIT 1",
+            (namespace, kind, key, self._to_time(at)),
         )
         return found[0] if found else None
 
@@ -374,7 +390,7 @@ class _SqlLedger(ABC):
         if not ids:
             return []
         return self._artifacts(
-            "UPDATE lineage_artifacts SET status = ?, ended_at = ?"
+            f"UPDATE lineage_artifacts SET {_end_set(status)}"
             f" WHERE status = 'active' AND id IN ({self._marks(ids)}) RETURNING {COLUMNS}",
             (status, now, *ids),
         )
@@ -393,7 +409,7 @@ class _SqlLedger(ABC):
             for i in range(0, len(frontier), BATCH):
                 part = frontier[i : i + BATCH]
                 level += self._artifacts(
-                    "UPDATE lineage_artifacts SET status = ?, ended_at = ?"
+                    f"UPDATE lineage_artifacts SET {_end_set(status)}"
                     " WHERE status = 'active' AND id IN (SELECT child_id FROM lineage_edges"
                     f" WHERE parent_id IN ({self._marks(part)}))"
                     " AND NOT EXISTS (SELECT 1 FROM lineage_edges e"
@@ -414,7 +430,7 @@ class _SqlLedger(ABC):
         roots = [
             i
             for (i,) in self._rows(
-                "UPDATE lineage_artifacts SET status = ?, ended_at = ?"
+                f"UPDATE lineage_artifacts SET {_end_set(status)}"
                 " WHERE namespace = ? AND status = 'active' RETURNING id",
                 (status, now, namespace),
             )
@@ -430,49 +446,13 @@ class _SqlLedger(ABC):
 
 
 class PgLedger(_SqlLedger):
-    """psycopg: `%s` parameters (no query here contains a literal `?`), jsonb, timestamptz."""
-
     def __init__(self, conn: psycopg.Connection, *, clock: Clock = utcnow) -> None:
-        super().__init__(conn, clock)
-
-    def _sql(self, query: str) -> str:
-        return query.replace("?", "%s")
-
-    def _to_json(self, value: dict[str, Any]) -> Any:
-        return Jsonb(value)
-
-    def _from_json(self, value: Any) -> dict[str, Any]:
-        return dict(value)
-
-    def _to_time(self, value: datetime) -> Any:
-        return value
-
-    def _from_time(self, value: Any) -> datetime:
-        assert isinstance(value, datetime)
-        return value
+        super().__init__(PgDialect(conn), clock)
 
 
 class SqliteLedger(_SqlLedger):
-    """sqlite3: JSON as text; times as fixed-width ISO-8601 UTC text, so text order is time
-    order. Needs SQLite >= 3.35 (RETURNING) and foreign keys on."""
-
     def __init__(self, conn: sqlite3.Connection, *, clock: Clock = utcnow) -> None:
-        super().__init__(conn, clock)
-
-    def _sql(self, query: str) -> str:
-        return query
-
-    def _to_json(self, value: dict[str, Any]) -> Any:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-    def _from_json(self, value: Any) -> dict[str, Any]:
-        return dict(json.loads(value))
-
-    def _to_time(self, value: datetime) -> Any:
-        return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
-
-    def _from_time(self, value: Any) -> datetime:
-        return datetime.fromisoformat(value)
+        super().__init__(Dialect(conn), clock)
 
 
 def ledger_for(conn: psycopg.Connection | sqlite3.Connection, *, clock: Clock = utcnow) -> Ledger:

@@ -7,12 +7,14 @@ nothing else of lite-rag, so other projects can use it on their own connection:
     doc = ledger.record("ns", "document", "a", content_hash)
 """
 
+from lite_rag.lineage.dialect import Dialect, dialect_for
 from lite_rag.lineage.ledger import Ledger, PgLedger, SqliteLedger, ledger_for, utcnow
 from lite_rag.lineage.migrate import migrate, pending
 from lite_rag.lineage.types import Artifact, Edge, Ended, Item, Recorded, Related, Status
 
 __all__ = [
     "Artifact",
+    "Dialect",
     "Edge",
     "Ended",
     "Item",
@@ -22,6 +24,7 @@ __all__ = [
     "Related",
     "SqliteLedger",
     "Status",
+    "dialect_for",
     "ledger_for",
     "migrate",
     "pending",

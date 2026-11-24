@@ -153,3 +153,18 @@ def test_record_many_with_an_unknown_parent_writes_nothing(ledger: Ledger) -> No
     with pytest.raises(ValueError, match="nope"):
         ledger.record_many(NS, "chunk", [Item("a", "ha")], parents=["nope"])
     assert ledger.active(NS, "chunk", "a") is None
+
+
+def test_deleting_clears_the_text_at_once_superseding_keeps_it(ledger: Ledger) -> None:
+    d = _doc(ledger, "h1")
+    kept = ledger.record(NS, "chunk", "kept", "k", parents=[d], payload="old text").artifact.id
+    ledger.record(NS, "document", "a", "h2")
+    ledger.retire(d)  # superseded: the text stays until gc
+    assert ledger.get([kept])[kept].payload == "old text"
+    d3 = ledger.record(NS, "document", "b", "h").artifact.id
+    gone = ledger.record(NS, "chunk", "gone", "g", parents=[d3], payload="secret").artifact.id
+    ledger.retire(d3, status="deleted")
+    assert ledger.get([gone])[gone].payload is None
+    other = ledger.record("x", "chunk", "c", "c", payload="x text").artifact.id
+    ledger.retire_namespace("x")
+    assert ledger.get([other])[other].payload is None
