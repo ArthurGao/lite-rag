@@ -104,6 +104,7 @@ Every command takes `-c/--config <file.yaml>` and `-n/--namespace` (or `LITERAG_
 | `literag lineage backfill <kb>` | Record documents stored before lineage was kept (or with it off) |
 | `literag lineage gc` | Clear old versions' text past `lineage.keep_text_days`, delete traces past `trace.retention_days` (whole store) |
 | `literag trace show <trace_id>` | What each stage of a traced search or answer used, and whether it is still current |
+| `literag trace purge --yes` | Delete every trace of the namespace (its kbs stay: `drop-kb` removes those) |
 | `literag eval -c a.yaml -c b.yaml` | Compare configurations on a corpus and golden questions |
 | `literag key create --name <who> --namespace '<glob>' [--kb '<glob>'] --mode read\|write` | Create an API key for the service |
 | `literag serve [--host] [--port]` | Run the HTTP API (extra `server`) |
@@ -282,6 +283,8 @@ so another project can use it on its own PostgreSQL or SQLite connection:
 ```python
 from lite_rag.lineage import ledger_for, migrate
 
+# psycopg shown; a sqlite3 connection works the same (migrate() then manages its own
+# transactions). On PostgreSQL the connection's search_path decides the schema.
 with conn.transaction():
     migrate(conn)  # its own tables, lineage_*
 with conn.transaction():  # inside the transaction that writes your data
@@ -294,6 +297,10 @@ with conn.transaction():  # inside the transaction that writes your data
 ```
 
 Writers to one namespace must be serialised by the caller (lite-rag holds the kb's row lock).
+Version times come from each writer's clock and a trace's time from the reader's: hosts that
+share a store need synchronised clocks (NTP), or a trace may call a current chunk stale.
+A failed answer is traced too (`status: failed`, with what the model was given); a host's
+`record_cited` is accepted once per trace.
 
 ## Evaluation
 

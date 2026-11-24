@@ -34,6 +34,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         "0006_graph",
         "0007_lineage_key",
         "0008_traces",
+        "0009_traces_namespace",
         "lineage:0001_ledger",
         "lineage:0002_gc_index",
     ]
@@ -51,6 +52,7 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         ("0006_graph",),
         ("0007_lineage_key",),
         ("0008_traces",),
+        ("0009_traces_namespace",),
     ]
 
 

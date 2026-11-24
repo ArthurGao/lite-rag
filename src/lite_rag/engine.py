@@ -569,7 +569,7 @@ class RagEngine:
         *,
         cited: Sequence[tuple[Key, float]] = (),
         completion: Completion | None = None,
-        status: Literal["answered", "no_sources"] | None = None,
+        status: Literal["answered", "no_sources", "failed"] | None = None,
     ) -> str | None:
         """Write the trace of one search or answer (`cited`: what the answer cited, from the
         in_context stage); None when tracing is off. A failed write raises (no silent
@@ -880,8 +880,15 @@ class RagEngine:
                 model_id=None,
                 trace_id=trace_id,
             )
-        with cache_context(self._settings, self.namespace, "answer", question):
-            completion = self.runtime.llm().complete(prompt(question, hits))
+        try:
+            with cache_context(self._settings, self.namespace, "answer", question):
+                completion = self.runtime.llm().complete(prompt(question, hits))
+        except Exception as exc:  # traced too: what the model was given when it failed
+            try:
+                self._trace("ask", question, found, status="failed")
+            except Exception as trace_exc:  # never hide the model's error behind the trace's
+                exc.add_note(f"tracing the failed answer failed too: {trace_exc!r}")
+            raise
         text, citations, dropped = check_citations(completion.text, hits)
         trace_id = self._trace(
             "ask",
@@ -927,6 +934,19 @@ class RagEngine:
         if found is None or not KbRef.in_namespace(found.namespace, self.namespace):
             raise InvalidRequest(f"no artifact {artifact_id!r} in namespace {self.namespace!r}")
 
+    def purge_traces(self, *, batch: int = 1000) -> int:
+        """Delete every trace of this namespace, `batch` per transaction; returns how many.
+        Only traces: a kb's documents and ledger go with `delete_kb`."""
+        if batch < 1:
+            raise InvalidRequest(f"batch must be at least 1, got {batch}")
+        deleted = 0
+        while True:
+            with self._store.traces() as log:
+                n = log.delete_namespace(self.namespace, limit=batch)
+            deleted += n
+            if n < batch:
+                return deleted
+
     def trace_report(self, trace_id: str) -> TraceReport:
         """A trace of this namespace with, for each source, whether the chunk version it used is
         still current, has gone stale since, or was never recorded (`InvalidRequest` for a trace
@@ -946,7 +966,8 @@ class RagEngine:
 
     def record_cited(self, trace_id: str, cited: Sequence[Hit]) -> None:
         """For a host that answers from `search_traced` hits itself: record the hits its answer
-        cited, in order, as the trace's `cited` stage. Each must be one of the trace's
+        cited, in order, as the trace's `cited` stage — once per trace (an empty list too),
+        and never on an `ask` trace, which has its own. Each must be one of the trace's
         `in_context` hits; otherwise nothing is written (`InvalidRequest`)."""
         _, sources = self._own_trace(trace_id)
         used = {(s.artifact_ns, s.chunk_id): s for s in sources if s.stage == "in_context"}
@@ -957,7 +978,8 @@ class RagEngine:
                 raise InvalidRequest(f"{hit.kb}/{hit.chunk_id} was not in trace {trace_id!r}")
             rows.append(replace(source, stage="cited", rank=rank))
         with self._store.traces() as log:
-            log.add_sources(trace_id, rows)
+            if not log.close(self.namespace, trace_id, rows):  # once: a second list would mix
+                raise InvalidRequest(f"trace {trace_id!r} already has its answer")
 
     def _rerank(
         self, query: str, candidates: list[tuple[Key, float]], stored: dict[Key, StoredChunk]

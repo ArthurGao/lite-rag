@@ -177,3 +177,37 @@ def test_deleting_clears_the_metadata_too(ledger: Ledger) -> None:
     kept = ledger.record(NS, "document", "b", "h", metadata={"title": "Old"}).artifact.id
     ledger.record(NS, "document", "b", "h2")
     assert ledger.get([kept])[kept].metadata == {"title": "Old"}  # superseded: kept
+
+
+def test_record_many_handles_a_key_twice_in_one_call(ledger: Ledger) -> None:
+    d = _doc(ledger, "h")
+    first, again = ledger.record_many(NS, "chunk", [Item("k", "h1"), Item("k", "h1")], parents=[d])
+    assert again.reused and again.artifact.id == first.artifact.id
+    changed = ledger.record_many(NS, "chunk", [Item("k", "h2"), Item("k", "h3")], parents=[d])
+    assert [r.artifact.version for r in changed] == [2, 3]
+    assert changed[1].replaced is not None and changed[1].replaced.id == changed[0].artifact.id
+    assert ledger.count_active(NS, "chunk") == 1
+
+
+def test_record_many_returns_what_is_stored(ledger: Ledger) -> None:
+    d = _doc(ledger, "h")
+    [rec] = ledger.record_many(
+        NS, "chunk", [Item("k", "h", payload="t", edge_metadata={"n": 1})],
+        parents=[d], producer="p", metadata={"m": [1, "x"]},
+    )  # fmt: skip
+    assert ledger.get([rec.artifact.id])[rec.artifact.id] == rec.artifact
+
+
+def test_record_many_returns_replaced_versions_as_stored(ledger: Ledger) -> None:
+    """Codex: two new hashes for an existing key in one call — each `replaced` equals its
+    stored row (an earlier item's `artifact` is a snapshot of when it was recorded, as with
+    one call per item: the later item supersedes it)."""
+    d = _doc(ledger, "h")
+    [v1] = ledger.record_many(NS, "chunk", [Item("k", "h1")], parents=[d])
+    a, b = ledger.record_many(NS, "chunk", [Item("k", "h2"), Item("k", "h3")], parents=[d])
+    for rec in (a, b):
+        assert rec.replaced is not None
+        assert ledger.get([rec.replaced.id])[rec.replaced.id] == rec.replaced
+    assert ledger.get([b.artifact.id])[b.artifact.id] == b.artifact
+    assert a.replaced.id == v1.artifact.id  # type: ignore[union-attr]
+    assert b.replaced.valid_from == a.artifact.valid_from  # type: ignore[union-attr]

@@ -22,6 +22,7 @@ MIGRATIONS = [
     "0001_initial",
     "0002_lineage_key",
     "0003_traces",
+    "0004_traces_namespace",
     "lineage:0001_ledger",
     "lineage:0002_gc_index",
 ]
@@ -424,3 +425,20 @@ def test_cli_lineage_show_upstream_and_gc(data_dir: Path) -> None:
     assert up.exit_code == 0 and "document d1 v2" in up.output, up.output
     gc = runner.invoke(app, ["lineage", "gc"], env=env)
     assert gc.exit_code == 0 and "cleared 0 texts, deleted 0 traces" in gc.output, gc.output
+
+
+def test_cli_trace_purge_needs_yes_and_removes_the_namespaces_traces(data_dir: Path) -> None:
+    from tests.integration.support import NS as ENGINE_NS
+    from tests.integration.support import make_engine
+
+    store = ChromaStore(data_dir)
+    engine = make_engine(store, size=200, trace={"enabled": True})
+    engine.upsert_text("kb", "d1", "D1", "refunds take seven days")
+    engine.search_traced("kb", "refunds", mode="bm25")
+    store.close()
+    env = {"LITERAG_STORE__BACKEND": "chroma", "LITERAG_STORE__DATA_DIR": str(data_dir)}
+    runner = CliRunner()
+    refused = runner.invoke(app, ["trace", "purge", "-n", ENGINE_NS], env=env)
+    assert refused.exit_code != 0 and "--yes" in refused.output
+    done = runner.invoke(app, ["trace", "purge", "--yes", "-n", ENGINE_NS], env=env)
+    assert done.exit_code == 0 and "deleted 1 traces" in done.output, done.output

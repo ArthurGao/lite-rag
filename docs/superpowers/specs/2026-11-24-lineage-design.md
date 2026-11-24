@@ -279,3 +279,6 @@ trace:
 - **`record_cited(trace_id, cited: Sequence[Hit])`**：接收 Hit 而不是 chunk_id，因为 chunk_id 只在 kb 内唯一，跨 kb 的 trace 需要 kb 名。
 - **gc**：`literag lineage gc` 不分 namespace，作用于整个 store；清原文和删 trace 都按 1000 条一批、每批一个事务（`lineage_artifacts_gc` 部分索引只含还有原文的已结束行）。`lineage.enabled: false` 时只删 trace，不动账本。不剪"稳定 chunk 指向旧文档版本"的边：那是来历本身，增长为每次编辑每个 chunk 一条边。
 - **存储估算**：每条 trace 约 2×`top_k` 行（rerank 关，默认）或 2×`top_n`+`top_k` 行（rerank 开）。每天 1 万次、保留 90 天、rerank 开时，PG 约 5–10 GB。
+- **合并前补充（2026-11-25）**：`record_cited` 每个 trace 只接受一次：它把 trace 的 status 从空（未结束的 search trace）条件更新为 `answered`，并在同一事务里写 cited 行，并发调用只有一个成功；`ask` 的 trace（含无引用、`no_sources`、`failed`）一律拒绝，传入空列表也算用掉这一次。`engine.purge_traces()` / `literag trace purge --yes` 分批删一个 namespace 的全部 trace（只删 trace，kb 用 `drop-kb` 删），索引 `ix_rag_query_traces_namespace (namespace, created_at, id)`（迁移 0009 / sqlite 0004）；`ask` 调用模型失败时也写 trace（`status: failed`，含检索阶段），然后照常抛出模型的错误（写 trace 本身失败时作为附注附在那个错误上，不替换它）；`record()` 也走 `record_many`（只有一条写入路径）：一次查出全部 key 的最新版本、分批结束被取代的、新版本与边各用一次 `executemany`（300 个 chunk 从约 900 次调用降到约 7 次）；内容没变的边不重写。
+- **时钟**：版本时间取自写入方的时钟，trace 时间取自读取方的。共用一个 store 的多台主机需要时钟同步（NTP），否则可能把有效的 chunk 判为过期。不改用数据库时间，因为那样每次记账都要多一次查询。
+- **未处理（不可达）**：文档 hash 不变但切出的 chunk 文本不同时，旧 chunk 不会结束。现在走不到这条路径（kb 的 chunker 固定，hash 覆盖全文）；要处理得给账本加"断开边"的接口。

@@ -292,3 +292,78 @@ def test_a_trace_that_stored_its_in_context_rows_reads_them_once(store: CachedSt
         log.write(record, rows)
     _, sources = _trace(store, "t-old")
     assert [(s.stage, s.chunk_id) for s in sources] == [("retrieved", "d#0"), ("in_context", "d#0")]
+
+
+def test_record_cited_refuses_a_trace_that_has_citations(store: CachedStore) -> None:
+    engine = _engine(store)
+    traced = engine.search_traced("kb", "refunds seven days", mode="bm25")
+    engine.record_cited(traced.trace_id, traced.hits[:1])  # type: ignore[arg-type]
+    with pytest.raises(InvalidRequest, match="already"):
+        engine.record_cited(traced.trace_id, traced.hits[:1])  # type: ignore[arg-type]
+    answer = _engine(store, llm=FakeLLM(reply="Seven days [1].")).ask("kb", "refunds", mode="bm25")
+    with pytest.raises(InvalidRequest, match="already"):  # ask recorded its own
+        engine.record_cited(answer.trace_id, answer.sources[:1])  # type: ignore[arg-type]
+
+
+def test_purge_traces_removes_only_this_namespaces(store: CachedStore) -> None:
+    engine = _engine(store)
+    mine = engine.search_traced("kb", "refunds", mode="bm25").trace_id
+    other = make_engine(store, size=200, namespace="other/tenant", trace=ON)
+    other.upsert_text("kb", "d", "D", "refunds elsewhere")
+    theirs = other.search_traced("kb", "refunds", mode="bm25").trace_id
+    assert engine.purge_traces() == 1
+    with store.traces() as log:
+        assert log.get(NS, mine) is None  # type: ignore[arg-type]
+        assert log.get("other/tenant", theirs) is not None  # type: ignore[arg-type]
+
+
+def test_a_failed_answer_is_traced_then_raises(store: CachedStore) -> None:
+    def fail(messages: list[Any]) -> str:
+        raise RuntimeError("model down")
+
+    engine = _engine(store, llm=FakeLLM(reply=fail))
+    with pytest.raises(RuntimeError, match="model down"):
+        engine.ask("kb", "refunds seven days", mode="bm25")
+    [trace_id] = _ids(store)
+    record, sources = _trace(store, trace_id)
+    assert (record.operation, record.status, record.model_id) == ("ask", "failed", None)
+    assert {s.stage for s in sources} == {"retrieved", "in_context"}  # what it was given
+
+
+def test_record_cited_refuses_an_answer_that_cited_nothing(store: CachedStore) -> None:
+    engine = _engine(store, llm=FakeLLM(reply="No idea."))
+    answer = engine.ask("kb", "refunds", mode="bm25")
+    assert answer.status == "answered" and answer.citations == []
+    with pytest.raises(InvalidRequest, match="already"):
+        engine.record_cited(answer.trace_id, answer.sources[:1])  # type: ignore[arg-type]
+
+
+def test_record_cited_with_nothing_still_closes_the_trace(store: CachedStore) -> None:
+    engine = _engine(store)
+    traced = engine.search_traced("kb", "refunds", mode="bm25")
+    engine.record_cited(traced.trace_id, [])  # type: ignore[arg-type]
+    record, _ = _trace(store, traced.trace_id)
+    assert record.status == "answered"
+    with pytest.raises(InvalidRequest, match="already"):
+        engine.record_cited(traced.trace_id, traced.hits[:1])  # type: ignore[arg-type]
+
+
+def test_a_failing_trace_write_does_not_hide_the_model_error(
+    store: CachedStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(messages: list[Any]) -> str:
+        raise RuntimeError("model down")
+
+    engine = _engine(store, llm=FakeLLM(reply=fail))
+    monkeypatch.setattr(store, "traces", lambda: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(RuntimeError, match="model down") as caught:
+        engine.ask("kb", "refunds seven days", mode="bm25")
+    assert any("disk full" in note for note in caught.value.__notes__)
+
+
+def test_purge_traces_works_in_batches(store: CachedStore) -> None:
+    engine = _engine(store)
+    for q in ("refunds", "shipping", "returns"):
+        engine.search_traced("kb", q, mode="bm25")
+    assert engine.purge_traces(batch=2) == 3
+    assert _ids(store) == []

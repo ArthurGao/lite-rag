@@ -10,6 +10,7 @@ resolution, and `as_of` needs versions ordered exactly."""
 import sqlite3
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -312,10 +313,15 @@ class _SqlLedger:
         metadata: dict[str, Any] | None = None,
         edge_metadata: dict[str, Any] | None = None,
     ) -> Recorded:
-        self._check_parents(parents)
-        return self._record(
-            namespace, kind, key, content_hash, parents, producer, payload, metadata, edge_metadata
+        [recorded] = self.record_many(
+            namespace,
+            kind,
+            [Item(key, content_hash, payload, edge_metadata)],
+            parents=parents,
+            producer=producer,
+            metadata=metadata,
         )
+        return recorded
 
     def record_many(
         self,
@@ -327,21 +333,93 @@ class _SqlLedger:
         producer: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> list[Recorded]:
+        """A handful of statements whatever the number of items: the latest versions in one
+        query, the superseded ones ended in one, new versions and edges written in batches."""
         self._check_parents(parents)
-        return [
-            self._record(
-                namespace,
-                kind,
-                i.key,
-                i.content_hash,
-                parents,
-                producer,
-                i.payload,
-                metadata,
-                i.edge_metadata,
+        latest = self._latest(namespace, kind, list(dict.fromkeys(i.key for i in items)))
+        now = self._clock()
+        out: list[Recorded] = []
+        ending: list[str] = []  # stored active versions this call supersedes
+        inserts: dict[str, Artifact] = {}  # versions this call creates, by id
+        for item in items:
+            prev = latest.get(item.key)
+            current = prev if prev is not None and prev.status == "active" else None
+            if current is not None and current.content_hash == item.content_hash:
+                out.append(Recorded(current, replaced=None, reused=True))
+                continue
+            replaced = None
+            if current is not None:
+                replaced = replace(current, status="superseded", ended_at=now)
+                if current.id in inserts:  # created earlier in this call: never stored active
+                    inserts[current.id] = replaced
+                else:
+                    ending.append(current.id)
+            created = Artifact(
+                id=uuid.uuid4().hex,
+                namespace=namespace,
+                kind=kind,
+                key=item.key,
+                version=prev.version + 1 if prev is not None else 1,
+                content_hash=item.content_hash,
+                producer=producer,
+                payload=item.payload,
+                metadata=metadata or {},
+                status="active",
+                valid_from=now,
+                ended_at=None,
             )
-            for i in items
-        ]
+            inserts[created.id] = latest[item.key] = created
+            out.append(Recorded(created, replaced=replaced, reused=False))
+        at = self._to_time(now)
+        self._end(ending, "superseded", at, returning=False)
+        self._d.run_many(
+            f"INSERT INTO lineage_artifacts ({COLUMNS})"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    a.id,
+                    a.namespace,
+                    a.kind,
+                    a.key,
+                    a.version,
+                    a.content_hash,
+                    a.producer,
+                    a.payload,
+                    self._to_json(a.metadata),
+                    a.status,
+                    at,
+                    None if a.ended_at is None else at,
+                )
+                for a in inserts.values()
+            ],
+        )
+        # an unchanged edge (a reused chunk's position) is left alone, not rewritten
+        self._d.run_many(
+            "INSERT INTO lineage_edges (parent_id, child_id, metadata) VALUES (?, ?, ?)"
+            " ON CONFLICT (parent_id, child_id) DO UPDATE SET metadata = excluded.metadata"
+            " WHERE lineage_edges.metadata <> excluded.metadata",  # NOT NULL: no IS DISTINCT
+            [
+                (p, r.artifact.id, self._to_json(i.edge_metadata or {}))
+                for r, i in zip(out, items, strict=True)
+                for p in parents
+            ],
+        )
+        return out
+
+    def _latest(self, namespace: str, kind: str, keys: list[str]) -> dict[str, Artifact]:
+        """The latest version of each key that has one."""
+        found: dict[str, Artifact] = {}
+        for i in range(0, len(keys), BATCH):
+            part = keys[i : i + BATCH]
+            for a in self._artifacts(
+                f"SELECT {COLUMNS} FROM lineage_artifacts a"
+                f" WHERE namespace = ? AND kind = ? AND key IN ({self._marks(part)})"
+                " AND version = (SELECT max(version) FROM lineage_artifacts b"
+                " WHERE b.namespace = a.namespace AND b.kind = a.kind AND b.key = a.key)",
+                (namespace, kind, *part),
+            ):
+                found[a.key] = a
+        return found
 
     def _check_parents(self, parents: Sequence[str]) -> None:
         """Before anything is written: an unknown parent is the caller's mistake."""
@@ -356,69 +434,23 @@ class _SqlLedger:
         if missing := set(parents) - known:
             raise ValueError(f"unknown parent artifact(s): {', '.join(sorted(missing))}")
 
-    def _record(
-        self,
-        namespace: str,
-        kind: str,
-        key: str,
-        content_hash: str,
-        parents: Sequence[str],
-        producer: str | None,
-        payload: str | None,
-        metadata: dict[str, Any] | None,
-        edge_metadata: dict[str, Any] | None,
-    ) -> Recorded:
-        # The latest version answers both questions: is one active (only the latest can be),
-        # and which number comes next.
-        latest = self._artifacts(
-            f"SELECT {COLUMNS} FROM lineage_artifacts WHERE namespace = ? AND kind = ? AND key = ?"
-            " ORDER BY version DESC LIMIT 1",
-            (namespace, kind, key),
-        )
-        current = latest[0] if latest and latest[0].status == "active" else None
-        if current is not None and current.content_hash == content_hash:
-            self._link(parents, current.id, edge_metadata)
-            return Recorded(current, replaced=None, reused=True)
-        now = self._to_time(self._clock())
-        replaced = None
-        if current is not None:
-            [replaced] = self._end([current.id], "superseded", now)
-        [created] = self._artifacts(
-            f"INSERT INTO lineage_artifacts ({COLUMNS})"
-            f" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL) RETURNING {COLUMNS}",
-            (
-                uuid.uuid4().hex,
-                namespace,
-                kind,
-                key,
-                latest[0].version + 1 if latest else 1,
-                content_hash,
-                producer,
-                payload,
-                self._to_json(metadata or {}),
-                now,
-            ),
-        )
-        self._link(parents, created.id, edge_metadata)
-        return Recorded(created, replaced=replaced, reused=False)
-
-    def _link(self, parents: Sequence[str], child_id: str, metadata: dict[str, Any] | None) -> None:
-        for parent in parents:
-            self._run(
-                "INSERT INTO lineage_edges (parent_id, child_id, metadata) VALUES (?, ?, ?)"
-                " ON CONFLICT (parent_id, child_id) DO UPDATE SET metadata = excluded.metadata",
-                (parent, child_id, self._to_json(metadata or {})),
+    def _end(
+        self, ids: Sequence[str], status: Ended, now: Any, *, returning: bool = True
+    ) -> list[Artifact]:
+        """End those of `ids` still active, `BATCH` ids per statement; returns them (nothing
+        when `returning` is off: a caller that builds them itself skips reading them back)."""
+        ended: list[Artifact] = []
+        for i in range(0, len(ids), BATCH):
+            part = ids[i : i + BATCH]
+            query = (
+                f"UPDATE lineage_artifacts SET {_end_set(status)}"
+                f" WHERE status = 'active' AND id IN ({self._marks(part)})"
             )
-
-    def _end(self, ids: Sequence[str], status: Ended, now: Any) -> list[Artifact]:
-        """End those of `ids` still active; returns them."""
-        if not ids:
-            return []
-        return self._artifacts(
-            f"UPDATE lineage_artifacts SET {_end_set(status)}"
-            f" WHERE status = 'active' AND id IN ({self._marks(ids)}) RETURNING {COLUMNS}",
-            (status, now, *ids),
-        )
+            if returning:
+                ended += self._artifacts(f"{query} RETURNING {COLUMNS}", (status, now, *part))
+            else:
+                self._run(query, (status, now, *part))
+        return ended
 
     def retire(self, artifact_id: str, *, status: Ended = "superseded") -> list[Artifact]:
         now = self._to_time(self._clock())

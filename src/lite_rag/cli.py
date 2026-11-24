@@ -374,6 +374,20 @@ def trace_show(
             typer.echo(f"    was: {was}" if was is not None else "    was: (text cleared)")
 
 
+@trace_app.command("purge")
+def trace_purge(
+    yes: Annotated[bool, typer.Option("--yes", help="Confirm: this deletes every trace")] = False,
+    config: ConfigOption = None,
+    namespace: NamespaceOption = None,
+) -> None:
+    """Delete every trace of the namespace (its kbs stay: `drop-kb` removes those)."""
+    if not yes:
+        _fail("pass --yes to delete every trace of the namespace")
+    with _engine(config, namespace) as engine:
+        deleted = engine.purge_traces()
+    typer.echo(f"deleted {deleted} traces")
+
+
 @app.command()
 def search(
     kb: KbArg,

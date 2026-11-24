@@ -629,7 +629,8 @@ lite-rag/
   - 安全审查：删除的产物原文立即清空（原来要等 gc）。
   - trace 存储：每条 trace 约 2×`top_k`（rerank 关）到 2×`top_n`+`top_k`（rerank 开）行；`in_context` 不存、读时推出：rerank 关（默认）时 search 的 trace 行数减半，ask 的少约三分之一。
     估算：每天 1 万次、保留 90 天、rerank 开，PG 约 5–10 GB。
-  - 没做的：账本的集合式批量写入（逐 chunk 两三条语句，远小于 embedding 的耗时）；不剪稳定 chunk 指向旧文档版本的边（那是来历本身）；
+  - 合并前补充：`record_cited` 每个 trace 一次；`literag trace purge`；模型失败的 ask 也写 trace（`failed`）；`record_many` 批量写入。
+  - 没做的：不剪稳定 chunk 指向旧文档版本的边（那是来历本身）；
     账本的 HTTP 查询接口；llm-steward 改用 `search_kbs_traced` + `record_cited` 是它升级 pin 之后的事。
   - 收尾记录（simplify、Codex）：每个阶段的提交信息里有；S25d 见其提交。
 

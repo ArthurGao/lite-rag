@@ -34,7 +34,7 @@ class TraceRecord:
     model_id: str | None = None
     usage: dict[str, int] | None = None
     cached: bool | None = None
-    status: Literal["answered", "no_sources"] | None = None
+    status: Literal["answered", "no_sources", "failed"] | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +131,27 @@ class TraceLog:
             "DELETE FROM rag_query_traces WHERE id IN"
             " (SELECT id FROM rag_query_traces WHERE created_at < ? ORDER BY created_at LIMIT ?)",
             (self._d.to_time(before), limit),
+        )
+
+    def close(self, namespace: str, trace_id: str, cited: Sequence[TraceSource]) -> bool:
+        """Give an open trace (a traced search: no outcome yet) its answer's citations, once:
+        the status update and the rows in one statement pair, so of two callers one wins.
+        False when the trace is not open (an answer's own, or closed before)."""
+        closed = self._d.run(
+            "UPDATE rag_query_traces SET status = 'answered'"
+            " WHERE id = ? AND namespace = ? AND status IS NULL",
+            (trace_id, namespace),
+        )
+        if closed:
+            self.add_sources(trace_id, cited)
+        return bool(closed)
+
+    def delete_namespace(self, namespace: str, *, limit: int) -> int:
+        """Delete up to `limit` traces of `namespace` (their sources cascade)."""
+        return self._d.run(
+            "DELETE FROM rag_query_traces WHERE id IN"
+            " (SELECT id FROM rag_query_traces WHERE namespace = ? LIMIT ?)",
+            (namespace, limit),
         )
 
     def ids(self, namespace: str) -> list[str]:
