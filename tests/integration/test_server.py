@@ -171,6 +171,20 @@ def test_ask_answers_through_the_api(store: PgStore, keys: dict[str, str]) -> No
         ).json()
     assert answer["status"] == "answered" and answer["citations"][0]["doc_id"] == "refund"
     assert answer["cached"] is False  # S18: an added field (lite-cache off here)
+    assert answer["trace_id"] is None  # S25c: tracing is off by default
+
+
+def test_ask_returns_its_trace_id(store: PgStore) -> None:
+    from lite_rag.testing import FakeLLM
+
+    settings = load_settings(chunking=CHUNKING, trace={"enabled": True})
+    engine = make_runtime(store, llm=FakeLLM(reply="Seven days [1]."), trace={"enabled": True})
+    with TestClient(create_app(settings, engine), base_url="http://localhost") as c:
+        h = {"X-LiteRag-Namespace": NS}
+        c.put("/v1/kbs/c-1/documents/refund", headers=h, json={"title": "R", "text": "Refunds."})
+        answer = c.post("/v1/kbs/c-1/ask", headers=h, json={"question": "refunds?"}).json()
+    with store.traces() as log:
+        assert answer["trace_id"] in log.ids(NS)
 
 
 def test_an_upstream_failure_is_reported_without_its_detail(

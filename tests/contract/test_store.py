@@ -7,6 +7,7 @@ import pytest
 
 from lite_rag.errors import KbNotFound, StoreError
 from lite_rag.keyword import Bm25Inputs, Posting, bm25
+from lite_rag.provenance import chunk_keys
 from lite_rag.stores.base import (
     CachedStore,
     IndexedChunk,
@@ -123,12 +124,13 @@ def test_upsert_stores_the_document_its_chunks_and_parents(store: CachedStore) -
 
     assert store.document_hash(KB, "d1") == "h1"
     got = store.chunks(KB, ["d1#0", "d1#1", "missing#0"])
+    k0, k1 = chunk_keys("d1", ["refunds take seven days", "shipping is free"])
     assert got == {
         "d1#0": StoredChunk(
             "d1#0", "d1", "Policy", "refunds take seven days", 0, 23, ("Policy", "Refunds"), 1,
-            StoredParent(0, "the parent", 0, 50, ("H",), 2),
+            StoredParent(0, "the parent", 0, 50, ("H",), 2), k0,
         ),
-        "d1#1": StoredChunk("d1#1", "d1", "Policy", "shipping is free", 100, 116, (), 2, None),
+        "d1#1": StoredChunk("d1#1", "d1", "Policy", "shipping is free", 100, 116, (), 2, None, k1),
     }  # fmt: skip
     assert list(store.documents(KB)) == [
         StoredDocument("d1", "Policy", "the full text", {"lang": "en", "n": 3}, "d1.md", (0, 40))
@@ -136,6 +138,15 @@ def test_upsert_stores_the_document_its_chunks_and_parents(store: CachedStore) -
     assert store.count_missing_text(KB) == 0
     avg = (len(first.terms) + len(second.terms)) / 2
     assert store.stats(KB) == KbStats(NS, "kb", 1, 2, avg, "fake/m1", 4)
+
+
+def test_a_repeated_text_gets_its_own_lineage_key(store: CachedStore) -> None:
+    store.create_kb(info())
+    put(store, "d1", [("same", [1, 0, 0, 0]), ("other", [0, 1, 0, 0]), ("same", [0, 0, 1, 0])])
+    got = store.chunks(KB, ["d1#0", "d1#1", "d1#2"])
+    assert [got[f"d1#{n}"].lineage_key for n in range(3)] == chunk_keys(
+        "d1", ["same", "other", "same"]
+    )
 
 
 def test_an_upsert_replaces_every_old_chunk(store: CachedStore) -> None:

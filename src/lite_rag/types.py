@@ -64,6 +64,15 @@ class Hit:
     route: "Route | None" = field(default=None, kw_only=True)  # mode="route": what was chosen
 
 
+@dataclass(frozen=True)
+class Traced:
+    """`search_traced`'s result: the hits, and the trace that recorded them (None: tracing is
+    off, settings `trace.enabled`)."""
+
+    hits: list[Hit]
+    trace_id: str | None
+
+
 # The name of `settings.embedding` among the named embedders (S22).
 DEFAULT_EMBEDDING = "default"
 

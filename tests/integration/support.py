@@ -28,6 +28,7 @@ def make_runtime(
     route_llm: LLM | None = None,
     llm_settings: dict[str, Any] | None = None,
     embedders: dict[str, Embedder] | None = None,
+    trace: dict[str, Any] | None = None,
     **chunking: Any,
 ) -> RagRuntime:
     """`embedders`: named embedders besides the default (S22): each name is added to the
@@ -40,6 +41,7 @@ def make_runtime(
         rerank=rerank or {},
         graph=graph or {},
         llm=llm_settings or {},
+        trace=trace or {},
     )
     inner = embedder or FakeEmbedder(dim=8)
     wrapped: Embedder = CachingEmbedder(inner, store) if cache else inner

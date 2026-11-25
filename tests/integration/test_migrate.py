@@ -13,6 +13,8 @@ from tests.conftest import TEST_SCHEMA
 
 TABLES = {"schema_migrations", "kbs", "documents", "chunks", "postings", "parents"}
 TABLES |= {"graph_mentions", "graph_relations"}  # 0006
+TABLES |= {"lineage_schema_migrations", "lineage_artifacts", "lineage_edges"}  # S25 ledger
+TABLES |= {"rag_query_traces", "rag_query_sources"}  # 0008
 
 
 def _tables(conn: psycopg.Connection) -> set[str]:
@@ -30,6 +32,11 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         "0004_pages_parents_context",
         "0005_documents_text",
         "0006_graph",
+        "0007_lineage_key",
+        "0008_traces",
+        "0009_traces_namespace",
+        "lineage:0001_ledger",
+        "lineage:0002_gc_index",
     ]
     assert _tables(pg) == TABLES
     assert migrate(pg, TEST_SCHEMA) == []  # second run: nothing pending
@@ -43,6 +50,9 @@ def test_migrate_creates_the_schema_once(pg: psycopg.Connection) -> None:
         ("0004_pages_parents_context",),
         ("0005_documents_text",),
         ("0006_graph",),
+        ("0007_lineage_key",),
+        ("0008_traces",),
+        ("0009_traces_namespace",),
     ]
 
 
@@ -138,3 +148,115 @@ def test_opening_a_store_on_an_outdated_schema_says_to_migrate(
         PgStore(pg_url, TEST_SCHEMA)
     migrate(pg, TEST_SCHEMA)
     PgStore(pg_url, TEST_SCHEMA).close()  # up to date: opens
+
+
+def test_the_store_refuses_a_schema_whose_ledger_is_behind(
+    pg: psycopg.Connection, pg_url: str
+) -> None:
+    """Hosts such as llm-steward call `lite_rag.db.migrate` and open the store themselves: the
+    ledger's migrations come with it, and its pending ones block opening like lite-rag's."""
+    migrate(pg, TEST_SCHEMA)
+    pg.execute(f"DELETE FROM {TEST_SCHEMA}.lineage_schema_migrations")
+    with pytest.raises(StoreError, match="lineage:0001_ledger, lineage:0002_gc_index"):
+        PgStore(pg_url, TEST_SCHEMA)
+
+
+def test_backfill_fills_keys_of_chunks_written_before_s25(
+    pg: psycopg.Connection, pg_url: str
+) -> None:
+    """Chunks from before migration 0007 have no lineage key, and old documents no text."""
+    from lite_rag.provenance import chunk_keys
+    from tests.contract.test_lineage import assert_consistent, write
+    from tests.contract.test_store import KB, info
+
+    migrate(pg, TEST_SCHEMA)
+    store = PgStore(pg_url, TEST_SCHEMA, lineage=False)
+    store.create_kb(info())
+    write(store, "d1", ["a", "b"], h="h1")
+    store.close()
+    pg.execute(f"UPDATE {TEST_SCHEMA}.chunks SET lineage_key = NULL")
+    pg.execute(f"UPDATE {TEST_SCHEMA}.documents SET text = NULL")
+    store = PgStore(pg_url, TEST_SCHEMA)
+    try:
+        assert store.backfill_lineage(KB) == 1
+        got = store.chunks(KB, ["d1#0", "d1#1"])
+        assert [got[c].lineage_key for c in ("d1#0", "d1#1")] == chunk_keys("d1", ["a", "b"])
+        assert_consistent(store)
+    finally:
+        store.close()
+
+
+def test_a_chunk_without_a_lineage_key_is_traced_as_unrecorded(
+    pg: psycopg.Connection, pg_url: str
+) -> None:
+    """A kb from before S25, not backfilled: tracing still works, its sources unrecorded."""
+    from tests.integration.support import make_engine
+
+    migrate(pg, TEST_SCHEMA)
+    store = PgStore(pg_url, TEST_SCHEMA)
+    try:
+        engine = make_engine(store, size=200, trace={"enabled": True})
+        engine.upsert_text("kb", "d1", "D1", "refunds take seven days")
+        pg.execute(f"UPDATE {TEST_SCHEMA}.chunks SET lineage_key = NULL")
+        traced = engine.search_traced("kb", "refunds", mode="bm25")
+        with store.traces() as log:
+            found = log.get(engine.namespace, traced.trace_id)  # type: ignore[arg-type]
+        assert found is not None
+        assert {s.artifact_key for s in found[1]} == {None}
+        assert {s.chunk_id for s in found[1]} == {"d1#0"}
+    finally:
+        store.close()
+
+
+def test_a_report_shows_an_unrecorded_source(pg: psycopg.Connection, pg_url: str) -> None:
+    from tests.integration.support import make_engine
+
+    migrate(pg, TEST_SCHEMA)
+    store = PgStore(pg_url, TEST_SCHEMA)
+    try:
+        engine = make_engine(store, size=200, trace={"enabled": True})
+        engine.upsert_text("kb", "d1", "D1", "refunds take seven days")
+        pg.execute(f"UPDATE {TEST_SCHEMA}.chunks SET lineage_key = NULL")
+        traced = engine.search_traced("kb", "refunds", mode="bm25")
+        sources = engine.trace_report(traced.trace_id).sources  # type: ignore[arg-type]
+        assert {(s.source.stage, s.state, s.artifact) for s in sources} == {
+            ("retrieved", "unrecorded", None),
+            ("in_context", "unrecorded", None),
+        }
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("rerank", [False, True], ids=["plain", "reranked"])
+def test_in_context_rows_are_derived_not_stored(
+    pg: psycopg.Connection, pg_url: str, rerank: bool
+) -> None:
+    """in_context is the first top_k of the last ranking stage: stored once, read back whole."""
+    from lite_rag.testing import FakeReranker
+    from tests.integration.support import make_engine
+
+    migrate(pg, TEST_SCHEMA)
+    store = PgStore(pg_url, TEST_SCHEMA)
+    try:
+        engine = make_engine(
+            store,
+            size=200,
+            trace={"enabled": True},
+            rerank={"enabled": rerank, "top_n": 3},
+            reranker=FakeReranker(),
+        )
+        for doc_id, text in [("a", "refunds take days"), ("b", "refunds and shipping"),
+                             ("c", "refunds weekly")]:  # fmt: skip
+            engine.upsert_text("kb", doc_id, doc_id, text)
+        traced = engine.search_traced("kb", "refunds shipping", top_k=2, mode="bm25")
+        stored = pg.execute(
+            f"SELECT count(*) FROM {TEST_SCHEMA}.rag_query_sources WHERE stage = 'in_context'"
+        ).fetchone()
+        assert stored == (0,)
+        with store.traces() as log:
+            found = log.get(engine.namespace, traced.trace_id)  # type: ignore[arg-type]
+        assert found is not None
+        in_context = [(s.chunk_id, s.rank) for s in found[1] if s.stage == "in_context"]
+        assert in_context == [(h.chunk_id, n) for n, h in enumerate(traced.hits, start=1)]
+    finally:
+        store.close()

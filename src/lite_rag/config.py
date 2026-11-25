@@ -423,6 +423,23 @@ class ApiKeyConfig(BaseModel):
     mode: Literal["read", "write"] = "read"
 
 
+class LineageConfig(BaseModel):
+    """The provenance ledger (lineage design §6.4): every write records the document version
+    and its chunks, in the write's transaction."""
+
+    enabled: bool = True
+    keep_text_days: int = Field(default=90, gt=0)  # `lineage gc` clears ended versions' text
+
+
+class TraceConfig(BaseModel):
+    """Query traces (lineage design §6.3): `search_traced` / `ask` record which chunk versions
+    each stage used. Off by default: a trace keeps the question."""
+
+    enabled: bool = False
+    query: Literal["text", "hash", "none"] = "text"  # the question as written, its sha256, or not
+    retention_days: int = Field(default=90, gt=0)  # `lineage gc` deletes older traces
+
+
 class ServerConfig(BaseModel):
     """`literag serve` (design §7). Keys come from YAML or `LITERAG_SERVER__KEYS` (JSON)."""
 
@@ -458,6 +475,8 @@ class Settings(BaseSettings):
     rerank: RerankConfig = RerankConfig()
     llm: LLMConfig = LLMConfig()
     cache: CacheConfig = CacheConfig()
+    lineage: LineageConfig = LineageConfig()
+    trace: TraceConfig = TraceConfig()
     server: ServerConfig = ServerConfig()
 
     @field_validator("embeddings")

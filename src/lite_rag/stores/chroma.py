@@ -35,8 +35,19 @@ from chromadb.config import Settings as ChromaSettings
 from chromadb.errors import NotFoundError
 
 from lite_rag.db import migration_files
-from lite_rag.errors import ConfigError, KbNotFound, StoreError
+from lite_rag.errors import ConfigError, KbNotFound, StoreError, lineage_disabled
 from lite_rag.keyword import Bm25Inputs, Posting, bm25
+from lite_rag.lineage import Ledger, ledger_for
+from lite_rag.lineage import migrate as migrate_ledger
+from lite_rag.lineage import pending as ledger_pending
+from lite_rag.provenance import (
+    DocVersion,
+    chunk_keys,
+    end_missing,
+    record_document,
+    recorded,
+    retire_document,
+)
 from lite_rag.ranking import ranked
 from lite_rag.stores.base import (
     SCALARS,
@@ -48,6 +59,7 @@ from lite_rag.stores.base import (
     StoredDocument,
     StoredParent,
 )
+from lite_rag.tracing import TraceLog
 from lite_rag.types import Chunk, Document
 
 MIGRATIONS = "lite_rag.migrations_sqlite"
@@ -91,7 +103,7 @@ def migrate_sqlite(data_dir: str | Path) -> list[str]:
                 f"INSERT INTO schema_migrations (version) VALUES ('{version}');\nCOMMIT;"
             )
             applied.append(version)
-        return applied
+        return applied + migrate_ledger(conn)  # the ledger's tables, in the same file
     finally:
         conn.close()
 
@@ -133,14 +145,17 @@ def _floats(blob: bytes) -> list[float]:
 class ChromaStore:
     """Implements both `Store` and `VectorCache`."""
 
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(self, data_dir: str | Path, *, lineage: bool = True) -> None:
+        """`lineage`: record every write in the provenance ledger, in the SQLite transaction
+        that writes its rows."""
+        self._lineage = lineage
         path = Path(data_dir)
         sqlite_path = path / SQLITE_FILE
         if not sqlite_path.is_file():
             raise StoreError(f"no lite-rag data in {path}: run `literag migrate`")
         self._db = _connect(sqlite_path)
         pending = {v for v, _ in migration_files(MIGRATIONS)} - _applied(self._db)
-        if pending:
+        if pending or ledger_pending(self._db):
             self._db.close()
             raise StoreError(f"the data in {path} is not up to date: run `literag migrate`")
         client = chromadb.PersistentClient(
@@ -199,10 +214,31 @@ class ChromaStore:
                     self._drop_collection(col.name)
 
     def _discard(self, kb: KbRef, doc_id: str) -> None:
-        """Remove a document's vectors, then its rows."""
+        """Remove a document's vectors, then its rows — and end it in the ledger, whichever way
+        it goes (a delete, a failed write's cleanup, recovery after a crash)."""
         self._collection(kb).delete(where={"doc_id": doc_id})
         with self._tx() as db:
             db.execute("DELETE FROM documents WHERE kb = ? AND doc_id = ?", (kb.key, doc_id))
+            if ledger := self._ledger_in(db):
+                retire_document(ledger, kb.key, doc_id)
+
+    @contextmanager
+    def ledger(self) -> Iterator[Ledger]:
+        if not self._lineage:
+            raise lineage_disabled()
+        with self._lock, self._tx() as db:
+            yield ledger_for(db)
+
+    # --- query traces (lineage §6.3) ---------------------------------------------------------
+
+    @contextmanager
+    def traces(self) -> Iterator[TraceLog]:
+        with self._lock, self._tx() as db:
+            yield TraceLog(db)
+
+    def _ledger_in(self, db: sqlite3.Connection) -> Ledger | None:
+        """The ledger inside a write's transaction; None when lineage is off."""
+        return ledger_for(db) if self._lineage else None
 
     # --- knowledge bases ---------------------------------------------------------------------
 
@@ -256,6 +292,8 @@ class ChromaStore:
             with self._tx() as db:  # rows first: a crash before the next line leaves an
                 # orphan collection, which opening the store (or creating the kb) removes
                 existed = db.execute("DELETE FROM kbs WHERE name = ?", (kb.key,)).rowcount > 0
+                if existed and (ledger := self._ledger_in(db)):
+                    ledger.retire_namespace(kb.key)
             self._drop_collection(collection_name(kb))
         return existed
 
@@ -389,7 +427,7 @@ class ChromaStore:
             rows = self._db.execute(
                 "SELECT c.id, c.doc_id, d.title, c.text, c.start_offset, c.end_offset,"
                 " c.heading_path, c.page,"
-                " p.n, p.text, p.start_offset, p.end_offset, p.heading_path, p.page"
+                " p.n, p.text, p.start_offset, p.end_offset, p.heading_path, p.page, c.lineage_key"
                 " FROM chunks c"
                 " JOIN documents d ON d.kb = c.kb AND d.doc_id = c.doc_id"
                 " LEFT JOIN parents p ON p.kb = c.kb AND p.doc_id = c.doc_id AND p.n = c.parent_n"
@@ -398,14 +436,14 @@ class ChromaStore:
                 (kb.key, json.dumps(chunk_ids)),
             ).fetchall()
         out = {}
-        for chunk, doc, title, text, start, end, path, page, pn, pt, ps, pe, pp, ppage in rows:
+        for chunk, doc, title, text, start, end, path, page, pn, pt, ps, pe, pp, ppage, key in rows:
             parent = (
                 StoredParent(pn, pt, ps, pe, tuple(json.loads(pp)), ppage)
                 if pn is not None
                 else None
             )
             out[chunk] = StoredChunk(
-                chunk, doc, title, text, start, end, tuple(json.loads(path)), page, parent
+                chunk, doc, title, text, start, end, tuple(json.loads(path)), page, parent, key
             )
         return out
 
@@ -413,11 +451,14 @@ class ChromaStore:
 
     def document_hash(self, kb: KbRef, doc_id: str) -> str | None:
         with self._lock:
-            row = self._db.execute(
-                "SELECT content_hash FROM documents"
-                " WHERE kb = ? AND doc_id = ? AND status = 'ready'",
-                (kb.key, doc_id),
-            ).fetchone()
+            return self._document_hash(self._db, kb, doc_id)
+
+    @staticmethod
+    def _document_hash(db: sqlite3.Connection, kb: KbRef, doc_id: str) -> str | None:
+        row = db.execute(
+            "SELECT content_hash FROM documents WHERE kb = ? AND doc_id = ? AND status = 'ready'",
+            (kb.key, doc_id),
+        ).fetchone()
         return row[0] if row else None
 
     def upsert_document(
@@ -446,7 +487,11 @@ class ChromaStore:
                 db.execute(
                     "DELETE FROM documents WHERE kb = ? AND doc_id = ?", (kb.key, doc.doc_id)
                 )
-                self._insert(db, kb, doc, content_hash, chunks, parents or [])
+                keys = chunk_keys(doc.doc_id, [c.chunk.text for c in chunks])
+                self._insert(db, kb, doc, content_hash, chunks, parents or [], keys)
+                if ledger := self._ledger_in(db):
+                    version = DocVersion(doc.doc_id, doc.title, doc.source, content_hash)
+                    record_document(ledger, info, version, [c.chunk for c in chunks], keys)
             try:
                 collection = self._collection(kb)  # 2. vectors: the old ones out, the new in
                 if old:  # by id: a filtered delete would scan the collection on every insert
@@ -460,6 +505,60 @@ class ChromaStore:
             except Exception as exc:
                 self._cleanup(kb, doc.doc_id, exc)
                 raise StoreError(f"writing {doc.doc_id!r} to Chroma failed: {exc}") from exc
+
+    def backfill_lineage(self, kb: KbRef) -> int:
+        if not self._lineage:
+            raise lineage_disabled()
+        with self._lock:
+            if self.get_kb(kb) is None:
+                raise KbNotFound.of(kb.name, kb.namespace)
+            docs = [
+                DocVersion(*row)
+                for row in self._db.execute(
+                    "SELECT doc_id, title, source, content_hash FROM documents"
+                    " WHERE kb = ? AND status = 'ready' ORDER BY doc_id",
+                    (kb.key,),
+                )
+            ]
+        done = 0
+        for doc in docs:  # the store's lock per document: reads and writes go on meanwhile
+            with self._lock:
+                info = self.get_kb(kb)
+                if info is None:
+                    raise KbNotFound.of(kb.name, kb.namespace)
+                with self._tx() as db:
+                    ledger = ledger_for(db)
+                    if recorded(ledger, kb.key, doc.doc_id, doc.content_hash):
+                        continue
+                    rows = db.execute(
+                        "SELECT c.id, c.n, c.text, c.start_offset, c.end_offset, c.tokens,"
+                        " c.heading_path, c.page, c.parent_n, c.lineage_key"
+                        " FROM chunks c JOIN documents d ON d.kb = c.kb AND d.doc_id = c.doc_id"
+                        " WHERE c.kb = ? AND c.doc_id = ? AND d.content_hash = ?"
+                        " AND d.status = 'ready' ORDER BY c.n",
+                        (kb.key, doc.doc_id, doc.content_hash),
+                    ).fetchall()
+                    if not rows and self._document_hash(db, kb, doc.doc_id) != doc.content_hash:
+                        continue  # deleted or rewritten since the list was read: recorded then
+                    chunks = [
+                        Chunk(cid, doc.doc_id, n, t, s, e, tok, tuple(json.loads(path)), pg, pn)
+                        for cid, n, t, s, e, tok, path, pg, pn, _ in rows
+                    ]
+                    keys = chunk_keys(doc.doc_id, [c.text for c in chunks])
+                    db.executemany(
+                        "UPDATE chunks SET lineage_key = ? WHERE kb = ? AND id = ?",
+                        [
+                            (k, kb.key, row[0])
+                            for row, k in zip(rows, keys, strict=True)
+                            if row[-1] is None
+                        ],
+                    )
+                    record_document(ledger, info, doc, chunks, keys)
+                    done += 1
+        with self._lock, self._tx() as db:  # deleted while lineage was off: end them now
+            present = db.execute("SELECT doc_id FROM documents WHERE kb = ?", (kb.key,))
+            end_missing(ledger_for(db), kb.key, {d for (d,) in present})
+        return done
 
     def delete_document(self, kb: KbRef, doc_id: str) -> bool:
         """False when the document — or the whole kb — does not exist."""
@@ -505,6 +604,7 @@ class ChromaStore:
         content_hash: str,
         chunks: list[IndexedChunk],
         parents: list[Chunk],
+        keys: list[str],
     ) -> None:
         db.execute(
             "INSERT INTO documents (kb, doc_id, title, source, content_hash, chunk_count,"
@@ -531,8 +631,8 @@ class ChromaStore:
         )
         db.executemany(
             "INSERT INTO chunks (kb, id, doc_id, n, text, start_offset, end_offset, tokens,"
-            " length, heading_path, page, parent_n, context)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " length, heading_path, page, parent_n, context, lineage_key)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     kb.key,
@@ -548,8 +648,9 @@ class ChromaStore:
                     c.chunk.page,
                     c.chunk.parent,
                     c.context,
+                    key,
                 )
-                for c in chunks
+                for c, key in zip(chunks, keys, strict=True)
             ],
         )
         db.executemany(

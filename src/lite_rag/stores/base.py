@@ -4,10 +4,15 @@ separate vector cache, which a backend may or may not offer."""
 
 import dataclasses
 from collections.abc import Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from lite_rag.errors import InvalidRequest
+from lite_rag.lineage import Ledger
+
+if TYPE_CHECKING:  # tracing reads KbRef from here
+    from lite_rag.tracing import TraceLog
 from lite_rag.model_profiles import Prefixes
 from lite_rag.types import DEFAULT_EMBEDDING, Chunk, ChunkGraph, Document
 
@@ -36,6 +41,11 @@ class KbRef:
     @property
     def key(self) -> str:
         return f"{self.namespace}:{self.name}"
+
+    @staticmethod
+    def in_namespace(key: str, namespace: str) -> bool:
+        """Whether a physical key belongs to `namespace` (a namespace has no ':')."""
+        return key.startswith(f"{namespace}:")
 
 
 @dataclass(frozen=True)
@@ -106,6 +116,9 @@ class StoredChunk:
     heading_path: tuple[str, ...]
     page: int | None = None
     parent: StoredParent | None = None
+    # Its ledger key (lineage §6.3, `provenance.chunk_keys`); None until backfilled when it
+    # was written before S25.
+    lineage_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +218,20 @@ class Store(Protocol):
         ...
 
     def chunks(self, kb: KbRef, chunk_ids: list[str]) -> dict[str, StoredChunk]: ...
+
+    def backfill_lineage(self, kb: KbRef) -> int:
+        """Record in the ledger every stored document it lacks, and fill chunks' missing
+        lineage keys; one transaction per document. Returns the documents recorded."""
+        ...
+
+    def ledger(self) -> AbstractContextManager[Ledger]:
+        """The provenance ledger in a transaction of its own (reads, backfill, gc); raises
+        `ConfigError` when lineage is disabled."""
+        ...
+
+    def traces(self) -> AbstractContextManager["TraceLog"]:
+        """The query-trace tables in a transaction of their own (lineage §6.3)."""
+        ...
 
     def close(self) -> None: ...
 

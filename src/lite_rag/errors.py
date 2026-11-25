@@ -90,3 +90,7 @@ class StoreError(LiteRagError):
     """The store could not be reached or rejected the operation."""
 
     status = 503
+
+
+def lineage_disabled() -> ConfigError:
+    return ConfigError("lineage is disabled (lineage.enabled: false): the ledger is not kept")

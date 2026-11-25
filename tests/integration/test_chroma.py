@@ -15,7 +15,17 @@ from lite_rag.errors import StoreError
 from lite_rag.stores.base import KbInfo, KbRef
 from lite_rag.stores.chroma import SQLITE_FILE, ChromaStore, collection_name, migrate_sqlite
 from lite_rag.stores.factory import evaluation_store, migrate_store
+from tests.contract.test_lineage import active_doc, assert_consistent
 from tests.contract.test_store import KB, NS, info, put
+
+MIGRATIONS = [
+    "0001_initial",
+    "0002_lineage_key",
+    "0003_traces",
+    "0004_traces_namespace",
+    "lineage:0001_ledger",
+    "lineage:0002_gc_index",
+]
 
 
 class Crash(BaseException):
@@ -260,8 +270,16 @@ def test_the_store_needs_migrate_first(tmp_path: Path) -> None:
 
 
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
-    assert migrate_sqlite(tmp_path / "d") == ["0001_initial"]
+    assert migrate_sqlite(tmp_path / "d") == MIGRATIONS
     assert migrate_sqlite(tmp_path / "d") == []
+
+
+def test_the_store_refuses_data_whose_ledger_is_behind(tmp_path: Path) -> None:
+    migrate_sqlite(tmp_path / "d")
+    with sqlite3.connect(tmp_path / "d" / SQLITE_FILE) as conn:
+        conn.execute("DELETE FROM lineage_schema_migrations")
+    with pytest.raises(StoreError, match="literag migrate"):
+        ChromaStore(tmp_path / "d")
 
 
 def test_telemetry_is_off(store: ChromaStore) -> None:
@@ -302,7 +320,7 @@ def test_the_engine_opens_the_configured_backend(tmp_path: Path) -> None:
 
 def test_eval_keeps_its_kbs_apart_from_application_data(tmp_path: Path) -> None:
     store = load_settings(store={"backend": "chroma", "data_dir": str(tmp_path / "d")}).store
-    assert migrate_store(evaluation_store(store, "ev"), None) == ["0001_initial"]
+    assert migrate_store(evaluation_store(store, "ev"), None) == MIGRATIONS
     assert (tmp_path / "d" / "ev" / SQLITE_FILE).is_file()
     assert not (tmp_path / "d" / SQLITE_FILE).exists()
 
@@ -313,3 +331,114 @@ def test_eval_refuses_configs_on_different_data_dirs(tmp_path: Path) -> None:
     b.write_text("store: {backend: chroma, data_dir: two}\n")
     result = CliRunner().invoke(app, ["eval", "-c", str(a), "-c", str(b)])
     assert result.exit_code != 0 and "one database" in result.output
+
+
+# --- lineage (S25b): the ledger follows the store's final state ----------------------------------
+
+
+def _active_doc(store: ChromaStore, doc_id: str) -> bool:
+    return active_doc(store, doc_id) is not None
+
+
+def test_a_failed_write_ends_the_document_in_the_ledger(
+    store: ChromaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _two_docs(store)
+    monkeypatch.setattr(store, "_add_vectors", _raise(RuntimeError("chroma is down")))
+    with pytest.raises(StoreError):
+        put(store, "d1", [("alpha three", [1, 0, 0, 0])], content_hash="h2")
+    assert not _active_doc(store, "d1") and _active_doc(store, "d2")  # as the store: d1 gone
+    assert_consistent(store)
+
+
+def test_recovery_after_a_crash_ends_the_document_in_the_ledger(
+    store: ChromaStore, monkeypatch: pytest.MonkeyPatch, reopen: Reopen
+) -> None:
+    _two_docs(store)
+    monkeypatch.setattr(store, "_add_vectors", _raise(Crash()))
+    with pytest.raises(Crash):
+        put(store, "d1", [("alpha three", [1, 0, 0, 0])], content_hash="h2")
+    monkeypatch.undo()
+    store = reopen()
+    assert not _active_doc(store, "d1") and _active_doc(store, "d2")
+    assert_consistent(store)
+
+
+def test_cli_lineage_backfill_reports_what_it_recorded(data_dir: Path) -> None:
+    off = ChromaStore(data_dir, lineage=False)
+    off.create_kb(info())
+    put(off, "d1", [("alpha", [1, 0, 0, 0])])
+    put(off, "d2", [("beta", [0, 1, 0, 0])])
+    off.close()
+    env = {"LITERAG_STORE__BACKEND": "chroma", "LITERAG_STORE__DATA_DIR": str(data_dir)}
+    runner = CliRunner()
+    first = runner.invoke(app, ["lineage", "backfill", KB.name, "-n", NS], env=env)
+    assert first.exit_code == 0, first.output
+    assert "recorded 2 of 2 documents" in first.output
+    again = runner.invoke(app, ["lineage", "backfill", KB.name, "-n", NS], env=env)
+    assert "recorded 0 of 2 documents" in again.output
+
+
+def test_cli_trace_show_marks_a_stale_source_with_its_old_text(data_dir: Path) -> None:
+    from lite_rag.testing import FakeLLM
+    from tests.integration.support import NS as ENGINE_NS
+    from tests.integration.support import make_engine
+
+    store = ChromaStore(data_dir)
+    engine = make_engine(
+        store, size=200, trace={"enabled": True}, llm=FakeLLM(reply="It is 100 [1].")
+    )
+    engine.upsert_text("kb", "visa", "Visa", "The visa fee is 100 dollars.")
+    answer = engine.ask("kb", "visa fee", top_k=1, mode="bm25")
+    engine.upsert_text("kb", "visa", "Visa", "The visa fee is 120 dollars.")
+    store.close()
+    env = {"LITERAG_STORE__BACKEND": "chroma", "LITERAG_STORE__DATA_DIR": str(data_dir)}
+    out = CliRunner().invoke(app, ["trace", "show", str(answer.trace_id), "-n", ENGINE_NS], env=env)
+    assert out.exit_code == 0, out.output
+    assert "ask" in out.output and "visa fee" in out.output
+    cited = [line for line in out.output.splitlines() if line.startswith("cited")]
+    assert cited and "visa#0" in cited[0] and "stale since" in cited[0]
+    assert "The visa fee is 100 dollars." in out.output
+    missing = CliRunner().invoke(app, ["trace", "show", "nope", "-n", ENGINE_NS], env=env)
+    assert missing.exit_code != 0 and "no trace" in missing.output
+
+
+def test_cli_lineage_show_upstream_and_gc(data_dir: Path) -> None:
+    from tests.integration.support import NS as ENGINE_NS
+    from tests.integration.support import make_engine
+
+    store = ChromaStore(data_dir)
+    engine = make_engine(store, size=200)
+    engine.upsert_text("kb", "d1", "D1", "first text")
+    engine.upsert_text("kb", "d1", "D1", "second text")
+    [(_, chunks), _] = engine.lineage_document("kb", "d1")
+    chunk_id = chunks[0].artifact.id
+    store.close()
+    env = {"LITERAG_STORE__BACKEND": "chroma", "LITERAG_STORE__DATA_DIR": str(data_dir)}
+    runner = CliRunner()
+    show = runner.invoke(app, ["lineage", "show", "kb", "d1", "-n", ENGINE_NS], env=env)
+    assert show.exit_code == 0, show.output
+    lines = show.output.splitlines()
+    assert lines[0].startswith("v2 active") and any(x.startswith("v1 superseded") for x in lines)
+    assert "second text" in show.output and "d1#0" in show.output
+    up = runner.invoke(app, ["lineage", "upstream", chunk_id, "-n", ENGINE_NS], env=env)
+    assert up.exit_code == 0 and "document d1 v2" in up.output, up.output
+    gc = runner.invoke(app, ["lineage", "gc"], env=env)
+    assert gc.exit_code == 0 and "cleared 0 texts, deleted 0 traces" in gc.output, gc.output
+
+
+def test_cli_trace_purge_needs_yes_and_removes_the_namespaces_traces(data_dir: Path) -> None:
+    from tests.integration.support import NS as ENGINE_NS
+    from tests.integration.support import make_engine
+
+    store = ChromaStore(data_dir)
+    engine = make_engine(store, size=200, trace={"enabled": True})
+    engine.upsert_text("kb", "d1", "D1", "refunds take seven days")
+    engine.search_traced("kb", "refunds", mode="bm25")
+    store.close()
+    env = {"LITERAG_STORE__BACKEND": "chroma", "LITERAG_STORE__DATA_DIR": str(data_dir)}
+    runner = CliRunner()
+    refused = runner.invoke(app, ["trace", "purge", "-n", ENGINE_NS], env=env)
+    assert refused.exit_code != 0 and "--yes" in refused.output
+    done = runner.invoke(app, ["trace", "purge", "--yes", "-n", ENGINE_NS], env=env)
+    assert done.exit_code == 0 and "deleted 1 traces" in done.output, done.output
