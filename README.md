@@ -24,6 +24,10 @@ measure.
   latency) on a bundled Chinese and English corpus, or your own. It runs on
   [lite-eval](https://github.com/ArthurGao/lite-eval): each config is a lite-eval run, so two can
   be compared with significance (`lite-eval compare`).
+- **Lineage**: every write records which document version each chunk came from, in the same
+  transaction. Opt-in query traces then answer "did this answer use text that has since changed,
+  and what did it say then?" (`literag trace show`). The ledger underneath (`lite_rag.lineage`)
+  is generic and usable on its own.
 
 Use it as a Python library or as a service (`literag serve`, Docker image, HTTP API with API keys).
 The default stack (Ollama `bge-m3` + `qwen3:8b` for answers + `qwen3:1.7b` for contexts and graphs,
@@ -31,8 +35,9 @@ PostgreSQL/pgvector, jieba) runs locally and costs
 nothing. [llm-steward](https://github.com/ArthurGao/llm-steward) uses it as its knowledge-base
 engine.
 
-Status: v0.1, stages S0–S11 of the [design](docs/lite-rag-design.md) are done (S9: llm-steward
-integration; S10: searching several kbs as one; S11: graph retrieval, local mode).
+Status: v0.1, stages S0–S25 of the [design](docs/lite-rag-design.md) are done (S9: llm-steward
+integration; S10: searching several kbs as one; S11: graph retrieval, local mode; S15–S23: every
+model call through lite-model; S22: a named embedder per kb; S25: lineage and query traces).
 
 ## How it works
 
@@ -44,6 +49,8 @@ search:  query → embedder → vector top-n ┐
          query → tokenize → BM25 top-n   ┤
          query → named entities → walk co-mentions → reached chunks by vector ┴→ RRF → [rerank] → top-k hits
 ask:     hits → prompt (prompts/*.j2) → LLM → answer (status, text, citations, provenance)
+lineage: each write ──(same transaction)──→ ledger: document version → chunk versions
+         [trace] search / ask → which chunk versions were retrieved, reranked, in context, cited
 ```
 
 A few rules the engine enforces:
@@ -264,7 +271,37 @@ JSONL file (for a later replay evaluation). PostgreSQL store only.
 
 ## Lineage
 
-Every write records, in the same transaction, which document version each indexed chunk came
+In plain words: lite-rag keeps a ledger of *which version of which document* every chunk came
+from, and — when traces are on — *which chunk versions* every search and answer used. Months
+later you can ask about an old answer: "was it based on text that has changed since, and what
+did that text say then?"
+
+```bash
+literag ingest handbook docs/              # the ledger is written with the index (lineage.enabled, default on)
+literag lineage show handbook <doc_id>     # every version of a document (ingest prints its id), newest first
+literag ask handbook "…" --json            # with trace.enabled, the answer carries a trace_id
+literag trace show <trace_id>              # what each stage used, and whether it is still current
+```
+
+```
+trace 01a2…  ask  2026-11-25 10:02:11 UTC
+kbs: handbook  query: how many days of annual leave?
+answer: answered by ollama/qwen3:8b
+retrieved    1  handbook/leave-policy#2  stale since 2026-11-26 09:15:40
+    was: Staff get 20 days of annual leave per year.
+retrieved    2  handbook/leave-policy#3  current
+in_context   1  handbook/leave-policy#2  stale since 2026-11-26 09:15:40
+    was: Staff get 20 days of annual leave per year.
+cited        1  handbook/leave-policy#2  stale since 2026-11-26 09:15:40
+    was: Staff get 20 days of annual leave per year.
+```
+
+`current`: the text is unchanged; `stale`: the document was edited or deleted after the answer
+(the old text is shown while it is kept); `unrecorded`: written while lineage was off — run
+`literag lineage backfill <kb>`. `search` is untouched by all this; `search_traced`,
+`search_kbs_traced` and `record_cited` are the traced variants (see Library above).
+
+How it works: every write records, in the same transaction, which document version each indexed chunk came
 from (a provenance ledger). A chunk is known by its text: when a document changes, only the
 chunks whose text changed get a new version; renumbered or re-contextualised ones stay the same.
 With `trace.enabled`, `search_traced` / `ask` also record which chunk versions each stage used
