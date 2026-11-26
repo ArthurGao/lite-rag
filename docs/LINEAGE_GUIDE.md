@@ -1,75 +1,75 @@
 > **Superseded (2026-11-25):** the decided design is `docs/superpowers/specs/2026-11-24-lineage-design.md`, built in S25 (design §12). This guide is kept as the original intent.
 
-# Lite Lineage 实现指导（给 Claude Code）
+# Lite Lineage implementation guide (for Claude Code)
 
-> 目标读者：在 lite-rag 仓库中工作的 Claude Code。
-> 用法：**先分析现有代码，提交一份实现计划给我确认，再动手。** 本文给的是设计意图和约束，具体落地要以仓库现状为准。
-
----
-
-## 0. 背景与目标
-
-lite-rag 要做成跨项目复用的通用 RAG 模块。现在缺两样能力：
-
-1. **增量重处理（Incremental Reprocessing）**：源文档、chunk 策略、embedding 模型变了，只重算受影响的部分，不做全量重建。
-2. **可追溯（Lineage / Provenance）**：任一产物（chunk、embedding、摘要、生成的页面）都能查到上游来源；任一源变更都能查到下游影响。
-
-另外，查询侧要能回答：这次回答用了哪些 chunk、哪个文档版本、当时这些数据是否已经过期。
-
-**非目标**：不做 OpenLineage/Marquez 那样的企业级 lineage 平台；不做可视化 UI；不做分布式调度。
+> Audience: Claude Code working in the lite-rag repository.
+> Usage: **first analyze the existing code and submit an implementation plan for my confirmation, then start work.** This document gives design intent and constraints; the actual implementation must follow the current state of the repository.
 
 ---
 
-## 1. 分层（硬约束）
+## 0. Background and goals
+
+lite-rag is to become a general RAG module reused across projects. It currently lacks two abilities:
+
+1. **Incremental reprocessing**: when a source document, the chunk strategy or the embedding model changes, recompute only the affected parts, with no full rebuild.
+2. **Traceability (Lineage / Provenance)**: for any artifact (chunk, embedding, summary, generated page), the upstream source can be found; for any source change, the downstream impact can be found.
+
+In addition, the query side must be able to answer: which chunks and which document versions this answer used, and whether this data was already stale at that time.
+
+**Non-goals**: no enterprise-grade lineage platform like OpenLineage/Marquez; no visualization UI; no distributed scheduling.
+
+---
+
+## 1. Layering (hard constraint)
 
 ```
-lite-lineage  (通用层，不认识 RAG)
+lite-lineage  (general layer, knows nothing about RAG)
     ▲
-    │ 依赖（单向）
-lite-rag      (RAG 层：chunk/embed step、KB、查询 trace)
+    │ depends on (one-way)
+lite-rag      (RAG layer: chunk/embed steps, KB, query trace)
 ```
 
-- 通用层放在 lite-rag 仓库内的独立 package，例如 `packages/lineage/` 或 `lite_rag/lineage/`，以仓库现有结构为准。
-- **通用层禁止 import 任何 RAG 代码。** `artifact.kind` 只是字符串（`"chunk"`、`"embedding"`、`"summary"`……），通用层不解释它。
-- 将来会被其他项目复用（TenderTED、Cairn 签证材料核查、AI 学习系统、AdForge），所以接口设计要按"通用派生数据管道"来想。等第二个项目接入后，再把它拆成独立 repo。
+- Put the general layer in a separate package inside the lite-rag repository, for example `packages/lineage/` or `lite_rag/lineage/`, following the existing repository structure.
+- **The general layer must not import any RAG code.** `artifact.kind` is just a string (`"chunk"`, `"embedding"`, `"summary"`, ...), and the general layer does not interpret it.
+- It will later be reused by other projects (TenderTED, Cairn visa-document checking, the AI learning system, AdForge), so design the interface as a "general derived-data pipeline". Split it into a separate repo only after a second project has adopted it.
 
 ---
 
-## 2. 核心概念
+## 2. Core concepts
 
-| 概念 | 含义 |
+| Concept | Meaning |
 |---|---|
-| document | 原始输入（文件、URL、DB 记录），按 `content_hash` 区分版本 |
-| step | 处理步骤的**定义**：name + version + config_hash（如 `chunk@v2`、`embed:bge-m3`） |
-| processing_run | step 的**一次执行**：状态、时间、错误 |
-| artifact | 某次执行产出的**不可变**产物，带 fingerprint |
-| lineage_edge | 产物级的"输入 → 输出"派生关系 |
+| document | The raw input (file, URL, DB record); versions are told apart by `content_hash` |
+| step | The **definition** of a processing step: name + version + config_hash (such as `chunk@v2`, `embed:bge-m3`) |
+| processing_run | One **execution** of a step: status, time, error |
+| artifact | The **immutable** product of one execution, with a fingerprint |
+| lineage_edge | An artifact-level "input → output" derivation relation |
 
-### 关键原则
+### Key principles
 
-1. **artifact 不可变**。内容变了就生成新的 artifact，旧的标记为 superseded。
-2. **fingerprint 驱动增量**：
+1. **An artifact is immutable.** When the content changes, generate a new artifact and mark the old one superseded.
+2. **The fingerprint drives incremental work**:
    ```
    fingerprint = hash(step.name + step.version + step.config_hash
-                      + sorted(所有输入 artifact/document 的 content_hash))
+                      + sorted(content_hash of all input artifacts/documents))
    ```
-   执行前先按 fingerprint 查询：已存在且 active 就直接复用（跳过）；不存在才计算。这和 Bazel、Nix 的缓存是同一个思路。
-3. **run_id 管批次，lineage_edges 管单个产物**。一次 run 处理 1000 个文档、产出 5 万个 chunk 时，只靠 run_id 分不清哪个 chunk 来自哪个文档，所以必须有边。
-4. **lineage_edges 只记录派生关系**。下面两种关系**不放进** lineage_edges：
-   - KB 成员关系 → `kb_members`
-   - Agent 或查询的消费关系 → `rag_query_sources`
-5. **有效期**：artifact 带 `valid_from` 和 `superseded_at`，这样才能判断"查询那一刻用的数据是否已经过期"。
+   Before executing, query by fingerprint: if one exists and is active, reuse it directly (skip); compute only when it does not exist. This is the same idea as the Bazel and Nix caches.
+3. **run_id manages the batch, lineage_edges manage individual artifacts.** When one run handles 1000 documents and produces 50,000 chunks, run_id alone cannot tell which chunk came from which document, so edges are required.
+4. **lineage_edges record only derivation relations.** The following two relations are **not put into** lineage_edges:
+   - KB membership → `kb_members`
+   - The consumption relation of an Agent or a query → `rag_query_sources`
+5. **Validity period**: an artifact carries `valid_from` and `superseded_at`, which is what makes it possible to judge "whether the data used at the moment of the query was already stale".
 
 ---
 
-## 3. 表结构（通用层）
+## 3. Table structure (general layer)
 
-> 以 Postgres 为参考写法。如果 lite-rag 当前用 SQLite 或需要本地模式，请保持两者都能跑（递归 CTE 两边都支持；JSONB 在 SQLite 里退化为 TEXT JSON）。先确认仓库现有的 DB 访问方式（ORM 或原生 SQL），沿用它。
+> Postgres is the reference syntax. If lite-rag currently uses SQLite or needs a local mode, keep both working (recursive CTEs are supported by both; JSONB degrades to TEXT JSON in SQLite). First confirm how the repository accesses the DB (ORM or raw SQL) and follow it.
 
 ```sql
 CREATE TABLE lineage_documents (
   id            UUID PRIMARY KEY,
-  namespace     TEXT NOT NULL,          -- 租户/项目隔离
+  namespace     TEXT NOT NULL,          -- tenant/project isolation
   source_uri    TEXT NOT NULL,
   content_hash  TEXT NOT NULL,
   version       INT  NOT NULL,
@@ -96,7 +96,7 @@ CREATE TABLE lineage_runs (
   started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   finished_at TIMESTAMPTZ,
   error       TEXT,
-  stats       JSONB                     -- added/skipped/failed 计数
+  stats       JSONB                     -- added/skipped/failed counts
 );
 
 CREATE TABLE lineage_artifacts (
@@ -107,8 +107,8 @@ CREATE TABLE lineage_artifacts (
   content_hash  TEXT NOT NULL,
   fingerprint   TEXT NOT NULL,
   status        TEXT NOT NULL DEFAULT 'active',  -- active/superseded/deleted
-  payload_ref   TEXT,                   -- 指向向量 ID / 对象存储 / 文本表
-  metadata      JSONB,                  -- page、offset 等
+  payload_ref   TEXT,                   -- points to a vector ID / object store / text table
+  metadata      JSONB,                  -- page, offset, etc.
   valid_from    TIMESTAMPTZ NOT NULL DEFAULT now(),
   superseded_at TIMESTAMPTZ,
   UNIQUE (namespace, fingerprint)
@@ -125,38 +125,38 @@ CREATE INDEX ON lineage_edges (child_id);
 CREATE INDEX ON lineage_edges (parent_id);
 ```
 
-**设计取舍（请评估后决定）：**
-- documents 是否并入 artifacts（作为 `kind='source'`）？并入后 edges 只需要连 artifact，递归查询更简单。保留独立表则语义更清楚。请根据现有代码选一种并说明理由。
-- chunk → embedding 这种一对一关系会让 edges 表膨胀。可以考虑一对一的关系直接在 artifact 上存 `parent_id`，只有多对多才写 edges。先评估数据量再定。
+**Design trade-offs (evaluate, then decide):**
+- Should documents be merged into artifacts (as `kind='source'`)? After merging, edges only need to connect artifacts, which makes recursive queries simpler. Keeping a separate table makes the semantics clearer. Choose one based on the existing code and explain why.
+- A one-to-one relation such as chunk → embedding would bloat the edges table. Consider storing `parent_id` directly on the artifact for one-to-one relations, and writing edges only for many-to-many. Estimate the data volume first, then decide.
 
 ---
 
-## 4. 通用层 API（建议签名，按仓库语言和风格调整）
+## 4. General layer API (suggested signatures; adjust to the repository's language and style)
 
 ```python
 register_document(namespace, source_uri, content_hash, metadata) -> Document
-    # content_hash 没变 → 返回现有版本；变了 → 新建版本，旧版本标 superseded
+    # content_hash unchanged → return the existing version; changed → create a new version, mark the old one superseded
 
-get_or_create_step(name, version, config) -> Step   # 内部计算 config_hash
+get_or_create_step(name, version, config) -> Step   # computes config_hash internally
 
 compute_fingerprint(step, inputs: list[Document|Artifact]) -> str
 
 should_recompute(namespace, step, inputs) -> tuple[bool, Artifact | None]
 
 run_step(namespace, step, inputs, fn) -> list[Artifact]
-    # 1. 算 fingerprint → 命中则直接返回，不调用 fn
-    # 2. 未命中：建 run → 调用 fn(inputs) → 写 artifacts + edges → 结束 run
-    # 3. 整个过程要幂等，fn 失败时 run 标为 failed，不留半成品 active artifact
+    # 1. compute the fingerprint → on a hit, return directly without calling fn
+    # 2. on a miss: create a run → call fn(inputs) → write artifacts + edges → end the run
+    # 3. the whole process must be idempotent; if fn fails, mark the run failed and leave no half-finished active artifact
 
-upstream_of(artifact_id) -> list[Node]       # 递归 CTE 向上
-downstream_of(node_id) -> list[Artifact]     # 递归 CTE 向下（影响分析）
+upstream_of(artifact_id) -> list[Node]       # recursive CTE upwards
+downstream_of(node_id) -> list[Artifact]     # recursive CTE downwards (impact analysis)
 
-mark_deleted(document_id) -> list[Artifact]  # 级联把下游 artifact 标 deleted，返回清单供上层清理向量
-supersede(...)                               # 新版本生效时标记旧产物
-gc(older_than, keep_metadata=True)           # 删除 superseded/deleted 的 payload，保留元数据行
+mark_deleted(document_id) -> list[Artifact]  # cascade-mark downstream artifacts as deleted, return the list so the upper layer can clean up vectors
+supersede(...)                               # mark the old artifacts when a new version takes effect
+gc(older_than, keep_metadata=True)           # delete the payload of superseded/deleted artifacts, keep the metadata rows
 ```
 
-影响分析的递归查询示例：
+An example of a recursive query for impact analysis:
 
 ```sql
 WITH RECURSIVE downstream AS (
@@ -170,15 +170,15 @@ SELECT a.* FROM lineage_artifacts a JOIN downstream d ON a.id = d.child_id;
 
 ---
 
-## 5. RAG 层（lite-rag 中实现）
+## 5. RAG layer (implemented in lite-rag)
 
-### 5.1 把现有 ingestion 改造成 step
+### 5.1 Turn the existing ingestion into steps
 
-- 现有流程中的 load → parse → chunk → embed → 写入向量库，逐个包装成 `run_step` 调用。
-- 每个 step 都要有显式的 version 和 config（chunk_size、overlap、embedding 模型名、维度……）。
-- 写入向量库时，向量的 metadata 要带上 `artifact_id`。删除时，以 lineage 返回的 artifact 清单为准去删除向量。
+- Wrap each of load → parse → chunk → embed → write to the vector store in the existing flow as a `run_step` call.
+- Every step needs an explicit version and config (chunk_size, overlap, embedding model name, dimension, ...).
+- When writing to the vector store, the vector's metadata must carry `artifact_id`. On deletion, delete the vectors according to the artifact list returned by lineage.
 
-### 5.2 RAG 专属表
+### 5.2 RAG-specific tables
 
 ```sql
 CREATE TABLE kb_members (
@@ -192,14 +192,14 @@ CREATE TABLE rag_query_traces (
   id               UUID PRIMARY KEY,
   namespace        TEXT NOT NULL,
   user_id          TEXT,
-  query_text       TEXT,              -- 可配置为只存 hash
+  query_text       TEXT,              -- can be configured to store only a hash
   model_name       TEXT,
   prompt_version   TEXT,
   embed_model      TEXT,
   index_version    TEXT,
   retrieval_config JSONB,             -- top_k、filters、reranker
   answer_ref       TEXT,
-  external_trace_id TEXT,             -- Langfuse 等外部 trace ID（可选）
+  external_trace_id TEXT,             -- external trace ID such as Langfuse (optional)
   latency_ms INT, tokens_in INT, tokens_out INT,
   created_at       TIMESTAMPTZ DEFAULT now()
 );
@@ -214,58 +214,58 @@ CREATE TABLE rag_query_sources (
 );
 ```
 
-- 文档版本**不要**冗余存进 sources，通过 `upstream_of(artifact_id)` 查。
-- 判断查询时是否用了过期数据：`artifact.superseded_at IS NOT NULL AND artifact.superseded_at < trace.created_at`。
-- trace 记录要做成**可关闭、可配置保留期**（例如 90 天后只保留聚合数据）。
-- **普通问答的答案不写进 artifacts。** 只有会被持久化和复用的产出（缓存答案、生成的报告或 HTML 学习页）才作为 artifact 并写入 edges。
+- Do **not** store the document version redundantly in sources; look it up through `upstream_of(artifact_id)`.
+- To judge whether stale data was used at query time: `artifact.superseded_at IS NOT NULL AND artifact.superseded_at < trace.created_at`.
+- Trace records must be **switchable off and have a configurable retention period** (for example, after 90 days keep only aggregate data).
+- **The answer of an ordinary Q&A is not written into artifacts.** Only outputs that are persisted and reused (cached answers, generated reports or HTML learning pages) become artifacts and get edges.
 
 ---
 
-## 6. 实施阶段
+## 6. Implementation stages
 
-1. **分析（先做，产出计划给我确认）**
-   - 现有 ingestion 流程、存储（向量库、元数据库）、配置方式、语言和依赖。
-   - 现在有没有任何 hash、去重、版本相关的逻辑。
-   - 给出：package 放在哪、documents 是否并入 artifacts、一对一边怎么处理、需要改哪些现有文件。
-2. **通用层**：表 + migration + API + 单元测试。
-3. **接入 ingestion**：chunk/embed 改造为 step，向量带 artifact_id。
-4. **删除与 GC**：源删除级联清理向量；superseded 产物的 GC。
-5. **查询 trace**：两张 trace 表 + 检索流程埋点（四个 stage）。
-6. **文档**：README 中写明用法和第三方项目如何接入通用层。
+1. **Analysis (do this first, and produce a plan for my confirmation)**
+   - The existing ingestion flow, storage (vector store, metadata DB), configuration method, language and dependencies.
+   - Whether there is any hash, deduplication or versioning logic now.
+   - Give: where the package goes, whether documents are merged into artifacts, how one-to-one edges are handled, and which existing files need to change.
+2. **General layer**: tables + migration + API + unit tests.
+3. **Hook into ingestion**: turn chunk/embed into steps, and give vectors an artifact_id.
+4. **Deletion and GC**: deleting a source cascades to clean up vectors; GC of superseded artifacts.
+5. **Query trace**: the two trace tables + instrumentation in the retrieval flow (four stages).
+6. **Documentation**: the README states the usage and how third-party projects adopt the general layer.
 
-每个阶段完成后都要保证现有功能和测试不受影响。
-
----
-
-## 7. 验收标准（需有自动化测试覆盖）
-
-- [ ] 同一批文档重复 ingest：第二次 0 次 embedding 调用，全部 skipped。
-- [ ] 修改 1 个文档：只有该文档的 chunk/embedding 被重算，其他全部 skipped。
-- [ ] 修改 chunk 配置（version 或 config 变）：所有 chunk 及其下游重算，embedding step 本身的配置不变也会重算（因为输入 hash 变了）。
-- [ ] 切换 embedding 模型：chunk 全部复用，只重算 embedding；新旧索引可以并存。
-- [ ] 删除 1 个文档：下游 artifact 全部标记 deleted，对应向量从向量库删除，检索不再返回。
-- [ ] `upstream_of(embedding_id)` 能返回到源文档及其版本。
-- [ ] `downstream_of(document_id)` 返回完整的影响清单。
-- [ ] step 执行失败：run 标记为 failed，没有残留 active 的半成品 artifact，重跑可以恢复。
-- [ ] 查询 trace 能区分 retrieved/in_context/cited，并能判断当时是否用了已过期的 chunk。
-- [ ] 通用层的 import 中不出现任何 RAG 模块（可以加一个测试或 lint 规则来保证）。
+After each stage, make sure existing features and tests are not affected.
 
 ---
 
-## 8. 参考（只借鉴思路，不引入依赖）
+## 7. Acceptance criteria (must be covered by automated tests)
 
-- LangChain Indexing API / RecordManager：hash 去重 + cleanup 模式。注意它的 incremental 模式不会清理已从语料中删除的源，这一点我们要做到。
-- LlamaIndex IngestionPipeline + docstore：hash 去重与 upsert。
-- CocoIndex：声明式增量引擎 + 端到端 lineage。如果以后数据源变多、需要实时同步，可以考虑迁移过去。
-- OpenLineage：dataset / job / run 的概念模型，可参考命名，不要引入。
+- [ ] Ingest the same batch of documents again: on the second run, 0 embedding calls, everything skipped.
+- [ ] Modify 1 document: only the chunks/embeddings of that document are recomputed, everything else is skipped.
+- [ ] Modify the chunk config (version or config changes): all chunks and their downstream are recomputed; the embedding step is also recomputed even though its own config is unchanged (because the input hash changed).
+- [ ] Switch the embedding model: all chunks are reused, only the embeddings are recomputed; the old and new indexes can coexist.
+- [ ] Delete 1 document: all downstream artifacts are marked deleted, the matching vectors are removed from the vector store, and retrieval no longer returns them.
+- [ ] `upstream_of(embedding_id)` can return the source document and its version.
+- [ ] `downstream_of(document_id)` returns the complete impact list.
+- [ ] A step execution fails: the run is marked failed, no half-finished active artifact remains, and a rerun can recover.
+- [ ] The query trace can tell retrieved/in_context/cited apart, and can judge whether a stale chunk was used at that time.
+- [ ] No RAG module appears in the general layer's imports (add a test or lint rule to guarantee this).
 
 ---
 
-## 9. 需要你（Claude Code）在计划中明确回答的问题
+## 8. References (borrow ideas only, add no dependencies)
 
-1. 现有代码里哪些部分可以直接改造成 step，哪些需要重写？
-2. DB 选型：只支持 Postgres，还是 SQLite + Postgres 都支持？
-3. documents 是否并入 artifacts？一对一的边怎么存？
-4. 向量库是否支持按 metadata 批量删除？不支持的话，删除怎么实现？
-5. 现有的检索接口中，在哪里埋 trace 的四个 stage 改动最小？
-6. 预估各阶段的改动范围和风险。
+- LangChain Indexing API / RecordManager: hash deduplication + the cleanup modes. Note that its incremental mode does not clean up sources that have been deleted from the corpus; we must do that.
+- LlamaIndex IngestionPipeline + docstore: hash deduplication and upsert.
+- CocoIndex: a declarative incremental engine + end-to-end lineage. If data sources multiply later and real-time sync is needed, consider migrating to it.
+- OpenLineage: the conceptual model of dataset / job / run; naming can be borrowed, but do not add it as a dependency.
+
+---
+
+## 9. Questions you (Claude Code) must answer explicitly in the plan
+
+1. Which parts of the existing code can be turned into steps directly, and which need a rewrite?
+2. DB choice: Postgres only, or both SQLite and Postgres?
+3. Are documents merged into artifacts? How are one-to-one edges stored?
+4. Does the vector store support batch deletion by metadata? If not, how is deletion implemented?
+5. In the existing retrieval interface, where can the four trace stages be instrumented with the smallest change?
+6. Estimate the change scope and risk of each stage.

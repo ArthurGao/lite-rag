@@ -1,308 +1,308 @@
-# lite-rag 设计文档
+# lite-rag Design Document
 
-> 状态：S0–S19 已完成（2026-11-08 至 11-22；S18 = lite-cache L1，S19 = ollama / openai 的 embedding 改走 lite-model）。实施按第 12 节的阶段推进；某个阶段的行为改变时，在同一次提交里更新本文。
+> Status: S0–S19 done (2026-11-08 to 11-22; S18 = lite-cache L1, S19 = the ollama / openai embeddings now go through lite-model). Work follows the stages in section 12; when a stage changes behaviour, this document is updated in the same commit.
 
-## 1. 概述
+## 1. Overview
 
-lite-rag 是一个**可读、可改、可单独部署**的轻量 RAG 引擎，有两个用途：
+lite-rag is a lightweight RAG engine that is **readable, changeable and deployable on its own**. It has two uses:
 
-1. **学习**：切块、embedding、BM25、融合、rerank、生成，每一步都是这个仓库里自己写的代码，可以单独替换，效果可以量化比较。
-2. **通用 RAG**：既能作为 Python 库安装使用（`pip install`），也能作为独立服务运行（`literag serve`，或者直接用 Docker 镜像），通过 HTTP API 调用。使用方不需要拿到这个仓库的源码。[llm-steward](https://github.com/ArthurGao/llm-steward) 是第一个使用方，它负责治理，lite-rag 负责存储和检索。
+1. **Learning**: chunking, embedding, BM25, fusion, rerank and generation are each code written in this repo. Each step can be replaced alone, and the effect can be compared with numbers.
+2. **General-purpose RAG**: it can be installed and used as a Python library (`pip install`), or run as a standalone service (`literag serve`, or the Docker image) and called over an HTTP API. A caller does not need the source of this repo. [llm-steward](https://github.com/ArthurGao/llm-steward) is the first host: it does governance, lite-rag does storage and retrieval.
 
-### 目标
+### Goals
 
-- **默认零成本**：Ollama 提供 embedding 和 LLM；存储用 PostgreSQL + pgvector，也可以选 Chroma 做纯嵌入式运行。
-- **库和服务同一套核心**：`RagEngine` 是唯一实现，HTTP 服务只是在它外面包一层，两边的行为一致。
-- **每个环节都可插拔**：`Chunker`、`Embedder`、`Store`、`Reranker`、`LLM` 都是 Protocol，换实现只改配置。
-- **可以度量**：自带评测（hit@k、MRR、延迟），同一组问题在不同配置下并排比较。
-- **LLM 可切换**：`ollama`、`openai`（以及任何 OpenAI 兼容的端点，例如 llm-gateway）、`anthropic`，只改配置。
+- **Zero cost by default**: Ollama provides embedding and the LLM; storage is PostgreSQL + pgvector, or Chroma for a purely embedded run.
+- **One core for library and service**: `RagEngine` is the only implementation. The HTTP service is a thin wrapper around it, so both behave the same.
+- **Every step is pluggable**: `Chunker`, `Embedder`, `Store`, `Reranker` and `LLM` are Protocols; swapping an implementation is a config change only.
+- **Measurable**: it ships its own eval (hit@k, MRR, latency); the same questions are compared side by side under different configs.
+- **Switchable LLM**: `ollama`, `openai` (and any OpenAI-compatible endpoint, such as llm-gateway) and `anthropic`, by config only.
 
-### 非目标（v1）
+### Non-goals (v1)
 
-- **不做治理**：审核、状态机和用户权限都交给 llm-steward 这类上层系统。lite-rag 只负责 namespace 隔离（见 §4）和服务端的 API key 鉴权。
-- **不做复杂文档解析**：OCR、版面分析、表格结构交给 RAGFlow 这类引擎。v1 只支持 txt、md；PDF 只抽取纯文本，作为可选 extra。
-- **不做分布式**：一个 PG 实例就够用。目标规模是每个 kb 十万级 chunk。
+- **No governance**: review, state machines and user permissions are left to a higher-level system such as llm-steward. lite-rag only does namespace isolation (see §4) and server-side API key authentication.
+- **No complex document parsing**: OCR, layout analysis and table structure are left to engines such as RAGFlow. v1 supports only txt and md; PDF gets plain-text extraction only, as an optional extra.
+- **No distribution**: one PG instance is enough. The target size is on the order of a hundred thousand chunks per kb.
 
-## 2. 数据流
+## 2. Data flow
 
 ```
-摄取：  文件/文本 → Loader → Document → Chunker → chunks → Embedder ─┐
-                                                   ├→ 分词(jieba) ────┤
-                                                   └→ [LLM 抽实体/关系] ┴→ Store（一个事务：登记 + 向量 + 倒排 + 图）
-检索：  query → Embedder → 向量 top-n ┐
-        query → 分词 → BM25 top-n    ┤
-        query → 种子实体 → 沿共现扩展 → 范围内按向量排序 ┴→ 融合(RRF) → [Reranker] → top-k Hit
-回答：  Hit[] → prompt 模板(answer_system.j2 + answer_user.j2) → LLM → Answer(status, text, citations, provenance)
+Ingest: file/text → Loader → Document → Chunker → chunks → Embedder ─┐
+                                                   ├→ tokenize(jieba) ────┤
+                                                   └→ [LLM extracts entities/relations] ┴→ Store (one transaction: registry + vectors + inverted index + graph)
+Search:  query → Embedder → vector top-n ┐
+        query → tokenize → BM25 top-n ┤
+        query → seed entities → expand by co-occurrence → rank by vector in range ┴→ fusion(RRF) → [Reranker] → top-k Hit
+Answer: Hit[] → prompt template(answer_system.j2 + answer_user.j2) → LLM → Answer(status, text, citations, provenance)
 ```
 
-## 3. 组件与接口
+## 3. Components and interfaces
 
-所有接口都是 `typing.Protocol`；测试用 fake 实现，不依赖网络和模型。
+All interfaces are `typing.Protocol`; tests use fake implementations and need no network or model.
 
-| 接口 | 方法 | 默认实现 | 其他实现 |
+| Interface | Methods | Default implementation | Other implementations |
 | --- | --- | --- | --- |
-| `Loader` | `load_file(path, pdf) -> Loaded(title, text, pages)` | txt、md；pdf 用 pypdf（extra `[pdf]`，逐页抽纯文本） | `docling`（extra `[docling]`，`loader.pdf: docling`）：PDF、DOCX 转成 Markdown，保留标题；`.docx` 总是走它 |
-| `Chunker` | `split(doc) -> list[Chunk]`；`split_parents(doc) -> (parents, chunks)` | `recursive` | 见 §3.1：fixed、sentence、paragraph、markdown、semantic、parent-child，另有 contextual 增强 |
-| `Embedder` | `embed_documents(texts)`、`embed_query(text)`、`dim`、`model` | `ollama`（`bge-m3`） | 见 §3.2：openai 兼容、voyage、cohere、gemini、fastembed、sentence-transformers、`FakeEmbedder` |
-| `Store` | `get_or_create_kb`、`get_kb`、`upsert_document`、`delete_document`、`vector_query`（可用 `among` 限定 chunk 范围）、`bm25_query`、`chunks`、`stats`；图检索另有 `GraphStore`（只有 PgStore 实现）：`graph_names_in`、`graph_chunks_of`、`graph_entities_of` | `PgStore`（pgvector 存向量，PG 表存 BM25 倒排和文档登记） | `ChromaStore`（extra `[chroma]`）：向量放 Chroma，倒排和登记放 SQLite |
-| `Reranker` | `score(query, texts) -> list[float]`（只打分；排序和组装上下文由引擎负责） | 不启用（`rerank.enabled=false`） | 本地 cross-encoder `BAAI/bge-reranker-v2-m3-int8`（extra `[fastembed]`）；Voyage `rerank-2.5`（`provider: voyage`，付费，S20） |
-| `LLM` | `complete(messages) -> Completion` | `OpenAICompatLLM`（Ollama `/v1`、OpenAI、llm-gateway） | `AnthropicLLM`（extra `[anthropic]`）、`FakeLLM` |
+| `Loader` | `load_file(path, pdf) -> Loaded(title, text, pages)` | txt, md; pdf uses pypdf (extra `[pdf]`, plain text page by page) | `docling` (extra `[docling]`, `loader.pdf: docling`): converts PDF and DOCX to Markdown and keeps headings; `.docx` always goes through it |
+| `Chunker` | `split(doc) -> list[Chunk]`; `split_parents(doc) -> (parents, chunks)` | `recursive` | See §3.1: fixed, sentence, paragraph, markdown, semantic, parent-child, plus the contextual enhancer |
+| `Embedder` | `embed_documents(texts)`, `embed_query(text)`, `dim`, `model` | `ollama` (`bge-m3`) | See §3.2: openai-compatible, voyage, cohere, gemini, fastembed, sentence-transformers, `FakeEmbedder` |
+| `Store` | `get_or_create_kb`, `get_kb`, `upsert_document`, `delete_document`, `vector_query` (`among` limits the chunk range), `bm25_query`, `chunks`, `stats`; graph retrieval has a separate `GraphStore` (only PgStore implements it): `graph_names_in`, `graph_chunks_of`, `graph_entities_of` | `PgStore` (pgvector holds vectors; PG tables hold the BM25 inverted index and the document registry) | `ChromaStore` (extra `[chroma]`): vectors in Chroma, inverted index and registry in SQLite |
+| `Reranker` | `score(query, texts) -> list[float]` (scores only; ordering and context assembly are the engine's job) | Not enabled (`rerank.enabled=false`) | Local cross-encoder `BAAI/bge-reranker-v2-m3-int8` (extra `[fastembed]`); Voyage `rerank-2.5` (`provider: voyage`, paid, S20) |
+| `LLM` | `complete(messages) -> Completion` | `OpenAICompatLLM` (Ollama `/v1`, OpenAI, llm-gateway) | `AnthropicLLM` (extra `[anthropic]`), `FakeLLM` |
 
-`Store` 把向量和倒排放在同一个接口里，这样 PG 后端能在一个事务里完成一篇文档的所有写入。BM25 的公式写在 `keyword.py` 里；store 只提供一个 `bm25_query`，内部决定在哪里打分：PgStore 可以在 SQL 里打分（`store.bm25_impl: sql`，默认），也可以取回 posting 后交给 `keyword.bm25` 打分（`python`）。两种方式共用同一段统计量 SQL。Chroma 后端只用 Python 方式。
+`Store` keeps vectors and the inverted index in one interface, so the PG backend can finish all writes for one document in one transaction. The BM25 formula is in `keyword.py`; the store only offers `bm25_query` and decides inside where to score: PgStore can score in SQL (`store.bm25_impl: sql`, the default), or fetch the postings and hand them to `keyword.bm25` (`python`). Both ways share one statistics SQL. The Chroma backend uses only the Python way.
 
-库的入口有两层（S8 起）：`RagRuntime` 持有与 namespace 无关的东西（配置、store、embedder、token 计数器、chunker，以及首次用到时才建的 reranker / LLM），只建一次；`runtime.engine(namespace)` 返回绑定一个 namespace 的 `RagEngine`，很轻，每个请求建一个也没问题。HTTP 服务持有一个 runtime。只用一个 namespace 的库调用方可以直接用 `RagEngine.from_settings(settings, namespace)`，它自带一个 runtime，`close()` 时一并关闭。
+The library has two entry layers (since S8): `RagRuntime` holds everything that does not depend on a namespace (config, store, embedder, token counter, chunker, and the reranker / LLM, which are built on first use) and is built once; `runtime.engine(namespace)` returns a `RagEngine` bound to one namespace. It is very light, so building one per request is fine. The HTTP service holds one runtime. A library caller that uses only one namespace can call `RagEngine.from_settings(settings, namespace)` directly; it brings its own runtime, which is closed together with it on `close()`.
 
 ```python
-runtime = RagRuntime.from_settings(settings)   # 服务端：max_connections=工作线程数
-engine = runtime.engine("tenderted/tenant_42")  # 或 RagEngine.from_settings(settings, namespace)
-engine.ingest(kb, path)                                   # 文件 → 文档 id
-engine.upsert_text(kb, doc_id, title, text, metadata={})  # 已存在则整篇替换
+runtime = RagRuntime.from_settings(settings)   # server: max_connections = number of worker threads
+engine = runtime.engine("tenderted/tenant_42")  # or RagEngine.from_settings(settings, namespace)
+engine.ingest(kb, path)                                   # file → document id
+engine.upsert_text(kb, doc_id, title, text, metadata={})  # replaces the whole document if it exists
 engine.delete(kb, doc_id)
 engine.search(kb, query, top_k=5, mode="hybrid", rerank=False) -> list[Hit]
 engine.ask(kb, question, top_k=5) -> Answer
 engine.stats(kb)
 ```
 
-### 3.1 切块策略（每个 kb 单独配置）
+### 3.1 Chunking strategies (configured per kb)
 
-切块方式可以按 kb 配置，按名字从注册表里选实现；以后要加新策略，实现 `Chunker` Protocol 再注册即可。每个 chunk 都带上 `start`、`end` 字符偏移（用于引用定位）、`heading_path`（所在的标题层级）、`tokens`（真实 token 数）、`page`（起始所在页，1 起；文档没有分页时为空，S5b）和 `parent`（`parent_child` 时所属父块的序号）。用的是哪种策略记在 kb 一级（kb 身份），不逐块记录：一个 kb 里不可能混进两种策略切出的块。
+The chunking method can be configured per kb and is chosen by name from a registry; to add a strategy later, implement the `Chunker` Protocol and register it. Every chunk carries the character offsets `start` and `end` (used to locate citations), `heading_path` (the heading levels it sits under), `tokens` (the real token count), `page` (the page it starts on, from 1; empty when the document has no pages, S5b) and `parent` (the index of the parent chunk, for `parent_child`). Which strategy was used is recorded at kb level (the kb identity), not per chunk: one kb cannot contain chunks cut by two strategies.
 
-**先解析结构，再切块**（2026-11-08）：切块好坏一大半取决于解析时有没有保留结构。PDF 被拍平成纯文本后，任何 chunker 都恢复不出标题层级。所以加载器分两档：pypdf 快、无模型，只给纯文本和页码；docling 用版面模型把 PDF 转成 Markdown（每页之间插分页标记，所以页码也保留），交给 `markdown` 策略得到 `heading_path`。实测 docling 2.148 的两个限制见 §13 S5b 说明。
+**Parse structure first, then chunk** (2026-11-08): most of the quality of chunking depends on whether structure was kept at parsing. Once a PDF is flattened to plain text, no chunker can recover the heading levels. So the loaders come in two tiers: pypdf is fast and has no model, and gives only plain text and page numbers; docling uses a layout model to convert the PDF to Markdown (a page marker is inserted between pages, so page numbers are kept too) and hands it to the `markdown` strategy to get `heading_path`. The two limits of docling 2.148 that were measured are in the §13 S5b note.
 
-| 策略 | 做法 | 适用 | 阶段 |
+| Strategy | What it does | Fits | Stage |
 | --- | --- | --- | --- |
-| `fixed` | 按固定长度切，带重叠 | 基线，用于对比 | S2 |
-| `recursive`（默认） | 按分隔符层级递归切：标题 → 空行 → 换行 → 句末标点 → 空格，直到小于 `size`，再补上重叠 | 大多数文本 | S2 |
-| `sentence` | 按中英文句末标点切句，再按窗口合并（每块 N 句，重叠 M 句） | 问答、短事实 | S2 |
-| `paragraph` | 按空行切段，过短的段落向后合并，过长的再用 recursive 切 | 结构清晰的文章 | S2 |
-| `markdown` | 按标题层级切，块内用 recursive；`heading_path` 作为前缀写进 embedding 文本 | 文档、手册、wiki | S2 |
-| `semantic` | 按句切（标题仍然切开），整篇文档的句子一次 embed（走 kb 的 embedder 和缓存）；相邻两句的余弦距离高于全篇相邻距离的 `semantic_threshold` 分位数（默认 95，线性插值，所以全篇一个话题时不切）时断开，各组再按 `size` 打包 | 主题频繁切换的长文 | S5b |
-| `semantic`（`semantic_impl: chonkie`） | 用 chonkie 1.7.0 的 SemanticChunker（固定余弦相似度阈值 `chonkie_threshold`、3 句窗口、Savitzky-Golay 找谷），用 lite-rag 的 embedder 和 token 计数；外面仍保证 offset 精确、`size` 硬上限、不跨标题 | 和自写版对比（extra `[chonkie]`） | S5b |
-| `parent_child` | 父块：`markdown` 策略、`parent_size`（默认 4×`size`）、无重叠；子块：在每个父块内用 `recursive` 切，所以子块不跨父块。只有子块 embed 和建 BM25；父块存 `parents` 表。检索在子块上排序和 rerank，再换成父块并按父块去重：top-k 是 k 个不同的父块，`Hit.text` 是父块，`Hit.matched` 是命中的子块区间 | 需要精确命中、又需要上下文 | S5b |
-| `contextual`（增强器，`chunking.contextual.enabled`） | 可以叠加在任意策略上：用 LLM 为每个 chunk 写一两句"这段在全文中讲什么"（文档超过 `max_doc_tokens` 时只给以 chunk 为中心的一段），拼在 chunk 前面再做 embedding 和 BM25，存在 `chunks.context`，不出现在 `Hit.text`。kb 身份记录它的 provider/model 和提示词哈希；调用失败则整篇 upsert 失败，不换模型重试 | 指代多、单看一段看不懂的文档；每个 chunk 多一次 LLM 调用 | S5b |
+| `fixed` | Cuts at a fixed length, with overlap | Baseline, for comparison | S2 |
+| `recursive` (default) | Cuts recursively by a hierarchy of separators: heading → blank line → newline → sentence-end punctuation → space, until smaller than `size`, then adds overlap | Most text | S2 |
+| `sentence` | Splits sentences at Chinese and English sentence-end punctuation, then merges by window (N sentences per chunk, M sentences overlap) | Question answering, short facts | S2 |
+| `paragraph` | Splits paragraphs at blank lines, merges too-short paragraphs forward, and cuts too-long ones with recursive | Well-structured articles | S2 |
+| `markdown` | Cuts by heading level, with recursive inside a chunk; `heading_path` is written as a prefix into the embedding text | Documents, manuals, wikis | S2 |
+| `semantic` | Splits by sentence (headings still cut), embeds all sentences of the whole document at once (through the kb's embedder and cache); breaks where the cosine distance between two adjacent sentences is above the `semantic_threshold` percentile (default 95, linear interpolation, so a document with one topic is not cut) of the adjacent distances in the whole document, then packs each group by `size` | Long text with frequent topic changes | S5b |
+| `semantic` (`semantic_impl: chonkie`) | Uses the SemanticChunker of chonkie 1.7.0 (fixed cosine-similarity threshold `chonkie_threshold`, 3-sentence window, Savitzky-Golay valley finding), with lite-rag's embedder and token counter; outside it, exact offsets, the hard `size` limit and no crossing of headings are still guaranteed | Comparison with the self-written version (extra `[chonkie]`) | S5b |
+| `parent_child` | Parent chunk: `markdown` strategy, `parent_size` (default 4×`size`), no overlap; child chunk: cut with `recursive` inside each parent, so a child never crosses a parent. Only child chunks are embedded and get BM25; parent chunks are stored in the `parents` table. Retrieval ranks and reranks on child chunks, then swaps them for parents and dedups by parent: the top-k are k distinct parents, `Hit.text` is the parent, and `Hit.matched` is the range of the matching child | Needs exact hits and also needs context | S5b |
+| `contextual` (enhancer, `chunking.contextual.enabled`) | Can be stacked on any strategy: the LLM writes one or two sentences for each chunk saying "what this passage is about in the whole document" (when the document is longer than `max_doc_tokens`, it is given only the stretch centred on the chunk), which is put in front of the chunk before embedding and BM25, stored in `chunks.context`, and does not appear in `Hit.text`. The kb identity records its provider/model and the prompt hash; if a call fails, the whole upsert fails, with no retry on another model | Documents with many references that cannot be understood from one passage alone; one more LLM call per chunk | S5b |
 
-- **长度单位**：可以选 `chars` 或 `tokens`，默认 `tokens`，并且按 embedding 模型自己的 tokenizer 计数。KB 的教训是按词数切会失真（`rag-production-guide` §3）。拿不到 tokenizer 时用字符数估算，并记录这次是估算。
-- **配置示例**：`chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50}`。800/120 是 KB 里实测用过的起点，最终由 eval 决定。
-- **`size` 是硬上限**（embedding 模型有输入长度上限）：任何一步都不会产出超过 `size` 的块。最后一块小于 `min_size` 时，把最后两块重新均分，两块都不超过 `size`、尾块不小于 `min_size`；找不到这样的切分就保持原样。估算计数时，连续的字母或数字每 6 个算一个 token，所以超长的无空格串也会被切开。（Codex review，2026-11-08）
-- **改切块就要重建这个 kb**：`kbs` 表记录 chunker 配置，配置变了就要求重建（`literag reindex` 推迟到 S6：文档原文不存，重建需要源文件）。阈值也要重新校准，见 §5。新加的切块参数只在用到它的策略里进入身份（`parent_size` 只在 `parent_child`，`semantic_*` 只在 `semantic`，`contextual` 只在启用时），已有 kb 的身份不变。
-- 不在 v1 范围内：late chunking 和 proposition 切块。前者需要专门的长上下文 embedding 模型，后者每块都要一次 LLM 调用；等 eval 证明 S5b 不够用时再考虑。
+- **Length unit**: `chars` or `tokens`, default `tokens`, counted with the embedding model's own tokenizer. The lesson from the KB is that cutting by word count distorts (`rag-production-guide` §3). When no tokenizer is available, characters are used as an estimate, and the fact that this was an estimate is recorded.
+- **Config example**: `chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50}`. 800/120 is a starting point measured in the KB; the final choice is decided by eval.
+- **`size` is a hard limit** (the embedding model has an input length limit): no step produces a chunk larger than `size`. When the last chunk is smaller than `min_size`, the last two chunks are re-split evenly so that neither exceeds `size` and the tail is not smaller than `min_size`; if no such split is found, they are left as they were. When counting by estimate, every 6 consecutive letters or digits count as one token, so an overlong string without spaces is also cut. (Codex review, 2026-11-08)
+- **Changing the chunking means rebuilding the kb**: the `kbs` table records the chunker config, and a changed config requires a rebuild (`literag reindex` is postponed to S6: the original document text is not stored, so a rebuild needs the source files). Thresholds must be recalibrated too, see §5. A new chunking parameter enters the identity only in the strategy that uses it (`parent_size` only in `parent_child`, `semantic_*` only in `semantic`, `contextual` only when enabled), so the identity of an existing kb does not change.
+- Out of v1 scope: late chunking and proposition chunking. The former needs a dedicated long-context embedding model and the latter needs one LLM call per chunk; they will be considered when eval shows S5b is not enough.
 
-### 3.2 Embedding（每个 kb 固定一个模型）
+### 3.2 Embedding (each kb is fixed to one model)
 
-`Embedder` 分别提供 `embed_documents` 和 `embed_query`，因为很多模型要求区分文档和查询：例如 voyage 和 cohere 的 `input_type` 参数，以及 bge、e5、qwen3 这类模型给查询加的指令前缀。这些前缀写在每个模型的配置里，不写死在代码里。
+`Embedder` offers `embed_documents` and `embed_query` separately, because many models require documents and queries to be told apart: for example the `input_type` parameter of voyage and cohere, and the instruction prefix that models such as bge, e5 and qwen3 add to a query. These prefixes are written in each model's config, not hard-coded.
 
-| provider | 怎么调用 | 候选模型（S0/S5b 时按官方文档和 MTEB / C-MTEB 榜单核实后锁定） | 费用 |
+| provider | How it is called | Candidate models (locked after checking against the official docs and the MTEB / C-MTEB leaderboards at S0/S5b) | Cost |
 | --- | --- | --- | --- |
-| `ollama`（默认） | 本地 Ollama `/api/embed` | `bge-m3`（多语言，1024 维）、`qwen3-embedding`、`nomic-embed-text`、`mxbai-embed-large`、`snowflake-arctic-embed2` | 免费 |
-| `fastembed` | 进程内 ONNX，不需要 Ollama | `BAAI/bge-small-zh-v1.5`、`intfloat/multilingual-e5-*` 等 | 免费 |
-| `sentence_transformers` | 进程内 PyTorch（extra `[sentence-transformers]`，6.2.0；CPU / CUDA / Apple MPS；第一次用到时才加载 torch） | 任意 HF embedding 模型，例如 `Qwen/Qwen3-Embedding-0.6B` | 免费 |
-| `openai` | OpenAI 兼容的 `/v1/embeddings` | OpenAI `text-embedding-3-large` / `-small`（支持 `dimensions` 截断）；同一个实现也能接 DashScope（通义 `text-embedding-v*`）、SiliconFlow、Jina、vLLM、TEI | 付费（各家免费额度不一） |
-| `voyage` | lite-model 的 `voyage` 类型（S20 起；之前是直接 HTTP），`input_type` = query / document（Voyage 会自己在前面拼一句检索提示），`output_dimension`；每次最多 1000 条；key `VOYAGE_API_KEY` | `voyage-4-large`、`voyage-4`、`voyage-4-lite`、`voyage-3.5` 等。KB 中 tenderted 实测用过 voyage-3-large | 付费 |
-| `cohere` | lite-model 的 `cohere` 类型（S23 起；之前是直接 HTTP）`POST /v2/embed`，`input_type` = search_document / search_query，`embedding_types: [float]`；每次最多 96 条；key `CO_API_KEY` | `embed-v4.0`、`embed-multilingual-v3.0` 等 | 付费 |
-| `gemini` | lite-model 的 `gemini` 类型（S23 起；之前是直接 HTTP）`POST /v1beta/models/{model}:batchEmbedContents`，每条文本一个 Content（多个 part 放在一个 Content 里会被合成一个向量）；`gemini-embedding-001` 用 `taskType` = RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY，`gemini-embedding-2` 没有这个参数，任务写成前缀（见下表）；`outputDimensionality`；每次最多 100 条；key `GEMINI_API_KEY` | `gemini-embedding-2`、`gemini-embedding-001`（两者的向量空间不兼容） | 付费，有免费额度 |
+| `ollama` (default) | Local Ollama `/api/embed` | `bge-m3` (multilingual, 1024 dims), `qwen3-embedding`, `nomic-embed-text`, `mxbai-embed-large`, `snowflake-arctic-embed2` | Free |
+| `fastembed` | In-process ONNX, no Ollama needed | `BAAI/bge-small-zh-v1.5`, `intfloat/multilingual-e5-*`, etc. | Free |
+| `sentence_transformers` | In-process PyTorch (extra `[sentence-transformers]`, 6.2.0; CPU / CUDA / Apple MPS; torch is loaded on first use) | Any HF embedding model, for example `Qwen/Qwen3-Embedding-0.6B` | Free |
+| `openai` | OpenAI-compatible `/v1/embeddings` | OpenAI `text-embedding-3-large` / `-small` (support truncation by `dimensions`); the same implementation also reaches DashScope (Tongyi `text-embedding-v*`), SiliconFlow, Jina, vLLM, TEI | Paid (free quotas differ by vendor) |
+| `voyage` | lite-model's `voyage` type (since S20; before that, direct HTTP), `input_type` = query / document (Voyage prepends a retrieval prompt itself), `output_dimension`; at most 1000 items per call; key `VOYAGE_API_KEY` | `voyage-4-large`, `voyage-4`, `voyage-4-lite`, `voyage-3.5`, etc. The KB records tenderted measuring voyage-3-large | Paid |
+| `cohere` | lite-model's `cohere` type (since S23; before that, direct HTTP) `POST /v2/embed`, `input_type` = search_document / search_query, `embedding_types: [float]`; at most 96 items per call; key `CO_API_KEY` | `embed-v4.0`, `embed-multilingual-v3.0`, etc. | Paid |
+| `gemini` | lite-model's `gemini` type (since S23; before that, direct HTTP) `POST /v1beta/models/{model}:batchEmbedContents`, one Content per text (several parts in one Content are combined into one vector); `gemini-embedding-001` uses `taskType` = RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY, `gemini-embedding-2` has no such parameter and writes the task as a prefix (see the table below); `outputDimensionality`; at most 100 items per call; key `GEMINI_API_KEY` | `gemini-embedding-2`, `gemini-embedding-001` (their vector spaces are not compatible) | Paid, with a free quota |
 
-每个 provider 有自己的默认 `base_url`（`EMBEDDING_URLS`），`embedding.base_url` 可以覆盖（例如走代理）；`api_key_env` 不填时用各家 SDK 的惯例变量名。所有 HTTP embedder 都走 lite-model（S19 ollama / openai、S20 voyage、S23 cohere / gemini）：分批、并发、400 / 413 对半拆、同模型重试都是它的，lite-rag 只把自己的 `EmbeddingConfig` 换成 lite-model 的配置，并保留前缀、向量缓存和索引身份。（历史：S5c 时它们是 lite-rag 自己的直接 HTTP 调用，共用 `_HTTPEmbedder`；S23 删除。）进程内的 fastembed / sentence-transformers 留在 lite-rag（lite-model 不带 ONNX / torch，见它的设计 §3.4）。
+Each provider has its own default `base_url` (`EMBEDDING_URLS`), which `embedding.base_url` can override (for example to go through a proxy); when `api_key_env` is not set, the variable name that each vendor's SDK conventionally uses is used. All HTTP embedders go through lite-model (S19 ollama / openai, S20 voyage, S23 cohere / gemini): batching, concurrency, halving on 400 / 413 and same-model retries are its job; lite-rag only turns its own `EmbeddingConfig` into lite-model's config, and keeps the prefixes, the vector cache and the index identity. (History: at S5c they were lite-rag's own direct HTTP calls sharing `_HTTPEmbedder`; removed in S23.) The in-process fastembed / sentence-transformers stay in lite-rag (lite-model carries no ONNX / torch, see its design §3.4).
 
-- **"最好"由自己测**：榜单只能用来缩小候选范围。模型的取舍以本项目语料上的 `literag eval` 结果为准（AGENTS 规则 8）。所以 S5c 的验收是一张多模型对比表，列出 hit@k、MRR、延迟和费用（本地模型为 0；付费 API 只在用户提供 key 并同意后才跑）。
-- **接口**：每个 `Embedder` 都提供 `model_id`（`provider/model`，例如 `ollama/bge-m3:567m`）、`dim`、`prefixes`、`embed_documents` 和 `embed_query`。具体用哪个实现由配置决定，调用方只依赖这个接口。
-- **文档和查询的差异封装在实现里**（最容易踩的坑）：前缀用错不会报错，只会让检索质量悄悄下降。所以 `model_profiles.py` 维护一张已知模型的前缀表，embedder 自己按模型名加前缀，调用方不需要知道这些细节。下表来源是各模型在 Hugging Face 上的模型卡，2026-11-08 核实：
+- **"Best" is measured by ourselves**: a leaderboard can only narrow the candidates. The choice of model rests on the `literag eval` results on this project's corpus (AGENTS rule 8). So the acceptance of S5c is a multi-model comparison table that lists hit@k, MRR, latency and cost (0 for local models; paid APIs run only after the user provides a key and agrees).
+- **Interface**: every `Embedder` offers `model_id` (`provider/model`, for example `ollama/bge-m3:567m`), `dim`, `prefixes`, `embed_documents` and `embed_query`. Which implementation is used is decided by config; callers depend only on this interface.
+- **The difference between documents and queries is encapsulated in the implementation** (the easiest trap): a wrong prefix raises no error and only lowers retrieval quality silently. So `model_profiles.py` keeps a table of the prefixes of known models, and the embedder adds the prefix by model name itself; callers need not know these details. The table below comes from each model's model card on Hugging Face, checked on 2026-11-08:
 
-  | 模型 | 查询 | 文档 |
+  | Model | Query | Document |
   | --- | --- | --- |
-  | e5 系列 | `query: ` | `passage: `（必须加） |
-  | nomic-embed-text | `search_query: ` | `search_document: `（必须加） |
-  | bge-*-v1.5 | 中文 `为这个句子生成表示以用于检索相关文章：`，英文 `Represent this sentence for searching relevant passages:` | 不加 |
-  | bge-m3 | 不加 | 不加 |
-  | qwen3-embedding | `Instruct: <任务>\nQuery:` | 不加 |
-  | gemini-embedding-2 | `task: search result \| query: ` | `title: none \| text: `（官方格式是 `title: {标题} \| text: …`；lite-rag 的前缀是固定字符串，chunk 自带标题路径，所以用 `none`） |
+  | e5 family | `query: ` | `passage: ` (required) |
+  | nomic-embed-text | `search_query: ` | `search_document: ` (required) |
+  | bge-*-v1.5 | Chinese `为这个句子生成表示以用于检索相关文章：`, English `Represent this sentence for searching relevant passages:` | None |
+  | bge-m3 | None | None |
+  | qwen3-embedding | `Instruct: <task>\nQuery:` | None |
+  | gemini-embedding-2 | `task: search result \| query: ` | `title: none \| text: ` (the official format is `title: {title} \| text: …`; lite-rag's prefix is a fixed string and a chunk carries its own heading path, so `none` is used) |
 
-  配置里的 `query_prefix` / `document_prefix` 可以覆盖这张表，设为 `""` 表示不加。fastembed 和 sentence-transformers 都用普通的 encode 加上表里的前缀（不用它们自带的 query/passage 方法），所以 kb 记下的前缀就是实际加上去的前缀。Voyage、Cohere、gemini-embedding-001 用请求参数区分文档和查询，这个区分封装在各自的类里，前缀为空。
-- **索引绑定模型**（最重要；`rag-production-guide` §4 规则 2，也是 RAGFlow 换 embedding 时做的检查）：即使维度相同，不同模型的向量也不能混用，比如 bge-m3 和 voyage-3-large 都是 1024 维。`kbs` 表记录 `provider`、`model`、`dim`、查询前缀、文档前缀和切块配置，每次打开 kb（写入或查询）都会校验，不一致就报错，绝不返回错误的结果。换模型的做法是新建一个 kb、重新 embedding，例如命名为 `docs-voyage3`，不会在原索引上直接改。以后加 `literag reindex` 时，也是"建新 kb → 写入 → 验证 → 切换"这个流程。
-- **向量缓存**：每种维度一张 `embedding_cache_<dim>` 表，主键是 `(model_id, sha256(角色 ‖ 前缀 ‖ 文本))`。同一个模型遇到完全相同的输入就直接复用，跨 kb、跨 namespace 都共享，因为向量只取决于模型和输入，和存它的人无关。key 里包含角色（document / query），所以查询永远拿不到文档的向量。这样重复文本不会重复计算，切到付费模型以后也能省钱。可以用 `embedding.cache: false` 关掉。
-- **统一出口（可选）**：如果 llm-gateway 以后提供 OpenAI 兼容的 `/v1/embeddings`，把 `openai` provider 的 `base_url` 指向它即可。所有模型调用都从一个地方出去，用量统计也就集中了。这是 gateway 仓库的事，lite-rag 不需要改。
-- **批量与限流**：`batch_size`、并发上限（默认 4）以及遇到 429/5xx 时的退避重试（默认 4 次）都可以配置。重试的是同一个模型，这不算回退链；用尽重试后直接抛错，绝不返回空结果。
-- **维度截断**：模型支持截断（OpenAI `dimensions`、Gemini、Matryoshka 模型）时，可以配置 `dimensions`。PG 后端按维度分表（§4）。
-- 付费 provider 的 key 只从环境变量读取。测试里一律用 fake，或者回放录制好的响应，不会真的调用接口。
-- **各层先做什么**：先把 Embedder 和 Store 两层的抽象做好，因为它们决定数据怎么存，以后很难改。这两层已在 S1、S2 完成。Reranker 等真正需要时再加（S4）；LLM 走 llm-gateway 或 Ollama（S4）。默认存储仍然是 pgvector（2026-11-08 已定），Chroma 作为可选后端（S7）。
+  `query_prefix` / `document_prefix` in the config can override this table; setting `""` means no prefix. fastembed and sentence-transformers both use plain encode plus the prefix from the table (not their own query/passage methods), so the prefix recorded by the kb is the prefix actually added. Voyage, Cohere and gemini-embedding-001 tell documents from queries with a request parameter; this is encapsulated in their own classes, and the prefix is empty.
+- **The index is bound to the model** (the most important point; `rag-production-guide` §4 rule 2, and also the check RAGFlow makes when the embedding is changed): even when the dimensions are the same, vectors of different models must not be mixed, for example bge-m3 and voyage-3-large are both 1024 dims. The `kbs` table records `provider`, `model`, `dim`, the query prefix, the document prefix and the chunking config, and every time a kb is opened (to write or to query) they are checked; a mismatch raises an error, and a wrong result is never returned. To change the model, create a new kb and embed again, for example named `docs-voyage3`; the old index is not changed in place. When `literag reindex` is added later, it will follow the same flow: "build a new kb → write → verify → switch".
+- **Vector cache**: one `embedding_cache_<dim>` table per dimension, with primary key `(model_id, sha256(role ‖ prefix ‖ text))`. The same model reuses the result directly for exactly the same input, shared across kbs and namespaces, because a vector depends only on the model and the input, not on who stores it. The key includes the role (document / query), so a query never gets a document's vector. This way repeated text is not computed twice, and it also saves money after switching to a paid model. It can be turned off with `embedding.cache: false`.
+- **A single exit (optional)**: if llm-gateway later offers an OpenAI-compatible `/v1/embeddings`, point the `base_url` of the `openai` provider at it. All model calls then leave from one place, and usage statistics are centralised too. This is a matter for the gateway repo; lite-rag needs no change.
+- **Batching and rate limiting**: `batch_size`, the concurrency limit (default 4) and the backoff retry on 429/5xx (default 4 times) are all configurable. What is retried is the same model, which is not a fallback chain; after the retries are used up it raises directly, and never returns an empty result.
+- **Dimension truncation**: when a model supports truncation (OpenAI `dimensions`, Gemini, Matryoshka models), `dimensions` can be configured. The PG backend uses a separate table per dimension (§4).
+- The key of a paid provider is read only from environment variables. Tests always use fakes, or replay recorded responses, and never call a real API.
+- **What to do first in each layer**: first build the abstractions of the Embedder and Store layers, because they decide how data is stored and are hard to change later. These two layers were finished in S1 and S2. The Reranker is added when it is really needed (S4); the LLM goes through llm-gateway or Ollama (S4). The default storage is still pgvector (decided 2026-11-08), with Chroma as an optional backend (S7).
 
-## 4. 存储与 id
+## 4. Storage and ids
 
-### PostgreSQL 后端（默认）
+### PostgreSQL backend (default)
 
-库（例如 `lite_rag`）里有一个 schema（默认 `lite_rag`，可配置）。这些表由 `literag migrate` 创建，迁移脚本放在包内：
+The database (for example `lite_rag`) holds one schema (default `lite_rag`, configurable). These tables are created by `literag migrate`, and the migration scripts live inside the package:
 
-| 表 | 内容 |
+| Table | Content |
 | --- | --- |
-| `kbs` | `name`（主键）、`embedding_provider`、`embedding_model`、`dim`、`query_prefix`、`chunker`（JSON）、`n_chunks` 与 `total_length`（BM25 的 N 和 avgdl）、`created_at` |
-| `documents` | `kb`、`doc_id`、`title`、`source`、`content_hash`、`chunk_count`、`metadata` JSONB、`updated_at`；主键 `(kb, doc_id)` |
-| `chunks` | `id`（`"{doc_id}#{n}"`）、`kb`、`doc_id`、`n`、`text`、`length`（词数）、`metadata` JSONB |
-| `embeddings_<dim>` | `chunk_id`、`kb`、`embedding vector(<dim>)`，HNSW 索引（cosine）。每个维度一张表，首次使用时创建 |
-| `postings` | `kb`、`term`、`chunk_id`、`tf`；索引 `(kb, term)` |
-| `graph_mentions`（S11） | `kb`、`chunk_id`、`doc_id`、`entity`（规范化后的名字）、`name`、`type`：哪个 chunk 提到了哪个实体；随 chunk 级联删除 |
-| `graph_relations`（S11） | `kb`、`chunk_id`、`doc_id`、`source`、`target`、`description`：chunk 里抽出的关系；随 chunk 级联删除 |
+| `kbs` | `name` (primary key), `embedding_provider`, `embedding_model`, `dim`, `query_prefix`, `chunker` (JSON), `n_chunks` and `total_length` (N and avgdl of BM25), `created_at` |
+| `documents` | `kb`, `doc_id`, `title`, `source`, `content_hash`, `chunk_count`, `metadata` JSONB, `updated_at`; primary key `(kb, doc_id)` |
+| `chunks` | `id` (`"{doc_id}#{n}"`), `kb`, `doc_id`, `n`, `text`, `length` (word count), `metadata` JSONB |
+| `embeddings_<dim>` | `chunk_id`, `kb`, `embedding vector(<dim>)`, HNSW index (cosine). One table per dimension, created on first use |
+| `postings` | `kb`, `term`, `chunk_id`, `tf`; index `(kb, term)` |
+| `graph_mentions` (S11) | `kb`, `chunk_id`, `doc_id`, `entity` (the normalised name), `name`, `type`: which chunk mentions which entity; deleted by cascade with the chunk |
+| `graph_relations` (S11) | `kb`, `chunk_id`, `doc_id`, `source`, `target`, `description`: the relations extracted from a chunk; deleted by cascade with the chunk |
 
-- **一个事务**：`upsert_document` 在同一个事务里删掉旧的 chunk、embedding 和 posting，写入新的，再更新 `documents` 和 `kbs` 里的统计。没有中间状态，也不需要恢复逻辑。
-- **BM25 查询**：先在 SQL 里按 `(kb, term)` 取出 posting，同时拿到 `n(t)`、`N`、`avgdl`，再按第 5 节的公式打分。打分既可以在 Python 里算（`keyword.py`，便于阅读），也可以整段在 SQL 里算（快）。两种算法的结果用同一组测试核对。
-- **向量查询**：`ORDER BY embedding <=> :q LIMIT n`，按 `kb` 过滤。
+- **One transaction**: `upsert_document` deletes the old chunks, embeddings and postings in the same transaction, writes the new ones, and then updates the statistics in `documents` and `kbs`. There is no intermediate state and no recovery logic is needed.
+- **BM25 query**: first fetch the postings by `(kb, term)` in SQL, together with `n(t)`, `N` and `avgdl`, then score by the formula in section 5. Scoring can be done in Python (`keyword.py`, easy to read) or entirely in SQL (fast). The results of the two algorithms are checked against each other with the same set of tests.
+- **Vector query**: `ORDER BY embedding <=> :q LIMIT n`, filtered by `kb`.
 
-### Chroma 后端（可选，S7）
+### Chroma backend (optional, S7)
 
-- 配置 `store: {backend: chroma, data_dir: ./lite_rag_data}`（环境变量 `LITERAG_STORE__BACKEND`、`LITERAG_STORE__DATA_DIR`），extra `[chroma]`（`chromadb==1.5.9`，Apache-2.0，依赖很重，所以不进核心）。先 `literag migrate` 建好数据目录。数据目录下有两部分：
-  - `chroma/`：`PersistentClient`，关闭遥测（`anonymized_telemetry=False`）；每个 kb 一个 collection（cosine），名字取 kb 键的哈希（Chroma 只允许 `[a-zA-Z0-9._-]`）；
-  - `lite_rag.sqlite`：和 PG 后端同样的 `kbs`、`documents`、`chunks`、`parents`、`postings` 和向量缓存，迁移文件在 `migrations_sqlite/`；JSON 存 TEXT 列。N 和 avgdl 每次查询时从 `chunks` 现算，不在 `kbs` 上维护计数。
-- **BM25** 只用 Python 实现（`keyword.bm25`），默认 `bm25_impl: python`，配 `sql` 会在加载配置时报错。统计量和 PG 一样取整个 kb、在元数据过滤之前计算。
-- **元数据过滤**：文档元数据里的标量值（str、int、float、bool）复制到它每条 Chroma 记录上，过滤按相等比较（Chroma `$eq` / `$and`）；bool 不等于数字，两条检索路径一致。过滤值必须是标量，这条规则对两个后端一样，由引擎在开始检索前检查（见第 5 节）。
-- **写入不在一个事务里**：向量在 Chroma，其余在 SQLite。文档带状态：
-  - upsert：一个 SQLite 事务里删旧版本、写入新行，状态 `pending` → Chroma 删旧向量、分批写新向量（每批不超过 `get_max_batch_size()`）→ 标记 `ready`；
-  - 删除：标记 `deleting` → 删 Chroma 向量 → 删 SQLite 行；
-  - 读只看 `ready` 的文档；
-  - 打开 store 时，把 `pending`、`deleting` 的文档从两边都删掉，再删掉没有对应 kb 的 collection；调用方重新摄取即可（内容哈希保证幂等）。删 kb 时先删行再删 collection；建 kb 前先删同名的残留 collection，避免旧向量混进新 kb。
-  - 和 PG 的差别：写入失败（不是崩溃）时立即清理，所以失败的 upsert 会删掉这篇文档，而不是保留旧版本；PG 是整篇回滚、保留旧版本。
-- **并发**：只支持单进程；一把锁串行化 store 的所有操作，SQLite 开 WAL。多个进程共用一个数据目录不受支持。
-- 适合不想装 PG 的单机学习场景。合约测试（`tests/contract/`）对两个后端运行同一套用例。
+- Config `store: {backend: chroma, data_dir: ./lite_rag_data}` (environment variables `LITERAG_STORE__BACKEND`, `LITERAG_STORE__DATA_DIR`), extra `[chroma]` (`chromadb==1.5.9`, Apache-2.0, a heavy dependency, so it is not in the core). Run `literag migrate` first to create the data directory. The data directory has two parts:
+  - `chroma/`: a `PersistentClient` with telemetry off (`anonymized_telemetry=False`); one collection per kb (cosine), named by the hash of the kb key (Chroma allows only `[a-zA-Z0-9._-]`);
+  - `lite_rag.sqlite`: the same `kbs`, `documents`, `chunks`, `parents`, `postings` and vector cache as the PG backend, with migration files in `migrations_sqlite/`; JSON is stored in TEXT columns. N and avgdl are computed from `chunks` on every query; no counters are kept on `kbs`.
+- **BM25** is implemented in Python only (`keyword.bm25`); the default is `bm25_impl: python`, and setting `sql` raises an error when the config is loaded. As in PG, the statistics are taken over the whole kb, before the metadata filter.
+- **Metadata filter**: scalar values (str, int, float, bool) in the document metadata are copied onto each of its Chroma records, and filtering compares for equality (Chroma `$eq` / `$and`); bool is not equal to a number, in both retrieval paths. A filter value must be a scalar. This rule is the same for both backends and is checked by the engine before retrieval starts (see section 5).
+- **Writes are not in one transaction**: vectors are in Chroma, the rest in SQLite. A document carries a state:
+  - upsert: in one SQLite transaction, delete the old version and write the new rows, state `pending` → delete the old vectors in Chroma and write the new vectors in batches (each batch no larger than `get_max_batch_size()`) → mark `ready`;
+  - delete: mark `deleting` → delete the Chroma vectors → delete the SQLite rows;
+  - reads see only `ready` documents;
+  - when the store is opened, documents in `pending` and `deleting` are deleted from both sides, then collections without a matching kb are deleted; the caller just ingests again (the content hash keeps this idempotent). When a kb is deleted, the rows are deleted first and then the collection; before a kb is created, a leftover collection with the same name is deleted first, so that old vectors do not get mixed into the new kb.
+  - Difference from PG: when a write fails (not a crash) it is cleaned up at once, so a failed upsert deletes the document instead of keeping the old version; PG rolls the whole document back and keeps the old version.
+- **Concurrency**: single process only; one lock serialises all operations of the store, and SQLite runs in WAL mode. Several processes sharing one data directory is not supported.
+- Suited to single-machine learning where you do not want to install PG. The contract tests (`tests/contract/`) run the same cases against both backends.
 
-### Namespace（强制）
+### Namespace (mandatory)
 
-- **必须指定 namespace**：每个项目、以及项目里的每个租户，都有自己的 namespace，例如 `tenderted/tenant_42`。创建引擎时必须传入：`RagEngine.from_settings(settings, namespace="tenderted/tenant_42")`；CLI 用 `-n` 或 `LITERAG_NAMESPACE` 指定；以后的 HTTP API 由 API key 绑定 namespace。不传就直接报错。
-- **物理键**：kb 在库里的键是 `<namespace>:<kb>`，`kbs.namespace` 列用于列出某个 namespace 下的 kb。引擎的每一次读写都由它自己拼出这个键，调用方无法越过，kb 名里也不能出现 `:` 或 `/`。隔离在模块这一层强制执行，不依赖调用方自觉，就不会再出现 TenderTED 那种多个项目共用一个索引的问题。
-- **格式**：namespace 由小写字母、数字、`_`、`-`、`.` 组成，最多 4 级，用 `/` 分隔。
+- **A namespace must be given**: every project, and every tenant inside a project, has its own namespace, for example `tenderted/tenant_42`. It must be passed when the engine is created: `RagEngine.from_settings(settings, namespace="tenderted/tenant_42")`; the CLI takes it with `-n` or `LITERAG_NAMESPACE`; in the future HTTP API the API key binds the namespace. If it is not given, an error is raised at once.
+- **Physical key**: the key of a kb in the database is `<namespace>:<kb>`, and the `kbs.namespace` column is used to list the kbs under a namespace. Every read and write of the engine builds this key itself, so a caller cannot get around it, and a kb name cannot contain `:` or `/`. Isolation is enforced at the module level and does not depend on callers behaving, so the TenderTED problem of several projects sharing one index cannot happen again.
+- **Format**: a namespace consists of lowercase letters, digits, `_`, `-` and `.`, with at most 4 levels, separated by `/`.
 
-### 通用规则
+### General rules
 
-- **id 规则**：文档 id 由调用方给出（`upsert_text`），或者由文件路径的哈希生成（`ingest`）。chunk id 是 `"{doc_id}#{n}"`。
-- **幂等**：`content_hash` 和 chunker 配置都没变时，`upsert_text` 直接返回；否则整篇替换。
-- **换 embedding 模型**：`kbs` 表记录了每个 kb 的模型和维度。配置与记录不一致时拒绝打开，并提示运行 `literag reindex <kb>`。
+- **Id rule**: a document id is given by the caller (`upsert_text`), or generated from the hash of the file path (`ingest`). A chunk id is `"{doc_id}#{n}"`.
+- **Idempotent**: when neither `content_hash` nor the chunker config has changed, `upsert_text` returns at once; otherwise the whole document is replaced.
+- **Changing the embedding model**: the `kbs` table records the model and dimension of every kb. When the config and the record differ, opening is refused, with a hint to run `literag reindex <kb>`.
 
-### Lineage 与查询 trace（S25）
+### Lineage and query trace (S25)
 
-详细设计见 `docs/superpowers/specs/2026-11-24-lineage-design.md`。这里只列表和规则：
+The detailed design is in `docs/superpowers/specs/2026-11-24-lineage-design.md`. Only the tables and rules are listed here:
 
-| 表 | 内容 |
+| Table | Content |
 | --- | --- |
-| `lineage_artifacts` / `lineage_edges` / `lineage_schema_migrations` | 通用账本（`lite_rag.lineage`，不认识 RAG）：产物的版本、派生边；迁移由 `literag migrate` / `lite_rag.db.migrate` 一起执行 |
-| `chunks.lineage_key`（0007） | chunk 的账本 key `{doc_id}/{原文 hash 前 16 位}/{k}`，写入时算好，检索时读出 |
-| `rag_query_traces` / `rag_query_sources`（0008） | 一次检索或问答，以及各阶段用到的 chunk（按检索时读到的 `lineage_key`）；`in_context` 不存，读时取最后一个排序阶段的前 `top_k` |
+| `lineage_artifacts` / `lineage_edges` / `lineage_schema_migrations` | A generic ledger (`lite_rag.lineage`, which knows nothing about RAG): artifact versions and derivation edges; its migrations are run together by `literag migrate` / `lite_rag.db.migrate` |
+| `chunks.lineage_key` (0007) | The chunk's ledger key `{doc_id}/{first 16 chars of the source hash}/{k}`, computed at write time and read at retrieval time |
+| `rag_query_traces` / `rag_query_sources` (0008) | One retrieval or question, and the chunks used at each stage (by the `lineage_key` read at retrieval time); `in_context` is not stored, and at read time it is taken as the first `top_k` of the last ranking stage |
 
-- 每次 upsert / delete / delete_kb 在同一事务里记账（`lineage.enabled`，默认开）。chunk 按原文认身份：原文没变的 chunk 复用旧产物、补一条边，位置和 context 记在边上；文档的新版本不再含有的 chunk 才结束。
-- 删除的产物立即清空原文和 metadata（title / source）；被取代的保留原文 `lineage.keep_text_days`（`literag lineage gc` 清），行永久保留。contextual 上下文不进账本。
-- `literag lineage backfill` 也把关账本期间删除的文档记为 deleted；关账本期间 drop 掉的整个 kb 修不回来。
-- trace（`trace.enabled`，默认关）的时间取在读完 chunk 之后；`trace show` 用 `started_by` 找当时读到的版本：已结束即"过期"，并显示原文。
-- 账本调用方必须串行化同一 namespace 的写入；lite-rag 的 namespace 就是 kb 物理键，PG 写入持有 kb 行锁。
+- Every upsert / delete / delete_kb is recorded in the ledger in the same transaction (`lineage.enabled`, on by default). A chunk gets its identity from its source text: a chunk whose text did not change reuses the old artifact and gets one more edge, with its position and context recorded on the edge; only a chunk that the new version of the document no longer contains is ended.
+- A deleted artifact has its text and metadata (title / source) cleared at once; a superseded one keeps its text for `lineage.keep_text_days` (cleaned by `literag lineage gc`), and the row is kept for ever. The contextual context does not enter the ledger.
+- `literag lineage backfill` also records documents deleted while the ledger was off as deleted; a whole kb that was dropped while the ledger was off cannot be recovered.
+- The time of a trace (`trace.enabled`, off by default) is taken after the chunks have been read; `trace show` uses `started_by` to find the version that was read at that time: if it has ended, it is "stale", and the source text is shown.
+- A caller of the ledger must serialise writes of the same namespace; lite-rag's namespace is the kb physical key, and a PG write holds the kb row lock.
 
-## 5. 检索
+## 5. Retrieval
 
-- **向量**：先对 query 做 embedding，再取 top-n（n = `top_k × candidate_factor`，默认取 4 倍）。
-- **BM25**：中文用 jieba 分词，英文转小写；停用词表可配置。采用标准公式：
+- **Vector**: first embed the query, then take the top-n (n = `top_k × candidate_factor`, 4 times by default).
+- **BM25**: Chinese is tokenised with jieba and English is lowercased; the stop word list is configurable. The standard formula is used:
 
-  `score(q, d) = Σ IDF(t) · f(t,d)·(k1+1) / (f(t,d) + k1·(1 − b + b·|d|/avgdl))`，
-  `IDF(t) = ln(1 + (N − n(t) + 0.5)/(n(t) + 0.5))`，默认 `k1=1.5`、`b=0.75`。
-- **融合**：默认用 RRF，`score = Σ 1/(k + rank)`，`k=60`。也可以选加权融合：两路分数先各自做 min-max 归一化，再按权重相加。
-- **Rerank**（可选）：取融合后的前 n 条，用 cross-encoder 对每个 `(query, chunk)` 对重新打分，再取前 k 条。
-- **模式**：`vector`、`bm25`、`hybrid`（S11 起还有 `graph`）；S21 起还有 `route`：`route` role（默认本地 qwen3:1.7b、不思考）对每个问题从 `retrieval.router.modes` 里选一种，每个 `Hit.route` 记下选了什么、哪个模型选的、理由；调用失败就报错，没有默认模式可退。每个 `Hit` 都带各阶段的分数 `scores={vector, bm25, fused, rerank}` 和排名，方便对比和调试。
-- **多个 kb 一起查**（S10，2026-11-09，为 llm-steward 的联合检索）：`RagEngine.search_kbs(kbs, query, …)` 把同一 namespace 里的几个 kb 当成一个来查。query 只嵌入一次；每一路（向量、BM25）在各 kb 取前 n 条，按分数合并成一张表，再只融合一次、只 rerank 一次。结果的 `Hit.kb` 标明来源（chunk id 只在 kb 内唯一，内部用"kb 序号/chunk id"作键）。向量分数在 kb 之间可比（一个引擎只有一个模型）；BM25 的 IDF 是各 kb 自己统计的，合并后的 BM25 表是近似的：小 kb 里同一个词的 IDF 更高，分数偏大，在默认路径（rerank 关）上会占到合并后 BM25 表的前排。开 rerank 时最终顺序完全可比。查询次数随 kb 数增长（每一轮每个 kb 两路各一次，加深时每个 kb 都重查）。留到以后：偏差成问题时，让 Store 返回每个 kb 的 (N, df(t), avgdl)，由引擎算统一的 IDF；kb 多时把各 kb 的查询并行，或在 PG 上一条 SQL 查多个 kb 的向量。还没写过文档（不存在）的 kb 跳过；名字不合法仍是 `InvalidRequest`。单 kb 的 `search` 走同一套流程，结果不变。
-- **图检索**（S11，2026-11-12，只做 local、只支持 PG）：
-  - **建库**：kb 开了 `graph.enabled` 时，每个 chunk 调一次 LLM（role `graph`，默认本地 qwen3、关闭思考），按 `prompts/graph_*.j2` 抽出实体（名字、类型）和关系（两端实体、一句描述），回复受 JSON schema 约束（S16 起，`GraphReply`：`entities`、`relations` 两个列表都要有，没找到就是空列表）。只给 LLM 看 chunk 正文，不给文档标题：给了标题，本地模型会把标题当成每个 chunk 的实体，成为连接一切的枢纽（实测）。回复仍不合 schema 时用同一个 prompt 再要一次，第二次还不合就整篇写入失败，不换别的模型（规则 5）。关系端点不在实体列表里时补成实体。实体按规范化的名字合并（NFKC、casefold、合并空白），所以同一个人在不同文档里是同一个节点。图和 chunk 在同一个事务里写；抽取模型和 prompt 记进 kb 的身份（`chunker.graph`），换了就要新 kb。Chroma 后端不支持，配置时就报错。
-  - **查询**（`graph` 路径，不调 LLM）：**图圈范围，向量排序。**
-    1. **种子**：名字（规范化后）是 query 子串的实体，至少 2 个字符；名字被包含在 2 个以上其他实体名里的不算（"委员会"、"council" 这类类别词）。
-    2. **扩展**：沿"同一个 chunk 里同时被提到"走：实体 → 提到它的 chunk → 这些 chunk 里的其他实体，共 `graph.hops` 跳（默认 2，即答案离问题点名的实体隔两篇文档）。被超过 `graph.hub_chunks` 个 chunk（默认 5）提到的实体是枢纽（公司名、贯穿全文的主题）：不经过它扩展，也不通过它把 chunk 纳入范围。每跳只留连接 chunk 最多的 `graph.max_neighbors` 个新实体。
-    3. **排序**：到达的 chunk 按与 query 向量的余弦相似度排序（`vector_query(…, among=到达的 chunk)`，按主键精确扫描，不走 HNSW）。分数因此与 vector 路径可比。
-    `where` 限定的是整个语料：种子只从保留下来的文档里找，走图也只经过它们，被过滤掉的文档既不出现在结果里，也不能当桥（S11 收尾时 Codex 指出，2026-11-12）。一次检索里每个 kb 的图只走一次，加深轮次只重新排序。种子规则和枢纽规则都在 `graph.py`，store 只返回数据。
-    走共现而不走抽出的关系，是因为本地模型漏掉了很多它本可以写出的关系（中文人员小节几乎没有关系）；关系照样存下，留给以后的 global 模式和回答上下文。
-  - **为什么这样打分**（2026-11-12 多跳评测，12 道 2–3 跳题，离线比较）：第一版按"实体权重之和"给 chunk 打分，种子所在的 chunk 永远最高，答案被压在后面，多跳 hit@5 只有 0.42，单跳对照题也从 1.00 掉到 0.25；用向量找种子带来大量噪音。"图圈范围、向量排序"多跳 hit@5 0.92、单跳不受影响。多跳题的 hit@1 在所有方式下都是 0：排第一的通常是推理链的第一环（种子所在 chunk），答案紧随其后；回答时两者都要交给 LLM，所以这类题看 hit@5。
-  - **模式**：新增 `mode: graph`（只走图）。`hybrid` 包含哪几路由 `retrieval.hybrid_paths` 决定，默认 `[vector, bm25]`（行为不变），加上 `graph` 就是多路 RRF。加权融合只支持 vector + bm25，配了 graph 会报错。kb 没开图时用 `mode: graph` 报 `InvalidRequest`。
-  - **代价**：建库每个 chunk 一次 LLM 调用；查询多 2–3 条 SQL 加一次限定范围的向量查询。种子匹配扫描整个 kb 的实体名，规模大到成为瓶颈时再加索引。
-  - **局限**：问题必须写出实体的名字（"Atlas 项目的负责人"能找到"atlas 项目"，只写"Atlas"找不到）；`hub_chunks` 是绝对数，语料大了要调。
-  - **不做**（S11b 再定）：global 模式（社区划分 + 社区摘要，回答整批文档的汇总题）、查询时用 LLM 抽关键词或实体向量找种子、实体描述的合并摘要。
-- **过滤**：先按 namespace 和 kb 隔离；`where` 是"键 → 标量值"（str、int、float、bool）的等值过滤，向量和 BM25 两路都会生效；bool 不等于数字。值不是标量（列表、对象、null）会报 `InvalidRequest`（400），在嵌入查询之前就检查，两个后端规则相同（S8 定，2026-11-09）。
+  `score(q, d) = Σ IDF(t) · f(t,d)·(k1+1) / (f(t,d) + k1·(1 − b + b·|d|/avgdl))`,
+  `IDF(t) = ln(1 + (N − n(t) + 0.5)/(n(t) + 0.5))`, with default `k1=1.5` and `b=0.75`.
+- **Fusion**: RRF by default, `score = Σ 1/(k + rank)`, `k=60`. Weighted fusion can also be chosen: the scores of the two paths are first min-max normalised separately, then added by weight.
+- **Rerank** (optional): take the first n after fusion, rescore each `(query, chunk)` pair with the cross-encoder, then take the first k.
+- **Modes**: `vector`, `bm25`, `hybrid` (and `graph` since S11); and `route` since S21: the `route` role (local qwen3:1.7b by default, no thinking) picks one mode from `retrieval.router.modes` for each question, and every `Hit.route` records what was picked, which model picked it, and the reason; if the call fails it raises an error, and there is no default mode to fall back to. Every `Hit` carries the scores of each stage `scores={vector, bm25, fused, rerank}` and the ranks, for comparison and debugging.
+- **Querying several kbs together** (S10, 2026-11-09, for llm-steward's joint retrieval): `RagEngine.search_kbs(kbs, query, …)` queries several kbs of the same namespace as one. The query is embedded only once; each path (vector, BM25) takes the first n from each kb, merges them into one list by score, and then fuses only once and reranks only once. `Hit.kb` of a result says where it came from (a chunk id is unique only inside a kb, so internally "kb index/chunk id" is used as the key). Vector scores are comparable across kbs (one engine has only one model); the IDF of BM25 is counted by each kb itself, so the merged BM25 list is approximate: in a small kb the IDF of the same word is higher and the score is too large, and on the default path (rerank off) it takes the front places of the merged BM25 list. When rerank is on, the final order is fully comparable. The number of queries grows with the number of kbs (in every round, one query per path per kb; when deepening, every kb is queried again). Left for later: when the bias becomes a problem, have the Store return the (N, df(t), avgdl) of each kb and let the engine compute one common IDF; when there are many kbs, run the kb queries in parallel, or query the vectors of several kbs with one SQL on PG. A kb that has no document written yet (does not exist) is skipped; an invalid name is still `InvalidRequest`. `search` on a single kb goes through the same flow, and its result does not change.
+- **Graph retrieval** (S11, 2026-11-12, local mode only, PG only):
+  - **Building**: when a kb has `graph.enabled`, each chunk gets one LLM call (role `graph`, local qwen3 by default, thinking off), which extracts entities (name, type) and relations (the two end entities, a one-sentence description) following `prompts/graph_*.j2`; the reply is held to a JSON schema (since S16, `GraphReply`: both lists `entities` and `relations` must be present, and are empty lists when nothing was found). The LLM sees only the chunk body, not the document title: when given the title, a local model takes the title as an entity of every chunk, and it becomes a hub connecting everything (measured). When the reply still does not fit the schema, it is asked once more with the same prompt, and if the second one still does not fit, the whole document write fails, with no other model tried (rule 5). When a relation endpoint is not in the entity list, it is added as an entity. Entities are merged by normalised name (NFKC, casefold, merged whitespace), so the same person in different documents is one node. The graph is written in the same transaction as the chunks; the extraction model and prompt are recorded in the kb identity (`chunker.graph`), so changing them needs a new kb. The Chroma backend does not support it, and it errors at config time.
+  - **Query** (the `graph` path, no LLM call): **the graph sets the range, vectors rank.**
+    1. **Seeds**: entities whose name (normalised) is a substring of the query, at least 2 characters; an entity whose name is contained in 2 or more other entity names does not count (category words such as "委员会" (committee), "council").
+    2. **Expansion**: follow "mentioned together in the same chunk": entity → chunks that mention it → other entities in those chunks, for `graph.hops` hops (default 2, that is, the answer is two documents away from the entity the question names). An entity mentioned by more than `graph.hub_chunks` chunks (default 5) is a hub (a company name, a topic that runs through the whole text): it is not expanded through, and it does not bring chunks into the range. In each hop only the `graph.max_neighbors` new entities with the most connecting chunks are kept.
+    3. **Ranking**: the chunks reached are ranked by cosine similarity to the query vector (`vector_query(…, among=reached chunks)`, an exact scan by primary key, not through HNSW). The scores are therefore comparable with those of the vector path.
+    `where` limits the whole corpus: seeds are looked for only in the documents that are kept, and the graph walk goes only through them; a document that is filtered out neither appears in the result nor serves as a bridge (pointed out by Codex at the close-out of S11, 2026-11-12). In one retrieval the graph of each kb is walked only once; deepening rounds only re-rank. The seed rule and the hub rule are both in `graph.py`, and the store returns only data.
+    It walks co-occurrence and not the extracted relations, because the local model missed many relations it could have written (the Chinese people sections have almost no relations); the relations are stored all the same, kept for a later global mode and for the answer context.
+  - **Why it is scored this way** (2026-11-12 multi-hop eval, 12 questions of 2–3 hops, compared offline): the first version scored a chunk by "the sum of entity weights"; the chunk holding the seed was always highest and the answer was pushed back, multi-hop hit@5 was only 0.42, and the single-hop control questions also dropped from 1.00 to 0.25; finding seeds by vector brought a lot of noise. "The graph sets the range, vectors rank" gives multi-hop hit@5 0.92 and leaves single-hop unaffected. The hit@1 of multi-hop questions is 0 under every method: the one ranked first is usually the first link of the reasoning chain (the chunk holding the seed), and the answer follows right behind; when answering, both are given to the LLM, so for this kind of question hit@5 is what counts.
+  - **Mode**: a new `mode: graph` (graph only). Which paths `hybrid` contains is decided by `retrieval.hybrid_paths`, default `[vector, bm25]` (behaviour unchanged); adding `graph` makes it multi-path RRF. Weighted fusion supports only vector + bm25, and configuring graph raises an error. Using `mode: graph` on a kb without a graph raises `InvalidRequest`.
+  - **Cost**: building takes one LLM call per chunk; a query takes 2–3 more SQL statements plus one range-limited vector query. Seed matching scans the entity names of the whole kb; an index is added when the size makes it a bottleneck.
+  - **Limits**: the question must write the name of the entity ("Atlas 项目的负责人" (the head of the Atlas project) can find "atlas 项目", but "Atlas" alone cannot); `hub_chunks` is an absolute number and must be tuned when the corpus grows.
+  - **Not done** (to be decided in S11b): global mode (community partition + community summaries, to answer summary questions over a whole batch of documents), using the LLM at query time to extract keywords, or entity vectors, to find seeds, and merged summaries of entity descriptions.
+- **Filter**: isolation by namespace and kb comes first; `where` is an equality filter of "key → scalar value" (str, int, float, bool), which takes effect in both the vector and the BM25 path; bool is not equal to a number. A value that is not a scalar (list, object, null) raises `InvalidRequest` (400), checked before the query is embedded, with the same rule in both backends (decided in S8, 2026-11-09).
 
-## 6. 生成
+## 6. Generation
 
-- **提示词模板** `prompts/answer_system.j2` + `prompts/answer_user.j2`：
-  - 检索到的 chunk 依次编号为 `[1] … [k]`；
-  - 要求只依据这些资料回答，并标注引用的编号；
-  - 资料不足时，直接说明资料不足。
-- **`Answer` 包含**：
-  - 回答正文；
-  - `citations`：引用了哪些 chunk id，代码会核对每个编号都在检索结果里；
-  - `model_id`：`backend/model`，**实际回答的模型**（S15 起从响应里读，由 lite-model 按后端读取：直连 Ollama 是
-    模型名，经 LiteLLM 是 `x-litellm-model-name`）；没有调用模型时为 `None`。S14 的过渡字段 `response_model` 删除；
-  - token 用量。
-- **没有回退链**：一次调用失败就抛出 `LLMError`（HTTP 502），只在同一个模型上重试；错误信息不带上游原文。
-  回答被截断（到了 `max_output_tokens`）也是 `LLMError`，不再把半个回答当完整的返回（S15，主人定）。
-- **LLM 调用由 lite-model 完成**（S15，lite-model 设计 §12）：三个 role——`answer`、`contextual`、`graph`——是同一份
-  lite-model 配置 `llm` 的三个 role。`contextual` 和 `graph` 是索引身份的一部分，**不可路由**（LiteLLM 的路由别名在
-  启动时被拒绝）；`answer` 可以。
+- **Prompt templates** `prompts/answer_system.j2` + `prompts/answer_user.j2`:
+  - the retrieved chunks are numbered `[1] … [k]` in order;
+  - the model is asked to answer only from these materials and to mark the numbers it cites;
+  - when the materials are not enough, it says so directly.
+- **`Answer` contains**:
+  - the answer text;
+  - `citations`: which chunk ids were cited; the code checks that every number is in the retrieval result;
+  - `model_id`: `backend/model`, **the model that actually answered** (read from the response since S15, by lite-model according to the backend: with direct Ollama it is the
+    model name, through LiteLLM it is `x-litellm-model-name`); `None` when no model was called. The transitional field `response_model` of S14 is removed;
+  - token usage.
+- **No fallback chain**: when a call fails it raises `LLMError` (HTTP 502), and retries only on the same model; the error message does not carry the upstream text.
+  A truncated answer (it reached `max_output_tokens`) is also an `LLMError`; half an answer is no longer returned as a complete one (S15, decided by the owner).
+- **LLM calls are made by lite-model** (S15, lite-model design §12): the three roles — `answer`, `contextual`, `graph` — are three roles of the same
+  lite-model config `llm`. `contextual` and `graph` are part of the index identity and are **not routable** (a LiteLLM routing alias is
+  rejected at start-up); `answer` is.
 
 ```yaml
-llm:                      # lite-model 的 ModelsConfig（它的设计 §4），带 lite-rag 的默认值
-  backend: ollama         # ollama | openai | anthropic | gateway | litellm，或自己命名的 backend
-  model: qwen3:8b         # 顶层的 backend、model 和调用参数只调 answer（和 S15 之前的 `llm` 一样）
+llm:                      # lite-model's ModelsConfig (its design §4), with lite-rag's defaults
+  backend: ollama         # ollama | openai | anthropic | gateway | litellm, or a backend you name yourself
+  model: qwen3:8b         # the top-level backend, model and call parameters tune only answer (as `llm` did before S15)
   max_output_tokens: 1024
   connect_timeout_s: 5
-  roles:                  # contextual、graph 默认固定在 ollama/qwen3:1.7b、不思考（S17；graph 2048 token），逐字段可改
+  roles:                  # contextual and graph default to ollama/qwen3:1.7b, no thinking (S17; graph 2048 tokens), each field can be changed
     graph: {model: qwen3:14b}
-  backends:               # 同名逐字段改：openai 兼容厂商用 openai 这个名字，记录仍是 openai/<model>
+  backends:               # same name, field by field: an openai-compatible vendor uses the name openai, and the record is still openai/<model>
     openai: {base_url: "https://api.deepseek.com/v1", api_key_env: DEEPSEEK_API_KEY}
 ```
 
-  顶层的 `temperature`、`reasoning_effort`、`max_output_tokens` 移到 `roles.answer`（answer 自己写的优先）：contextual、
-  graph 只从 `llm.roles` 取值，否则同一个索引身份下新 chunk 的上下文和图会换一种方式生成（Codex S15）。
-  role 的 id 是 `backend/model`（配置的模型），写进索引身份（`chunking.contextual`、`graph`），和 S15 之前的
-  `provider/model` 逐字节相同，已有的 kb 不用重建。S15 之前的形状（`llm.provider`、`llm.base_url`、
-  `llm.api_key_env`、`llm.max_tokens_param`、`chunking.contextual.llm`、`graph.llm`）启动时被拒绝，并说明搬到了哪里。
-  key 只从环境变量读取。
+  The top-level `temperature`, `reasoning_effort` and `max_output_tokens` move to `roles.answer` (what answer writes itself wins): contextual and
+  graph take values only from `llm.roles`; otherwise the context and graph of new chunks under the same index identity would be generated in a different way (Codex S15).
+  The role id is `backend/model` (the configured model) and is written into the index identity (`chunking.contextual`, `graph`); it is byte-for-byte the same as the
+  `provider/model` before S15, so existing kbs need no rebuild. The pre-S15 shapes (`llm.provider`, `llm.base_url`,
+  `llm.api_key_env`, `llm.max_tokens_param`, `chunking.contextual.llm`, `graph.llm`) are rejected at start-up, with a message saying where they moved to.
+  Keys are read only from environment variables.
 
-## 7. HTTP 服务（`literag serve`）
+## 7. HTTP service (`literag serve`)
 
-FastAPI，默认地址 `127.0.0.1:8700`。和库一样，所有调用都经过 `RagEngine`。
+FastAPI, default address `127.0.0.1:8700`. As with the library, every call goes through `RagEngine`.
 
-| 端点 | 作用 |
+| Endpoint | Purpose |
 | --- | --- |
-| `GET /health` | 不需要鉴权；检查存储和 embedding 服务 |
-| `PUT /v1/kbs/{kb}` · `GET /v1/kbs` · `GET/DELETE /v1/kbs/{kb}` | 建 kb（指定 chunker 与 embedding 模型）、列出、查看统计、删除 |
-| `PUT /v1/kbs/{kb}/documents/{doc_id}` | upsert 一篇文本文档（`title`、`text`、`metadata`） |
-| `POST /v1/kbs/{kb}/files` | 上传文件（multipart），返回 `doc_id` |
-| `DELETE /v1/kbs/{kb}/documents/{doc_id}` | 删除文档 |
-| `POST /v1/kbs/{kb}/search` | `{query, top_k, mode, rerank, where}` → hits（带各阶段分数） |
-| `POST /v1/search` | `{kbs, query, top_k, mode, rerank, where}` → 几个 kb 一起查（S10）；key 必须覆盖每一个 kb，否则 403 |
-| `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer（带引用和出处；`model_id` 是实际回答的模型，S15，见 §6；S14 的 `response_model` 已删除） |
+| `GET /health` | No authentication needed; checks the storage and the embedding service |
+| `PUT /v1/kbs/{kb}` · `GET /v1/kbs` · `GET/DELETE /v1/kbs/{kb}` | Create a kb (with its chunker and embedding model), list, view statistics, delete |
+| `PUT /v1/kbs/{kb}/documents/{doc_id}` | Upsert one text document (`title`, `text`, `metadata`) |
+| `POST /v1/kbs/{kb}/files` | Upload a file (multipart), returns `doc_id` |
+| `DELETE /v1/kbs/{kb}/documents/{doc_id}` | Delete a document |
+| `POST /v1/kbs/{kb}/search` | `{query, top_k, mode, rerank, where}` → hits (with the scores of each stage) |
+| `POST /v1/search` | `{kbs, query, top_k, mode, rerank, where}` → query several kbs together (S10); the key must cover every kb, otherwise 403 |
+| `POST /v1/kbs/{kb}/ask` | `{question, top_k}` → answer (with citations and sources; `model_id` is the model that actually answered, S15, see §6; the `response_model` of S14 is removed) |
 
-- **鉴权**（S6，KB web-authz：默认拒绝）：`Authorization: Bearer lrk_<prefix>_<secret>`。服务端只保存 key 的 `sha256`，配置在 `server.keys`（YAML，或 `LITERAG_SERVER__KEYS` 设为 JSON 列表）。每个 key 有 `namespaces`、`kbs` 两组 glob（`*` 可以跨 `/`，例如 `steward/*`）和 `mode`（`read` / `write`）；没有默认 namespace，不写就没有访问权限。`literag key create` 生成新 key，只打印一次，同时给出要加进配置的那一条；**没有任何 HTTP 路由能创建 key**。不配 key 时服务完全开放，所以 `serve` 只允许绑定回环地址。
-- **namespace**：每个请求用 `X-LiteRag-Namespace` 头指定（namespace 本身含 `/`，放进路径不干净）。缺这个头返回 400；key 不覆盖这个 namespace 或这个 kb 返回 403，只读 key 写入也是 403；没有 key 或 key 不认识返回 401，带 `WWW-Authenticate: Bearer`。服务端持有一个 `RagRuntime`，每个请求用 `runtime.engine(namespace)` 取一个引擎，共用 store、embedder、chunker 和模型。
-- **有意不加鉴权的路径**只有 `GET /health`（`?deep=true` 时还会 embed 一条缓存过的探测查询）。
-- **错误格式**：RFC 9457 Problem Details（`application/problem+json`）：`KbNotFound` / `DocumentNotFound` 404、kb 配置不一致（`KbMismatch`）409、调用方的错误（`InvalidRequest`：名字、参数、文件类型、过滤值）400、请求校验失败 422、embedding / LLM 失败 502、存储失败 503、服务自身配置错误（`ConfigError`：extra 没装、API key 没设、模型不存在）500。上游失败和服务配置错误的细节只写日志，不返回给客户端（里面可能有地址、供应商的报错原文或环境变量名）。
-- **请求体上限**：所有请求在解析之前就按大小检查（JSON `server.max_body_mb`，默认 10；上传 `server.max_upload_mb`），超过返回 413。开放模式（不配 key）只接受本机的 Host（防 DNS rebinding），并拒绝带 `Origin`（浏览器网页发的）或代理头（`Forwarded`、`X-Forwarded-For`、`X-Real-IP`）的请求，返回 403（2026-11-20，和 lite-mem 一致）。`GET /v1/kbs` 只列出 key 的 `kbs` 范围之内的 kb。
-- **并发**：处理函数都是同步的，FastAPI 放进线程池执行，线程数由 `server.max_workers`（默认 8）限制；启用 rerank 时启动阶段先加载模型。
-- **上传**：`POST /v1/kbs/{kb}/files`（multipart，`file` 加可选的 `doc_id`；默认 `file:<sha256(文件名)>`，同名文件再传就是替换），大小上限 `server.max_upload_mb`（默认 20）。
-- **部署**：仓库自带 `Dockerfile`（python:3.12-slim、非 root、`HEALTHCHECK`；启动时先 `literag migrate`），用环境变量指向 PG 和 Ollama。CI 每次构建镜像并做冒烟测试（/health、401、403、200），**不推送**到任何 registry（2026-11-08 决定）。`deploy/compose.yaml` 示例包含 lite-rag + PG（pgvector）；Ollama 跑在宿主机上（`host.docker.internal`）。
-- **安装**：`pip install "lite-rag[server] @ git+https://github.com/ArthurGao/lite-rag"`。以后再发布到 PyPI。
+- **Authentication** (S6, KB web-authz: deny by default): `Authorization: Bearer lrk_<prefix>_<secret>`. The server stores only the `sha256` of a key, configured in `server.keys` (YAML, or `LITERAG_SERVER__KEYS` set to a JSON list). Each key has two groups of globs, `namespaces` and `kbs` (`*` can cross `/`, for example `steward/*`), and a `mode` (`read` / `write`); there is no default namespace, and a key that does not write one has no access. `literag key create` generates a new key, prints it only once, and also gives the entry to add to the config; **no HTTP route can create a key**. When no key is configured the service is fully open, so `serve` is allowed to bind only to a loopback address.
+- **namespace**: each request names it with the `X-LiteRag-Namespace` header (a namespace itself contains `/`, which is not clean in a path). A missing header returns 400; a key that does not cover this namespace or this kb returns 403, and a read-only key that writes also gets 403; no key, or an unknown key, returns 401 with `WWW-Authenticate: Bearer`. The server holds one `RagRuntime`, and each request takes an engine with `runtime.engine(namespace)`, sharing the store, embedder, chunker and models.
+- **The only path left without authentication on purpose** is `GET /health` (with `?deep=true` it also embeds one cached probe query).
+- **Error format**: RFC 9457 Problem Details (`application/problem+json`): `KbNotFound` / `DocumentNotFound` 404, kb config mismatch (`KbMismatch`) 409, caller errors (`InvalidRequest`: name, parameter, file type, filter value) 400, request validation failure 422, embedding / LLM failure 502, storage failure 503, the service's own config error (`ConfigError`: extra not installed, API key not set, model does not exist) 500. The details of upstream failures and service config errors are written only to the log and are not returned to the client (they may contain addresses, the vendor's original error text or environment variable names).
+- **Request body limit**: every request is checked by size before parsing (JSON `server.max_body_mb`, default 10; uploads `server.max_upload_mb`), and over the limit it returns 413. Open mode (no key configured) accepts only a local Host (against DNS rebinding), and rejects with 403 a request that carries `Origin` (sent by a browser page) or proxy headers (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`) (2026-11-20, same as lite-mem). `GET /v1/kbs` lists only the kbs within the `kbs` scope of the key.
+- **Concurrency**: the handlers are all synchronous, FastAPI runs them in a thread pool, and the thread count is limited by `server.max_workers` (default 8); when rerank is enabled, the model is loaded at the start-up stage.
+- **Upload**: `POST /v1/kbs/{kb}/files` (multipart, `file` plus an optional `doc_id`; default `file:<sha256(file name)>`, so uploading a file with the same name again is a replacement), size limit `server.max_upload_mb` (default 20).
+- **Deployment**: the repo ships a `Dockerfile` (python:3.12-slim, non-root, `HEALTHCHECK`; runs `literag migrate` first at start-up), and environment variables point at PG and Ollama. CI builds the image every time and runs a smoke test (/health, 401, 403, 200), and **does not push** to any registry (decided 2026-11-08). The `deploy/compose.yaml` example contains lite-rag + PG (pgvector); Ollama runs on the host (`host.docker.internal`).
+- **Installation**: `pip install "lite-rag[server] @ git+https://github.com/ArthurGao/lite-rag"`. It will be published to PyPI later.
 
-## 8. 评测
+## 8. Eval
 
-- **语料**：`eval/` 下放一小份语料，中英文各一组，内容是自己写的公开知识。金标问题用 JSONL 存放，每行 `{question, expected_doc_ids[], expected_chunk_ids?[]}`。
-- **对比**：`literag eval --config a.yaml --config b.yaml` 为每个配置建一个临时 kb，再跑全部问题。结果并排列出 hit@1、hit@5、MRR@10，以及检索延迟的 p50 和 p95。
-- **跑在 lite-eval 上**（S12 起）：`literag eval` 把金标集和语料转成 lite-eval 数据集，每个配置是一次 lite-eval 运行（`eval/lite-eval/runs/`，gitignore）。判分（证据句）和指标由 lite-eval 的 retrieval pack 计算，定义和 S12 之前逐字一致（lite-eval 设计 §18.16）。两次运行可以用 `lite-eval compare` 做成对显著性比较；`--crosscheck` 用 ranx 重算排名指标。lite-rag 只保留适配器 `LiteRagTarget`（`src/lite_rag/eval.py`）。
-- **回答有没有依据**（S13 起，lite-eval E5 的模型评审）：检索评测只看找没找到；回答的质量由 lite-eval 的 grounded 评审判断：回答里有没有引用的来源不支持的说法。评审先校准才能用（lite-eval 设计 §9、§18.24）：
-  - **校准集**（`eval/judge-grounded/datasets/grounded-golden/`，提交，`eval/make_judge_grounded.py` 生成，测试核对和生成器一致）：每道金标题的合格回答 = 文档里含证据句的那一句，引用它所在的段落为来源 [1]，按构造是有依据的；再用 lite-eval 的构造工具各改坏一种方式：改一个数字、加一句别的文档的话、换成别题的回答（都是 unsupported），或去掉引用（仍然 grounded，评审不评引用标记）。插入和交换的内容只取同语言（按金标集，不按字符猜）的其他文档。
-  - **校准**：`lite-eval run eval/judge-grounded/suites/calibrate.yaml --config <评审>`，评审本身是 Target，记下一致率和每种改法的识别率；运行在 `eval/judge-grounded/runs/`（gitignore）。
-  - **真实回答**：`literag eval-answers -c <配置> --calibration <校准运行> --min-agreement <阈值>` 对金标题跑 `ask`（`LiteRagAnswerTarget`，输出 `{question, answer, sources, status, dropped}`），用校准运行测过的那个评审判分；评审的配置取自校准 suite 里的那一条，lite-eval 在任何调用之前逐项核对，校准不够就拒绝。最后列出每个被标记的回答，逐条读（评审错了，还是回答真有问题）。
-- **回答对不对**（S14 起）：金标题各有一个 `key_fact`（不分大小写的正则，回答必须说出的那件事），`eval-answers`
-  在 grounded 评审旁边加 lite-eval 的 `regex` 评分器。标签按构造：`key_fact` 匹配该题的合格回答（校准集里的证据句），
-  不匹配题目本身（`load_golden` 拒绝），也不匹配校准集里改了数字、换成别题答案的回答（测试）。它看不出方向（"磨粗"
-  和"磨细"都提到了"细"），所以**主指标是 `key_fact` 且 grounded 都过**，不单看 `key_fact`。`key_fact` 全有或全无：
-  只有一部分题有，`eval-answers` 拒绝（否则这一项会悄悄关掉）；都没有，报告写"not checked"。
-- **不用输出缓存**（S14 起）：`eval-answers` 的 suite 写 `cache: off`，每次运行都重新回答（S13 时第二次运行会直接
-  复用第一次的回答和延迟，重复就测不到东西）。`literag eval` 从 S12 起就是 off。
-- **金标集**：每个使用 lite-rag 的项目准备 20–30 个问题，标出正确答案应该来自哪个 chunk。切换任何一层之后都重跑一次，比较 hit rate 和 MRR，用这个回答「换了之后是变好还是变差」。
-- **用法**：这是学习的主循环。每换一种 chunker、加上 BM25、打开 rerank，都跑一次 eval，用数字判断效果有没有变好。
+- **Corpus**: a small corpus under `eval/`, one set each in Chinese and English, of public knowledge written by ourselves. The golden questions are kept in JSONL, one `{question, expected_doc_ids[], expected_chunk_ids?[]}` per line.
+- **Comparison**: `literag eval --config a.yaml --config b.yaml` builds a temporary kb for each config and then runs all the questions. The results are listed side by side: hit@1, hit@5, MRR@10, and p50 and p95 of retrieval latency.
+- **Runs on lite-eval** (since S12): `literag eval` converts the golden set and the corpus into a lite-eval dataset, and each config is one lite-eval run (`eval/lite-eval/runs/`, gitignored). Judging (evidence sentences) and the metrics are computed by lite-eval's retrieval pack, with definitions word for word the same as before S12 (lite-eval design §18.16). Two runs can be compared pairwise for significance with `lite-eval compare`; `--crosscheck` recomputes the ranking metrics with ranx. lite-rag keeps only the adapter `LiteRagTarget` (`src/lite_rag/eval.py`).
+- **Whether the answer is grounded** (since S13, the model judge of lite-eval E5): the retrieval eval looks only at whether the evidence was found; the quality of an answer is judged by lite-eval's grounded judge: does the answer contain a claim that the sources it cites do not support. The judge must be calibrated before it can be used (lite-eval design §9, §18.24):
+  - **Calibration set** (`eval/judge-grounded/datasets/grounded-golden/`, committed, generated by `eval/make_judge_grounded.py`, and a test checks it agrees with the generator): the qualified answer of each golden question = the sentence of the document that contains the evidence sentence, citing the paragraph it sits in as source [1], which is grounded by construction; then lite-eval's construction tool corrupts it in one way each: change a number, add a sentence from another document, replace it with the answer of another question (all unsupported), or remove the citation (still grounded, the judge does not judge citation marks). The inserted and swapped content is taken only from other documents of the same language (by the golden set, not guessed from characters).
+  - **Calibration**: `lite-eval run eval/judge-grounded/suites/calibrate.yaml --config <judge>`; the judge itself is the Target, and the agreement rate and the detection rate of each kind of corruption are recorded; the runs are in `eval/judge-grounded/runs/` (gitignored).
+  - **Real answers**: `literag eval-answers -c <config> --calibration <calibration run> --min-agreement <threshold>` runs `ask` on the golden questions (`LiteRagAnswerTarget`, output `{question, answer, sources, status, dropped}`) and scores with the judge that the calibration run measured; the judge's config is taken from the one entry in the calibration suite, lite-eval checks it item by item before any call, and refuses when the calibration is not enough. Finally every flagged answer is listed and read one by one (was the judge wrong, or is the answer really bad).
+- **Whether the answer is correct** (since S14): each golden question has a `key_fact` (a case-insensitive regular expression, the one thing the answer must say), and `eval-answers`
+  adds lite-eval's `regex` scorer next to the grounded judge. The labels are by construction: `key_fact` matches the qualified answer of that question (the evidence sentence in the calibration set),
+  does not match the question itself (`load_golden` rejects it), and does not match the answers in the calibration set whose number was changed or that were swapped with another question's answer (tested). It cannot see direction ("磨粗" (grind coarser)
+  and "磨细" (grind finer) both mention "细"), so **the main metric is that `key_fact` and grounded both pass**, not `key_fact` alone. `key_fact` is all or nothing:
+  if only some questions have it, `eval-answers` refuses (otherwise this item would be switched off silently); if none has it, the report says "not checked".
+- **No output cache** (since S14): the suite of `eval-answers` writes `cache: off`, so every run answers again (at S13 a second run directly
+  reused the first run's answers and latency, and with that repetition nothing is measured). `literag eval` has been off since S12.
+- **Golden set**: every project that uses lite-rag prepares 20–30 questions and marks which chunk the correct answer should come from. After switching any layer, run it again, compare hit rate and MRR, and use it to answer "is it better or worse after the change".
+- **Usage**: this is the main loop of learning. Each time a chunker is changed, BM25 is added or rerank is turned on, run eval, and use the numbers to judge whether the effect improved.
 
-## 9. 配置
+## 9. Configuration
 
-用 pydantic-settings 读取，环境变量前缀为 `LITERAG_`，也可以用 `--config file.yaml` 指定配置文件：
+Read with pydantic-settings, with the environment variable prefix `LITERAG_`; a config file can also be given with `--config file.yaml`:
 
 ```yaml
-database_url: null        # 一般用环境变量 LITERAG_DATABASE_URL，不写进文件
-store: {backend: postgres, schema: lite_rag}   # 或 {backend: chroma, data_dir: ./lite_rag_data}
+database_url: null        # normally set through the environment variable LITERAG_DATABASE_URL, not written into the file
+store: {backend: postgres, schema: lite_rag}   # or {backend: chroma, data_dir: ./lite_rag_data}
 embedding: {provider: ollama, model: bge-m3:567m, base_url: null, batch_size: 32, max_concurrency: 4, query_prefix: null}
 chunking: {strategy: recursive, unit: tokens, size: 800, overlap: 120, min_size: 50, contextual: {enabled: false}}
 retrieval: {mode: hybrid, hybrid_paths: [vector, bm25], top_k: 5, candidate_factor: 4, fusion: rrf, rrf_k: 60, bm25: {k1: 1.5, b: 0.75}}
@@ -320,291 +320,291 @@ trace: {enabled: false, query: text, retention_days: 90}     # S25 query traces 
 server: {host: 127.0.0.1, port: 8700}
 ```
 
-## 10. 与 llm-steward 集成
+## 10. Integration with llm-steward
 
-llm-steward 新增一个 `LiteRagProvider`，实现它的 `KnowledgeProvider` Protocol。它支持两种接入方式：in-process 直接 import 库，或者 HTTP 调用服务。两种方式都会跑 llm-steward 的合约测试。
+llm-steward adds a `LiteRagProvider` that implements its `KnowledgeProvider` Protocol. It supports two ways of connecting: in-process, importing the library directly, or HTTP, calling the service. Both ways run llm-steward's contract tests.
 
-| llm-steward 调用 | lite-rag 实现 |
+| llm-steward call | lite-rag implementation |
 | --- | --- |
-| `ensure_collection(collection)` | namespace 为 `steward/<namespace_id>`（每个 llm-steward namespace 一个），kb 名为 `c-<collection_id>`，返回 kb 名 |
-| `upsert_entry(entry, kb, external_id)` | `upsert_text(kb, doc_id=str(entry_id), title, content)`，返回 `doc_id` |
+| `ensure_collection(collection)` | The namespace is `steward/<namespace_id>` (one per llm-steward namespace), the kb name is `c-<collection_id>`, and the kb name is returned |
+| `upsert_entry(entry, kb, external_id)` | `upsert_text(kb, doc_id=str(entry_id), title, content)`, returns `doc_id` |
 | `remove(external_id)` | `delete(kb, doc_id)` |
-| `search(query, kbs, top_k)` | 一次 `search_kbs`（S10；HTTP 为 `POST /v1/search`），按 `doc_id` 取最高分 |
-| `health()` | 存储可用，且 embedding 服务可用 |
+| `search(query, kbs, top_k)` | One `search_kbs` (S10; over HTTP `POST /v1/search`), taking the highest score per `doc_id` |
+| `health()` | The storage is available, and the embedding service is available |
 
-- capabilities 为 `{entry_upsert}`。`doc_parsing` 等 llm-steward P3 做文档时再加。
-- 治理规则仍由 llm-steward 保证：只有生效的条目才会写入，检索结果要经过它的安全网。
-- llm-steward 和 lite-rag 可以共用同一个 PG 实例，但各用各的库或 schema。
+- capabilities are `{entry_upsert}`. `doc_parsing` and the like are added when llm-steward P3 does documents.
+- Governance rules are still guaranteed by llm-steward: only entries in effect are written, and retrieval results pass through its safety net.
+- llm-steward and lite-rag can share the same PG instance, but each uses its own database or schema.
 
-## 11. 项目结构
+## 11. Project structure
 
 ```
 lite-rag/
-  pyproject.toml            # uv；extras: [fastembed]（embedding 与 rerank）[anthropic]，以后 [server] [chroma] [pdf]
+  pyproject.toml            # uv; extras: [fastembed] (embedding and rerank) [anthropic], later [server] [chroma] [pdf]
   Dockerfile  compose.example.yml
   src/lite_rag/
     config.py loaders.py chunking.py embedding.py keyword.py fusion.py rerank.py llm.py engine.py
-    stores/ base.py pg.py chroma.py          # Store Protocol + 两个后端
-    lineage/                                 # 通用账本（S25）：不 import lite-rag 的其他模块
-    provenance.py tracing.py                 # 账本里怎么记 RAG 的产物；查询 trace（S25）
-    migrations/                              # PG schema（literag migrate）
-    server/ app.py auth.py schemas.py        # FastAPI（extra [server]）
+    stores/ base.py pg.py chroma.py          # Store Protocol + two backends
+    lineage/                                 # generic ledger (S25): imports no other lite-rag module
+    provenance.py tracing.py                 # how RAG artifacts are recorded in the ledger; query trace (S25)
+    migrations/                              # PG schema (literag migrate)
+    server/ app.py auth.py schemas.py        # FastAPI (extra [server])
     cli.py prompts/answer_system.j2 prompts/answer_user.j2
-  tests/   unit/（fakes）  integration/（PG：独立的测试 schema；Chroma：临时目录）  -m ollama 为可选
-  eval/    语料、金标问题、报告
+  tests/   unit/ (fakes)  integration/ (PG: its own test schema; Chroma: temp dir)  -m ollama is optional
+  eval/    corpus, golden questions, reports
   docs/lite-rag-design.md
 ```
 
-## 12. 阶段与验收
+## 12. Stages and acceptance
 
-每个阶段结束时，ruff、ruff format、mypy、pytest 都要通过；每个新测试至少见过一次失败（red）。
+At the end of every stage, ruff, ruff format, mypy and pytest must all pass; every new test must have been seen to fail (red) at least once.
 
-| 阶段 | 内容 | 验收 |
+| Stage | Content | Acceptance |
 | --- | --- | --- |
-| S0 环境 | 安装 Ollama，拉取 `bge-m3` 和 `qwen3:8b`；在共享 PG 上建库 `lite_rag` 和对应角色；用文档核对 Ollama、pgvector 驱动、Chroma 和 rerank 包的 API 与版本，并锁定版本 | `ollama list` 列出两个模型；`psql` 能连上 `lite_rag`，`vector` 扩展可用；版本写进 `pyproject.toml` |
-| S1 骨架 | uv、ruff、mypy、pytest、配置、fakes、CLI 骨架、`literag migrate` | `literag --help` 可用；迁移在测试 schema 上执行通过 |
-| S2 摄取（PG） | Loader；chunker：`fixed`、`recursive`、`sentence`、`paragraph`、`markdown`；embedder：`ollama`、`openai` 兼容、`fastembed`；`PgStore`（单个事务完成 upsert 和删除）、`upsert_text`、`delete` | chunk 边界测试（中英文）；重复 upsert 不会重写；删除后 chunk、embedding、posting 全为空；故障注入：写入中途出错时整篇回滚 |
-| S3 检索 | BM25（Python 版和 SQL 版）、RRF、三种模式、各阶段分数、`literag search` | BM25 与手算结果一致，Python 版和 SQL 版结果一致；融合顺序正确；`-m ollama` 真实往返测试通过 |
-| S4 rerank 与回答 | cross-encoder、三种 LLM 实现、回答模板、`literag ask`、引用核对 | FakeLLM 测试：越界的引用会被拒绝；切换 provider 只需改配置 |
-| S5 评测 | 语料、金标问题、`literag eval` 对比表 | 用真实 Ollama 跑出一张对比表：fixed 对比 recursive 对比 markdown、vector 对比 hybrid、rerank 开与关 |
-| S5b 结构化加载与进阶切块 | PDF 加载：pypdf（默认）与 docling（可选，转 Markdown）；chunk 记录页码；进阶切块 `semantic`（自写，并与 `chonkie` 对比）、`parent_child`、`contextual` | 加载器、切块、存储与检索都有单测和集成测试（fake 模型）；`-m ollama` 跑通真实的 contextual；用 eval 跑出切块对比表和 PDF 加载器对比表，结果记进 KB |
-| S5c 更多 embedding | embedder `voyage`、`cohere`、`gemini`、`sentence_transformers` | 每个 embedder 有单测（MockTransport，录制的响应结构）；本地模型的 embedding 对比表（含费用列），付费 API 只在用户提供 key 并同意后才跑 |
-| S6 HTTP 服务 | FastAPI、API key 鉴权、Problem Details、Dockerfile、compose 示例、CI 构建镜像 | API 测试：未授权返回 401，越权访问 kb 返回 403；`docker compose up` 后能完成 upsert → search → ask；库和 API 的结果一致 |
-| S7b 可选 BM25 后端 | ParadeDB `pg_search`（倒排索引，真正的 BM25）作为 `store.bm25_impl: pg_search`；需要 ParadeDB 镜像 | 等单个 kb 超过约十万个 chunk、实测 BM25 延迟成为瓶颈时再做；结果与自写 BM25 的排序对比测试 |
-| S7 Chroma 后端 | `ChromaStore` 加 SQLite 倒排，以及写入顺序与恢复逻辑 | 同一套 Store 合约测试在 PG 和 Chroma 上都通过；崩溃恢复测试 |
-| S8 收尾 | `/simplify`、Codex review、修复问题，然后重跑全部检查 | review 结论记录在案 |
-| S9 接入 llm-steward | `LiteRagProvider`（in-process 和 HTTP 两种）、合约测试、更新 llm-steward 设计文档 | llm-steward 的 KB 合约测试在两种接入方式下都通过；手动端到端：生效条目能检索到，废弃后检索不到 |
-| S11 Graph RAG（local） | `graph.enabled`：建库时 LLM 抽实体和关系，存进 PG 的三张图表（与 chunk 同一事务）；`graph` 检索路径（问题点名的实体 → 沿共现扩展 → 范围内按向量排序），`mode: graph` 与 `retrieval.hybrid_paths`；多跳评测集 `eval/golden-multihop.jsonl` | 抽取：FakeLLM 单测（合法、带代码块、非法 JSON；端点补实体；名字合并；prompt 不含标题）；扩展按手算核对（跳数、枢纽、每跳上限与排序）；PG 集成：写入、替换、删除后图随文档消失；类别词和单字母不当种子；多跳答案只能经图找到，分数与 vector 路径一致；配置冲突（chroma、未开图、加权融合）报错；kb 身份含抽取模型；`-m ollama` 真实抽取能解析；eval 前后对比记进 KB |
-| S12 评测迁到 lite-eval | `literag eval` 改为 lite-eval 上的薄包装：适配器 `LiteRagTarget`、金标集转数据集、同一索引共用一次 setup；删掉自写的判分和指标；可选 extra `eval` 按提交锁定 lite-eval | 等价：冻结的旧实现（`tests/legacy_eval.py`）和新实现同一进程同一 store，4 套金标集逐题 `answer_rank`、`doc_rank` 相同，整体与分题型的 hit@1、hit@5、MRR@10、doc hit@5 误差 ≤ 1e-9（FakeEmbedder 进 CI，bge-m3 用 `-m ollama`）；随机 2000 组命中上评分器等价；命令参数和表格不变 |
-| S13 回答评审（lite-eval E5b） | 依赖 lite-eval 0.3.0；grounded 评审的校准集（构造法，提交）和校准 suite；`LiteRagAnswerTarget` 与 `literag eval-answers`；数据集和 suite 的生成共用 `write_generated_dataset` / `write_suite` | 校准集：每种改法标签按构造正确、同一种子同一集合、提交的和生成器一致、插入和交换的内容同语言且不在来源里；FakeLLM + FakeJudge：回答被校准过的评审判分、被标记的回答列出、评审就是校准运行测过的那个、校准不够时在生成任何回答之前拒绝；qwen3:8b（思考关和开）的校准一致率和每种改法的识别率、真实回答的标记率和逐条判断记进 KB |
-| S14 回答对不对与自动路由 | 金标题的 `key_fact` 和 `eval-answers` 的 `regex` 评分器；`response_model`（LLM 响应写的模型）一路带到 `ask` 和评测输出；`eval-answers` 关掉输出缓存；四个对比配置（直连 Ollama 8b，经 LiteLLM Proxy 的 small / workhorse / smart-router） | `key_fact` 标签按构造（匹配合格回答、不匹配题目、不匹配改数字和换答案的回答）；全有或全无；缓存关闭（第二次运行重新回答）；FakeLLM：`response_model` 取自响应、评测输出带上、未检查时报告写明；四个配置 × 2 次真实运行，逐条读未通过的回答，结果记进 KB 和 lite-model 设计 §15 |
-| S15 迁到 lite-model | LLM 调用改由 lite-model 0.2.0 完成：三处 LLM 配置变成 `answer` / `contextual` / `graph` 三个 role（后两个不可路由、模型固定在 `host_roles`）；`RoleLLM`；`model_id` 改成实际回答的模型，`response_model` 删除；截断算错误；旧配置键拒绝并说明去处；删掉旧客户端 | 迁移前录下的 5 个请求（三个 role 的默认、OpenAI 兼容厂商全参数、Anthropic）逐字段相同；索引身份（评测 kb 名）不变；`literag eval`（contextual、graph）和 `eval-answers` 前后一致；`-m ollama` 通过 |
-| S16 图抽取用结构化输出 | graph role 的回复受 JSON schema 约束（lite-model `structured()`，`GraphReply`）；仍不合 schema 的回复用同一个 prompt 再要一次，第二次仍不合就整篇失败；`CODE_VERSION` 2（图 kb 的身份变了） | 单测：请求带 schema、不合 schema 再要一次且只一次、调用失败不重复、日志不带回复；请求体录制只多 `response_format`；之前 10 次里 7 次坏 JSON 的 chunk 用结构化输出 10 次都合法；`literag eval` graph-hybrid 3 次全部完成 |
-| S17 索引角色默认用小模型 | `contextual`、`graph` 默认 `ollama/qwen3:1.7b`、不思考；`eval/configs/*-8b.yaml` 写回 8b 作对照 | 单测：两个索引角色的默认 id 和参数、顶层设置不影响它们；8b 对照配置解析到 S17 之前的设置；检索和回答评测（KB 2026-11-19）不比 8b 差 |
-| S18 接 lite-cache L1 | `cache` extra（lite-cache v0.1.0 release wheel，默认关）；`cache` 配置（`enabled`、`roles`、`ttl_s`、`schema`、`question_log`），用 lite-rag 的 `database_url`、只支持 PG；开着时 runtime 的 lite-model 注册 `CacheHook`；`contextual`、`graph`、`answer` 的调用都在 `call_context(scope="literag/<namespace>")` 里（lite-cache 设计 §0、§9）；`BoundedLLM.map` 按项 `copy_context()`（lite-model 0.2.1 的 `Bounded.map` 线程不继承 contextvar）；`Completion` / `Answer` 带 `cached`，CLI 标出缓存答案；`ask()` 可选的提问日志（JSONL） | 关闭时与之前等价（请求体、索引身份、回答都不变，不建 lite-cache 的 schema）；开启时：换 embedding 后 `reindex --into` 新 kb，`contextual` / `graph` 不发请求，产出的上下文和图与第一次逐字相同；同一问题第二次 `ask` 不调用 LLM，`cached` 为真；两个 namespace 互不命中；`contextual` 并发大于 1 时也命中；`roles` 里没有的 role 不缓存；store 不是 PG 时开启报 `ConfigError`；提问日志关闭时不写文件 |
-| S19 embedding 走 lite-model | `OllamaEmbedder`、`OpenAICompatEmbedder` 改由 lite-model 0.6.0 的 `embed()` 调用（分批、并发、400/413 对半拆、同模型重试都是它的）；lite-rag 的 `EmbeddingConfig` 不变，由它生成 lite-model 的配置；前缀（`_Prefixing`）、向量缓存（`CachingEmbedder`）、索引身份留在 lite-rag；Voyage / Cohere / Gemini / fastembed / sentence-transformers 不动 | 索引身份不变（provider、model、`model_id`、前缀）；`-m ollama` 下 `/v1/embeddings` 与 `/api/embed` 的向量逐元素相等（含 query / document 前缀）；吞吐不变（同一批文本、默认并发 4 × 批 32）；Ollama 不发 `dimensions`（以前也不发） |
-| S20 Voyage 走 lite-model、Voyage rerank | `VoyageEmbedder` 改由 lite-model 0.7.0 的 `voyage` 类型调用（`input_type` 按 query / document、`dimensions` 作 `output_dimension`、对半拆与重试都是 lite-model 的）；`rerank.provider: voyage`：`VoyageReranker` 走 lite-model 的 `rerank()`（`/v1/rerank`，付费），默认 `rerank-2.5`；`-m voyage` opt-in | 索引身份不变（provider `voyage`、model、前缀为空、dim）；请求体只多了 SDK 的 `encoding_format: "base64"`；reranker 按输入顺序给每条打分、`model_id` 为 `voyage/<model>`；缺 key 在构建时报 `ConfigError`；fastembed 的 reranker 不变、拒绝 voyage 专用字段；`-m voyage` 没有 key 时失败而不是跳过 |
-| S21 检索路由（先量上限） | `eval/route_ceiling.py`（只读已有的 lite-eval 运行：每题选对配置时的上限、最好的固定配置、延迟）；`mode: route`、`retrieval.router.modes`、`route` role（可路由，默认 ollama/qwen3:1.7b 不思考，最多 256 token）；`Router`（每个 router 的 JSON schema 只含它提供的模式，偏离就再问一次，仍不行报 `BadReply`）；`prompts/route_*.j2`（问题放在 nonce 块里当材料）；`Hit.route`；eval 输出里的 `route` span；`eval/configs/route-*.yaml`（qwen3:1.7b、llm-gateway 的 gpt-sub / claude-sub-haiku） | 路由选的模式就是实际执行的（与直接指定该模式的结果逐条相同）；每次搜索一次路由调用，固定模式不调用；没有 kb 时不调用；调用失败、两次都不在 schema 内都报错；`route` 模式里有 graph 而 graph 没开时配置报错；用 lite-eval 比较路由与最好的固定配置 |
-| S22 每个 kb 选自己的 embedder | `embeddings.<name>`（命名 embedder，`embedding` 即 `default`）；`create_kb(kb, embedding=)`、`literag ingest/reindex --embedding`、`PUT /v1/kbs/{kb}` 的 `{embedding}`；打开 kb 时按它记录的身份（provider、model、前缀，再到 dim）找回 embedder，不加迁移；`search_kbs` 每个 embedder 只 embed 一次 query，各 embedder 的列表用 RRF 合并；跨 embedder 又没开 rerank 时警告一次；`literag eval --kb-per-dir`、跨语言评测集 `golden-xlang` | 只配一个 embedder 时结果逐条不变（分数是原始相似度）；新 kb 用指定的 embedder，已有 kb 换名字报错，未知名字 400；写已有 kb 用它自己的 embedder；`reindex --embedding` 换模型；评测：单一模型 vs 混用 vs 混用 + rerank |
-| S23 Cohere / Gemini 走 lite-model | `CohereEmbedder`、`GeminiEmbedder` 改由 lite-model 0.8.0 的 `cohere` / `gemini` 类型调用；`_HTTPEmbedder` 删除；`_LiteModelEmbedder._input_type(role)` 由各 embedder 决定是否把角色作 `input_type` 发出（Gemini 有前缀时不发） | 原有 vendor 测试（请求 URL、鉴权头、请求体、角色映射、批上限、前缀、缺 key）一条不改就通过，索引身份不变 |
-| S24 更难的跨语言评测 | `eval/make_xlang_hard.py` 生成 `corpus-xlang-hard/{en,zh}`（15 篇几乎相同的档位 / 地区 / 版本文档）和 `golden-xlang-hard.jsonl`（36 题，24 道跨语言，每题证据只在一篇里）；`vector-rerank.yaml`、`embed-qwen3-0.6b-rerank.yaml`、`xlang-en-bge-zh-qwen3*.yaml` | 回答：给不同语料选不同 embedding 模型，是否比最好的单一模型更好 |
-| S25 Lineage | S25a 通用账本 `lite_rag.lineage`；S25b 写入路径记账、`chunks.lineage_key`、backfill；S25c 查询 trace（`search_traced` / `search_kbs_traced` / `ask` / `record_cited` / `trace show`）；S25d `lineage gc`、`lineage show/upstream/downstream`、文档 | 见下方 S25 记录与 spec §9：改一段只出该段的新版本；删除级联；trace 判断当时用的数据是否已过期；`lite_rag.lineage` 不 import lite-rag 其他模块；现有检索与 eval 行为不变 |
-| S10 多 kb 检索 | `search_kbs` 与 `POST /v1/search`（为 llm-steward P4 联合检索）：只嵌入一次、只融合一次、只 rerank 一次 | 一次嵌入、跨 kb 的 RRF 分数可按合并后的名次手算、同一 doc id 在两个 kb 都返回、rerank 只调一次；单 kb 经 `search_kbs` 与 `search` 结果相同；HTTP 每个 kb 都要授权（403）；llm-steward 合约测试通过 |
+| S0 Environment | Install Ollama, pull `bge-m3` and `qwen3:8b`; create the database `lite_rag` and its role on the shared PG; check the APIs and versions of Ollama, the pgvector driver, Chroma and the rerank package against their docs, and lock the versions | `ollama list` shows the two models; `psql` can connect to `lite_rag`, and the `vector` extension is available; the versions are written into `pyproject.toml` |
+| S1 Skeleton | uv, ruff, mypy, pytest, config, fakes, CLI skeleton, `literag migrate` | `literag --help` works; the migration runs through on the test schema |
+| S2 Ingestion (PG) | Loader; chunkers: `fixed`, `recursive`, `sentence`, `paragraph`, `markdown`; embedders: `ollama`, `openai`-compatible, `fastembed`; `PgStore` (upsert and delete done in a single transaction), `upsert_text`, `delete` | Chunk boundary tests (Chinese and English); a repeated upsert does not rewrite; after a delete, chunks, embeddings and postings are all empty; fault injection: an error in the middle of a write rolls the whole document back |
+| S3 Retrieval | BM25 (Python version and SQL version), RRF, three modes, scores of each stage, `literag search` | BM25 agrees with a hand calculation, and the Python and SQL versions agree; fusion order is correct; the real round-trip test under `-m ollama` passes |
+| S4 Rerank and answering | cross-encoder, three LLM implementations, answer template, `literag ask`, citation check | FakeLLM test: an out-of-range citation is rejected; switching the provider needs only a config change |
+| S5 Eval | Corpus, golden questions, `literag eval` comparison table | A comparison table run on real Ollama: fixed vs recursive vs markdown, vector vs hybrid, rerank on vs off |
+| S5b Structured loading and advanced chunking | PDF loading: pypdf (default) and docling (optional, converts to Markdown); chunks record the page number; advanced chunking `semantic` (self-written, and compared with `chonkie`), `parent_child`, `contextual` | Loaders, chunking, storage and retrieval all have unit tests and integration tests (fake models); the real contextual runs through under `-m ollama`; a chunking comparison table and a PDF loader comparison table are produced with eval, and the results go into the KB |
+| S5c More embeddings | embedders `voyage`, `cohere`, `gemini`, `sentence_transformers` | Each embedder has unit tests (MockTransport, recorded response structure); an embedding comparison table for local models (with a cost column); paid APIs run only after the user provides a key and agrees |
+| S6 HTTP service | FastAPI, API key authentication, Problem Details, Dockerfile, compose example, CI image build | API tests: unauthorised returns 401, access to a kb out of scope returns 403; after `docker compose up`, upsert → search → ask completes; library and API results agree |
+| S7b Optional BM25 backend | ParadeDB `pg_search` (inverted index, real BM25) as `store.bm25_impl: pg_search`; needs the ParadeDB image | Done only when a single kb exceeds about a hundred thousand chunks and the measured BM25 latency becomes a bottleneck; a test comparing the ranking with the self-written BM25 |
+| S7 Chroma backend | `ChromaStore` plus a SQLite inverted index, and the write order and recovery logic | The same Store contract tests pass on both PG and Chroma; crash recovery test |
+| S8 Close-out | `/simplify`, Codex review, fix the problems, then re-run all checks | The review conclusions are on record |
+| S9 Integration with llm-steward | `LiteRagProvider` (in-process and HTTP), contract tests, update the llm-steward design doc | llm-steward's KB contract tests pass in both ways of connecting; manual end-to-end: an entry in effect can be retrieved, and after it is retired it cannot |
+| S11 Graph RAG (local) | `graph.enabled`: at build time the LLM extracts entities and relations and stores them in three graph tables in PG (in the same transaction as the chunks); the `graph` retrieval path (entity named by the question → expand along co-occurrence → rank by vector within the range), `mode: graph` and `retrieval.hybrid_paths`; the multi-hop eval set `eval/golden-multihop.jsonl` | Extraction: FakeLLM unit tests (valid, with a code block, invalid JSON; endpoints added as entities; names merged; the prompt does not contain the title); expansion checked against hand calculation (hops, hubs, per-hop cap and ranking); PG integration: write, replace, and the graph disappears with the document after a delete; category words and single letters are not seeds; a multi-hop answer can only be found through the graph, and scores agree with the vector path; config conflicts (chroma, graph not enabled, weighted fusion) raise errors; the kb identity contains the extraction model; the real extraction under `-m ollama` parses; the eval before/after comparison goes into the KB |
+| S12 Eval moves to lite-eval | `literag eval` becomes a thin wrapper on lite-eval: the adapter `LiteRagTarget`, the golden set converted to a dataset, one setup shared by the same index; the self-written judging and metrics are deleted; an optional extra `eval` pins lite-eval by commit | Equivalence: the frozen old implementation (`tests/legacy_eval.py`) and the new one, in the same process on the same store, give the same `answer_rank` and `doc_rank` question by question on 4 golden sets, and the overall and per-question-type hit@1, hit@5, MRR@10 and doc hit@5 differ by ≤ 1e-9 (FakeEmbedder in CI, bge-m3 with `-m ollama`); the scorer is equivalent on 2000 random hit sets; command arguments and tables unchanged |
+| S13 Answer judge (lite-eval E5b) | Depends on lite-eval 0.3.0; the calibration set of the grounded judge (constructed, committed) and the calibration suite; `LiteRagAnswerTarget` and `literag eval-answers`; dataset and suite generation share `write_generated_dataset` / `write_suite` | Calibration set: the label of each corruption is correct by construction, the same seed gives the same set, the committed one agrees with the generator, and the inserted and swapped content is in the same language and not in the sources; FakeLLM + FakeJudge: answers are scored by the calibrated judge, flagged answers are listed, the judge is the one the calibration run measured, and when calibration is not enough it is refused before any answer is generated; the calibration agreement rate and the detection rate of each corruption for qwen3:8b (thinking off and on), the flag rate on real answers and the item-by-item judgements go into the KB |
+| S14 Answer correctness and auto-routing | The `key_fact` of golden questions and the `regex` scorer of `eval-answers`; `response_model` (the model written in the LLM response) carried all the way to `ask` and the eval output; `eval-answers` turns off the output cache; four comparison configs (direct Ollama 8b, and small / workhorse / smart-router through the LiteLLM Proxy) | `key_fact` labels by construction (matches the qualified answer, does not match the question, does not match answers with a changed number or a swapped answer); all or nothing; cache off (the second run answers again); FakeLLM: `response_model` is taken from the response, the eval output carries it, and the report says so when not checked; four configs × 2 real runs, the answers that did not pass are read one by one, and the results go into the KB and lite-model design §15 |
+| S15 Move to lite-model | LLM calls are now made by lite-model 0.2.0: the three LLM configs become the three roles `answer` / `contextual` / `graph` (the last two not routable, with models fixed in `host_roles`); `RoleLLM`; `model_id` becomes the model that actually answered, `response_model` is removed; truncation counts as an error; old config keys are refused with a note on where they went; the old client is deleted | The 5 requests recorded before the migration (defaults of the three roles, all parameters of an OpenAI-compatible vendor, Anthropic) are the same field by field; the index identity (the eval kb name) is unchanged; `literag eval` (contextual, graph) and `eval-answers` agree before and after; `-m ollama` passes |
+| S16 Graph extraction uses structured output | The reply of the graph role is held to a JSON schema (lite-model `structured()`, `GraphReply`); a reply that still does not fit the schema is asked for once more with the same prompt, and if the second still does not fit, the whole document fails; `CODE_VERSION` 2 (the identity of a graph kb changed) | Unit tests: the request carries the schema, a reply that does not fit is asked for once more and only once, a failed call is not repeated, the log does not carry the reply; the recorded request body gains only `response_format`; a chunk that gave bad JSON 7 times in 10 before gives valid output 10 times in 10 with structured output; `literag eval` graph-hybrid finishes all 3 times |
+| S17 Index roles use a small model by default | `contextual` and `graph` default to `ollama/qwen3:1.7b`, no thinking; `eval/configs/*-8b.yaml` write 8b back as a control | Unit tests: the default id and parameters of the two index roles, and the top-level settings do not affect them; the 8b control config resolves to the settings before S17; retrieval and answer evals (KB 2026-11-19) are no worse than 8b |
+| S18 Connect lite-cache L1 | The `cache` extra (lite-cache v0.1.0 release wheel, off by default); the `cache` config (`enabled`, `roles`, `ttl_s`, `schema`, `question_log`), which uses lite-rag's `database_url` and supports PG only; when on, the runtime's lite-model registers `CacheHook`; the calls of `contextual`, `graph` and `answer` are all inside `call_context(scope="literag/<namespace>")` (lite-cache design §0, §9); `BoundedLLM.map` does `copy_context()` per item (the threads of lite-model 0.2.1's `Bounded.map` do not inherit the contextvar); `Completion` / `Answer` carry `cached`, and the CLI marks a cached answer; `ask()` has an optional question log (JSONL) | When off, equivalent to before (request bodies, index identity and answers unchanged, and the lite-cache schema is not created); when on: after changing the embedding, `reindex --into` a new kb, `contextual` / `graph` send no requests, and the context and graph produced are word for word the same as the first time; the second `ask` of the same question does not call the LLM, and `cached` is true; two namespaces do not hit each other; `contextual` also hits when concurrency is greater than 1; a role not in `roles` is not cached; turning it on when the store is not PG raises `ConfigError`; the question log writes no file when off |
+| S19 Embedding goes through lite-model | `OllamaEmbedder` and `OpenAICompatEmbedder` are now called through `embed()` of lite-model 0.6.0 (batching, concurrency, halving on 400/413 and same-model retries are all its job); lite-rag's `EmbeddingConfig` is unchanged and generates lite-model's config; the prefixes (`_Prefixing`), the vector cache (`CachingEmbedder`) and the index identity stay in lite-rag; Voyage / Cohere / Gemini / fastembed / sentence-transformers are untouched | The index identity is unchanged (provider, model, `model_id`, prefixes); under `-m ollama` the vectors of `/v1/embeddings` and `/api/embed` are equal element by element (including the query / document prefixes); throughput is unchanged (the same batch of texts, default concurrency 4 × batch 32); Ollama sends no `dimensions` (it did not before either) |
+| S20 Voyage through lite-model, Voyage rerank | `VoyageEmbedder` is now called through the `voyage` type of lite-model 0.7.0 (`input_type` by query / document, `dimensions` as `output_dimension`, halving and retries are lite-model's); `rerank.provider: voyage`: `VoyageReranker` goes through lite-model's `rerank()` (`/v1/rerank`, paid), default `rerank-2.5`; `-m voyage` opt-in | The index identity is unchanged (provider `voyage`, model, empty prefixes, dim); the request body gains only the SDK's `encoding_format: "base64"`; the reranker scores each item in input order, and `model_id` is `voyage/<model>`; a missing key raises `ConfigError` at build time; the fastembed reranker is unchanged and refuses Voyage-only fields; `-m voyage` fails, rather than skips, when there is no key |
+| S21 Retrieval routing (measure the ceiling first) | `eval/route_ceiling.py` (reads only existing lite-eval runs: the ceiling when each question picks the right config, the best fixed config, latency); `mode: route`, `retrieval.router.modes`, the `route` role (routable, default ollama/qwen3:1.7b without thinking, at most 256 tokens); `Router` (the JSON schema of each router contains only the modes it offers, a deviation is asked again, and if still wrong it raises `BadReply`); `prompts/route_*.j2` (the question is put in a nonce block as material); `Hit.route`; the `route` span in the eval output; `eval/configs/route-*.yaml` (qwen3:1.7b, llm-gateway's gpt-sub / claude-sub-haiku) | The mode the route picks is the one actually run (the result agrees item by item with specifying that mode directly); one route call per search, none for a fixed mode; no call when there is no kb; a failed call, or two replies both outside the schema, raise errors; when the `route` mode contains graph and graph is not enabled, the config raises an error; lite-eval compares the route with the best fixed config |
+| S22 Each kb picks its own embedder | `embeddings.<name>` (named embedder, `embedding` is `default`); `create_kb(kb, embedding=)`, `literag ingest/reindex --embedding`, `{embedding}` in `PUT /v1/kbs/{kb}`; when a kb is opened, the embedder is found again from the identity it recorded (provider, model, prefixes, then dim), with no migration added; `search_kbs` embeds the query only once per embedder, and the lists of the embedders are merged by RRF; a warning, once, when across embedders and rerank is not on; `literag eval --kb-per-dir`, the cross-lingual eval set `golden-xlang` | With only one embedder configured the results are unchanged item by item (scores are the raw similarity); a new kb uses the embedder given, changing the name on an existing kb raises an error, and an unknown name gives 400; writing an existing kb uses its own embedder; `reindex --embedding` changes the model; eval: a single model vs mixed vs mixed + rerank |
+| S23 Cohere / Gemini through lite-model | `CohereEmbedder` and `GeminiEmbedder` are now called through the `cohere` / `gemini` types of lite-model 0.8.0; `_HTTPEmbedder` is deleted; `_LiteModelEmbedder._input_type(role)` lets each embedder decide whether the role is sent as `input_type` (Gemini does not send it when there is a prefix) | The existing vendor tests (request URL, auth header, request body, role mapping, batch limit, prefixes, missing key) pass without changing a single one, and the index identity is unchanged |
+| S24 Harder cross-lingual eval | `eval/make_xlang_hard.py` generates `corpus-xlang-hard/{en,zh}` (15 near-identical tier / region / version documents) and `golden-xlang-hard.jsonl` (36 questions, 24 of them cross-lingual, the evidence of each question in only one document); `vector-rerank.yaml`, `embed-qwen3-0.6b-rerank.yaml`, `xlang-en-bge-zh-qwen3*.yaml` | Answer: does choosing different embedding models for different corpora do better than the best single model |
+| S25 Lineage | S25a the generic ledger `lite_rag.lineage`; S25b ledger records on the write path, `chunks.lineage_key`, backfill; S25c query trace (`search_traced` / `search_kbs_traced` / `ask` / `record_cited` / `trace show`); S25d `lineage gc`, `lineage show/upstream/downstream`, docs | See the S25 record below and spec §9: changing one passage produces only a new version of that passage; deletes cascade; a trace says whether the data used at that time is stale; `lite_rag.lineage` does not import other lite-rag modules; existing retrieval and eval behaviour unchanged |
+| S10 Multi-kb retrieval | `search_kbs` and `POST /v1/search` (for llm-steward P4 joint retrieval): embed only once, fuse only once, rerank only once | One embedding; the RRF scores across kbs can be hand-calculated from the merged ranks; the same doc id is returned from both kbs; rerank is called only once; a single kb gives the same result through `search_kbs` and `search`; over HTTP every kb needs authorisation (403); llm-steward contract tests pass |
 
-- **S15 迁到 lite-model（2026-11-18，lite-model 设计 §12 的第二个宿主）**：LLM 调用改由 lite-model 0.2.0 完成。
-  - 先发了 lite-model 0.2.0（主人选）：宿主在 `ModelsConfig` 子类上设 `host_backends` / `host_roles`，配置逐字段叠在上面。
-    没有它，任何 `LITERAG_LLM__ROLES` 都会把 graph 的默认值（不思考、2048 token）整个顶掉。
-  - `llm.py` 只留 `RoleLLM`（一个 role 对着共享的 lite-model）、`Completion`、`LLMError`（502）；删掉 `PROVIDERS`、`ProviderProfile`、
-    `_Client`、`OpenAICompatLLM`、`AnthropicLLM`、`BoundedCalls`、`build_llm`。`Message` 用 lite-model 的。`FakeLLM` 基于 lite-model
-    的 `FakeModel`，记录变成 `fake/fake-model`。并发上限改用 lite-model 的 `Bounded`（`RoleLLM.bounded()`）。依赖里去掉 `openai`、
-    `anthropic`（由 lite-model 锁定）。
-  - 请求体：迁移前用旧客户端录下 5 个请求（answer、contextual、graph 的默认，OpenAI 兼容厂商全参数，Anthropic），存在
-    `tests/fixtures/llm_requests.json`（`tests/data/` 被 `.gitignore` 的 `data/` 挡住，差点没提交上去）；迁移后逐字段相同。
-  - 索引身份：role 的 id 仍是 `ollama/qwen3:8b`；旧代码和新代码算出的评测 kb 名（索引身份的哈希）对 4 个配置完全相同，已有的
-    kb 不用重建。
-  - 迁移中发现并修掉的：①顶层 `backend`/`model` 以前只管 answer，现在会移动所有 role——`host_roles` 把 contextual、graph 固定在
-    `ollama/qwen3:8b`；②旧键 `graph.llm`、`chunking.contextual.llm` 被**悄悄忽略**（图会用默认模型建）——现在拒绝并说明去处，
-    `llm.provider` 等同样；③Codex：顶层的 `temperature`、`reasoning_effort` 也会传到 contextual、graph（同一个索引身份下内容换了
-    生成方式）——顶层调用参数移到 `roles.answer`，和 S15 之前 `llm` 只管回答一致。都先写失败的测试。
-  - 行为变化（主人定）：截断的回答是 `LLMError`；`Answer.model_id` 是实际回答的模型（从响应读，经 LiteLLM 是
-    `x-litellm-model-name`），S14 的 `response_model` 删除；`max_tokens_param` 删除（lite-model 的 profile 决定）。
-  - eval（本机 Ollama）：
-    - `eval-answers`（llm-ollama-8b，think 校准的评审）：两次都是 grounded 1.000、key fact 0.969、"答对" 0.969，0 个错误，没有一个
-      回答被截断；S14 迁移前两次是 0.938。差的一题两次都是 q12（"资料里没有"）。
-    - `literag eval`：graph-hybrid 迁移前 0.875 / 0.938 / 0.915（hit@1 / hit@5 / mrr@10，3 次相同），迁移后成功的那次完全相同；
-      chunk-contextual 0.875 / 0.969 / 0.912 → 0.906 / 0.969 / 0.928（差一题）。
-    - **图抽取偶尔返回坏 JSON，整个 ingest 失败**：迁移后 3 次里 2 次，迁移前 3 次 0 次。逐条对照（并发 1，49 个 chunk）：旧客户端
-      自己跑两次就有 22 条回复不同，新旧之间也是 22 条——qwen3 在 Ollama 上 temperature 0 也不确定，新客户端发的一样。不是迁移的
-      问题，是一直存在的风险：一个 chunk 的坏 JSON 让整份文档的 ingest 失败。后续：图抽取遇到解析错误重试一次（单独一个阶段，
-      改的是行为）。
-  - 变异：13 处（role 固定、graph 不思考、token 上限、错误转换、model_id、可路由、旧键拒绝、billing、两个身份、记录、FakeLLM），
-    全部被抓到。
-  - /simplify 采纳：`test_ollama.py` 还在用删掉的 `build_llm`（只在 `-m ollama` 下跑，默认跑不到）；billing 按 lite-model 解析出的
-    channel 判断（ollama 类型但 `channel: api` 的不再算免费）；`LLMConfig.target_of()` 是唯一调用 lite-model `target()` 的地方；
-    answer 运行记录按排除法记 target 的字段；过时注释。没采纳：合并 `LLM` / `RoleLLM` 两个名字和 `BoundedLLM`（类型已通过）、
-    把索引身份收到 `Settings` 一处（拼装重复早于这次改动）、eval-answers 在 contextual / graph 开着时建两次 lite-model（少见）、
-    每次读都重算 role id（几十微秒）、合并测试里的 helper 和旧键校验（小）。
-  - Codex 采纳 1 条（顶层调用参数只给 answer，见上）；核实后不成立 1 条："`llm` 下的拼写错误被悄悄忽略"——lite-model 的配置禁止
-    多余字段，`llm.reasining_effort` 启动时就报错。
+- **S15 Move to lite-model (2026-11-18, the second host of lite-model design §12)**: LLM calls are now made by lite-model 0.2.0.
+  - lite-model 0.2.0 was released first (the owner's choice): a host sets `host_backends` / `host_roles` on a subclass of `ModelsConfig`, and the config is layered field by field on top.
+    Without it, any `LITERAG_LLM__ROLES` would knock out the whole default of graph (no thinking, 2048 tokens).
+  - `llm.py` keeps only `RoleLLM` (one role against the shared lite-model), `Completion` and `LLMError` (502); `PROVIDERS`, `ProviderProfile`,
+    `_Client`, `OpenAICompatLLM`, `AnthropicLLM`, `BoundedCalls` and `build_llm` are deleted. `Message` is lite-model's. `FakeLLM` is based on lite-model's
+    `FakeModel`, and the record becomes `fake/fake-model`. The concurrency limit now uses lite-model's `Bounded` (`RoleLLM.bounded()`). `openai` and
+    `anthropic` are removed from the dependencies (lite-model pins them).
+  - Request bodies: before the migration, 5 requests were recorded with the old client (the defaults of answer, contextual and graph, all parameters of an OpenAI-compatible vendor, Anthropic), kept in
+    `tests/fixtures/llm_requests.json` (`tests/data/` was blocked by the `data/` in `.gitignore` and almost did not get committed); after the migration they are the same field by field.
+  - Index identity: the role id is still `ollama/qwen3:8b`; the eval kb names (the hash of the index identity) computed by the old code and the new code are exactly the same for the 4 configs, and existing
+    kbs need no rebuild.
+  - Found and fixed during the migration: (1) the top-level `backend`/`model` used to govern only answer and now move every role — `host_roles` pins contextual and graph to
+    `ollama/qwen3:8b`; (2) the old keys `graph.llm` and `chunking.contextual.llm` were **silently ignored** (the graph would be built with the default model) — they are now refused with a note on where they went,
+    and the same for `llm.provider` and the like; (3) Codex: the top-level `temperature` and `reasoning_effort` would also reach contextual and graph (under the same index identity the content would be generated
+    in a different way) — the top-level call parameters move to `roles.answer`, consistent with `llm` governing only answers before S15. A failing test was written first for each.
+  - Behaviour changes (decided by the owner): a truncated answer is an `LLMError`; `Answer.model_id` is the model that actually answered (read from the response, through LiteLLM it is
+    `x-litellm-model-name`), and the `response_model` of S14 is removed; `max_tokens_param` is removed (lite-model's profile decides).
+  - eval (local Ollama):
+    - `eval-answers` (llm-ollama-8b, judge calibrated with think): both times grounded 1.000, key fact 0.969, "answered correctly" 0.969, 0 errors, and no
+      answer was truncated; before the S14 migration both times were 0.938. The question that differs is q12 ("资料里没有" (not in the materials)) both times.
+    - `literag eval`: graph-hybrid before the migration 0.875 / 0.938 / 0.915 (hit@1 / hit@5 / mrr@10, the same in 3 runs), and the run that succeeded after the migration is exactly the same;
+      chunk-contextual 0.875 / 0.969 / 0.912 → 0.906 / 0.969 / 0.928 (one question different).
+    - **Graph extraction occasionally returns bad JSON and the whole ingest fails**: 2 of 3 runs after the migration, 0 of 3 before it. Compared item by item (concurrency 1, 49 chunks): the old client
+      differs from itself in 22 replies between two runs, and between old and new it is also 22 — qwen3 on Ollama is not deterministic even at temperature 0, and the new client sends the same. It is not a
+      problem of the migration but a risk that has always existed: the bad JSON of one chunk fails the ingest of the whole document. Follow-up: graph extraction retries once on a parse error (a separate stage,
+      as it changes behaviour).
+  - Mutations: 13 places (role pinning, graph no thinking, token cap, error conversion, model_id, routable, old-key refusal, billing, the two identities, the record, FakeLLM),
+    all caught.
+  - /simplify accepted: `test_ollama.py` still used the deleted `build_llm` (it runs only under `-m ollama`, so the default run does not reach it); billing is decided by the channel lite-model resolves
+    (an ollama type with `channel: api` no longer counts as free); `LLMConfig.target_of()` is the only place that calls lite-model `target()`;
+    the answer run record records the target's fields by exclusion; an outdated comment. Rejected: merging the two names `LLM` / `RoleLLM` and `BoundedLLM` (types already pass),
+    collecting the index identity in one place in `Settings` (the duplicated assembly predates this change), eval-answers building lite-model twice when contextual / graph are on (rare),
+    recomputing the role id on every read (tens of microseconds), merging the helpers in the tests with the old-key check (small).
+  - Codex accepted 1 (top-level call parameters go only to answer, see above); 1 did not hold up on checking: "a typo under `llm` is silently ignored" — lite-model's config forbids
+    extra fields, and `llm.reasining_effort` errors at start-up.
 
-- **S16 图抽取用结构化输出（2026-11-19）**：S15 记下的后续。
-  - 起因：graph-hybrid 迁移后 3 次里 2 次 ingest 失败（坏 JSON）。先按计划只加"解析失败再要一次"：3 次里仍有 1 次失败——
-    同一个 chunk（`茶叶分类#1`）两次都坏。单独问这个 chunk 10 次，7 次是坏 JSON（`{"source": "中国, "target": …`，模型漏了
-    一个引号，回复只有两三种），S15 的三次录制恰好都是好的。重试一次只能把这个 chunk 的失败率从 70% 降到约 50%，不是修复。
-  - 改为根因：graph role 用 lite-model 的 `structured()`，`GraphReply`（`entities[{name, type}]`、`relations[{source,
-    target, description}]`）作为 strict JSON schema 发给模型（Ollama 按 schema 约束解码）。同一个 chunk 10 次全部合法。
-    模型的同一个笔误还在，只是落进了字符串里（10 次里 4 次多出一个叫"中国,"的实体）：内容错一个节点，而不是整篇失败。
-  - 仍保留一次重试：回复不合 schema（lite-model 的 `BadStructuredReply` → `BadReply`）时用同一个 prompt 再要一次，第二次
-    仍不合抛 `GraphError`、整篇失败；调用失败（`LLMError`）不在这里重复（lite-model 已经按 `max_retries` 重试过）。每次重试记
-    一条 warning（chunk id，不带回复内容）。
-  - 删掉了宽松解析（代码块、前后文字、手写的字段检查）：schema 保证形状，`to_graph` 只做规范化（去空名、合并、补端点）。
-    提示词不变（`prompt_digest` 的模板部分不变），`CODE_VERSION` 1 → 2：请求多了 `response_format`，已有的图 kb 身份不再
-    匹配，要重建（llm-steward 不用图检索；评测 kb 每次重建）。
-  - `FakeLLM`（`lite_rag.testing`）支持结构化调用：脚本文本按 schema 校验，不合时抛 lite-model 的 `BadStructuredReply`，
-    和真实端点一样（lite-model 也用 `model_validate_json`）。
-  - 顺带修：S15 的并发测试覆盖了 `complete()`，而 `bounded()` 不经过它——测试什么都没验证。改成脚本里等 barrier（并发 1
-    时超时，先红）。
-  - 变异 4 处（去掉重试、对任何 `LLMError` 重试、`BadStructuredReply` 映射成 `LLMError`、schema 不再要求 `relations`），
-    全部被抓到。
-  - eval（本机 Ollama，`literag eval` graph-hybrid）：只加重试时 3 次里 1 次失败（重试后仍坏）、另 2 次 0.875 / 0.938 / 0.915；
-    结构化输出 3 次全部完成，三次都是 0.875 / 0.938 / 0.915（hit@1 / hit@5 / mrr@10，和 S15 前后一样），一次重试都没用上。
-    `-m ollama` 8 个通过。（中间一次重跑和仍在跑的上一组撞了同一个 schema，互相删了 kb；那两组不算。）
-  - /simplify：采纳——去掉 `PARSE_ATTEMPTS` 和循环（固定一次）；altitude 指出根因是没约束输出（即上面的改动）。不采纳——把
-    `_replies` 挪进 `FakeLLM`（只有一个测试文件用）。
-  - Codex：第一轮 1 条（重试改变了图的生成方式，应该进身份）——改成结构化输出后 `CODE_VERSION` 已升；第二轮 1 条不成立：
-    "fake 的校验比发给模型的 schema 宽"——真实路径也是 `model_validate_json`，两边一样宽。
-- **S17 索引角色默认用小模型（2026-11-19）**：所有模块迁到 lite-model 之后，逐个 role 比较 qwen3:1.7b 和 qwen3:8b
-  （KB `global/llm-evals/evals/2026-11-19-lite-small-model-per-role.md`，本机 Ollama，每组 2 次）。
-  - 检索：contextual 1.7b 建库快 3.6×（54 s vs 190 s），graph 快 5.7×（70 s vs 401 s）；hit@5 不变（0.969 / 0.938），但
-    hit@1 掉 0.06–0.11：4 / 3 题的正确 chunk 从第 1 名掉到第 2–3 名，两次都一样。
-  - 回答（8b 回答、校准过的 grounded 评审，"对" = key fact 且 grounded）：contextual 0.938 ×2（8b 建的 0.969 / 0.938），
-    graph 0.969 ×2（8b 建的 0.906 / 0.938）；不经索引的基线 0.938 ×2。每道错题都读过：q12、q04 是基线就错的题，没有新错题；
-    一次 q04 的回答在 answer role 的输出上限处截断（answer role 的问题，不是索引的）。top 5 都交给回答模型，名次 1 → 2 不影响回答。
-  - 所以 `contextual`、`graph` 的默认改成 `ollama/qwen3:1.7b`、`reasoning_effort: none`（contextual 之前没设，现在和测过的配置
-    一样）。answer 不变（8b）。role 的 id 进索引身份：用默认值的已有 contextual / graph kb 身份不再匹配，要重建，或在
-    `llm.roles` 里写回 `qwen3:8b`（`eval/configs/*-8b.yaml` 就是这样，用来对照）。lite-mem 的 `extract` 不换：1.7b 留下更多过时事实，而且不更快。
-  - 需要先 `ollama pull qwen3:1.7b`。只读第一个 hit 的调用方（不经回答）会感到名次的变化，这种情况写回 8b。
-- **跨仓库体检后的修补（2026-11-20）**：整个 lite-ai 跑过一遍后修的三处，各自先写了失败的测试。(1) `CREATE EXTENSION vector`
-  加 `SCHEMA public`：role 和 schema 同名（`lite_rag`）时 `"$user"` 排在 search_path 最前，新库上扩展会装进应用 schema、
-  删 schema 时一起被删；lite-mem 和 llm-steward 早就这样写。(2) 打开 PgStore 时检查未执行的迁移，有就报错并提示
-  `literag migrate`（迁移仍然显式执行，不自动迁移）；本机的应用 schema 曾落后 0004–0006 三个迁移而没人发现。
-  (3) `errors.redact` 改用和 lite-mem 相同的规则：`password = x`（等号两边有空格）、带引号的值、`PGPASSWORD` 这类前缀和 URL 参数里的密码。
-  另外开放模式补上 Origin 和代理头检查（§7），做成和 `TrustedHostMiddleware` 并列的中间件（整个开放模式的规则在一层）。
-  - /simplify：`pending()` 和 lite-cache 的同一份（只列文件名，不读 SQL）；Origin 检查从每个请求的依赖挪到中间件；测试用
-    `MagicMock(wraps=…)` 记录发出的 SQL。没改：检查放在 `PgStore.__init__` 而不是 `open_store`（和 `check_vector` 在一起，
-    直接构造 `PgStore` 的调用方也被覆盖）；打开时多两次往返（每个进程只打开一次）。
-  - Codex 采纳 2 条（先写失败的测试）：`redact` 也遮住 `Authorization: Bearer …`、`api_key=`、`token:`、`secret=`；
-    开放模式也拒绝 `Via`、`X-Forwarded-Host/-Proto/-Port/-Prefix`（lite-mem 同步）。
+- **S16 Graph extraction uses structured output (2026-11-19)**: a follow-up noted in S15.
+  - Cause: after the migration, the graph-hybrid ingest failed in 2 of 3 runs (bad JSON). Following the plan, only "ask again on a parse failure" was added first: 1 of 3 still failed —
+    the same chunk (`茶叶分类#1`) was bad both times. Asking about this chunk alone 10 times gave bad JSON 7 times (`{"source": "中国, "target": …`, the model dropped
+    a quote, and there were only two or three kinds of reply), and the three recordings of S15 happened to be good ones. Retrying once only brings the failure rate of this chunk from 70% down to about 50%, which is not a fix.
+  - Changed to the root cause: the graph role uses lite-model's `structured()`, and `GraphReply` (`entities[{name, type}]`, `relations[{source,
+    target, description}]`) is sent to the model as a strict JSON schema (Ollama constrains decoding by the schema). The same chunk is valid 10 times in 10.
+    The model's same slip is still there, but it now lands inside a string (4 of 10 runs add an entity called "中国," (China,)): one node is wrong in content, instead of the whole document failing.
+  - One retry is still kept: when the reply does not fit the schema (lite-model's `BadStructuredReply` → `BadReply`), it is asked again with the same prompt, and if the second still
+    does not fit it raises `GraphError` and the whole document fails; a failed call (`LLMError`) is not repeated here (lite-model has already retried by `max_retries`). Every retry logs
+    one warning (the chunk id, without the reply content).
+  - The lenient parsing is deleted (code block, text before and after, hand-written field checks): the schema guarantees the shape, and `to_graph` only normalises (drops empty names, merges, adds endpoints).
+    The prompt is unchanged (the template part of `prompt_digest` is unchanged), `CODE_VERSION` 1 → 2: the request gains `response_format`, the identity of an existing graph kb no longer
+    matches, and it must be rebuilt (llm-steward does not use graph retrieval; eval kbs are rebuilt every time).
+  - `FakeLLM` (`lite_rag.testing`) supports structured calls: the scripted text is validated against the schema, and when it does not fit it raises lite-model's `BadStructuredReply`,
+    the same as a real endpoint (lite-model also uses `model_validate_json`).
+  - Also fixed: the concurrency test of S15 covered `complete()`, while `bounded()` does not go through it — the test verified nothing. Changed to wait on a barrier in the script (with concurrency 1
+    it times out, red first).
+  - 4 mutations (remove the retry, retry on any `LLMError`, map `BadStructuredReply` to `LLMError`, the schema no longer requires `relations`),
+    all caught.
+  - eval (local Ollama, `literag eval` graph-hybrid): with only the retry, 1 of 3 runs failed (still bad after the retry) and the other 2 gave 0.875 / 0.938 / 0.915; with
+    structured output all 3 runs finished, each at 0.875 / 0.938 / 0.915 (hit@1 / hit@5 / mrr@10, the same as before and after S15), and not one retry was used.
+    8 `-m ollama` tests pass. (One intermediate re-run collided with the previous group, still running, on the same schema, and they deleted each other's kb; those two groups do not count.)
+  - /simplify: accepted — remove `PARSE_ATTEMPTS` and the loop (fixed at one); altitude pointed out that the root cause was the unconstrained output (the change above). Rejected — move
+    `_replies` into `FakeLLM` (only one test file uses it).
+  - Codex: round one, 1 finding (the retry changes how the graph is generated and should enter the identity) — after the change to structured output `CODE_VERSION` was already raised; round two, 1 finding that does not hold up:
+    "the fake's validation is looser than the schema sent to the model" — the real path is also `model_validate_json`, and both are equally loose.
+- **S17 Index roles use a small model by default (2026-11-19)**: after all modules moved to lite-model, qwen3:1.7b and qwen3:8b were compared role by role
+  (KB `global/llm-evals/evals/2026-11-19-lite-small-model-per-role.md`, local Ollama, 2 runs per group).
+  - Retrieval: contextual with 1.7b builds the kb 3.6× faster (54 s vs 190 s), graph 5.7× faster (70 s vs 401 s); hit@5 is unchanged (0.969 / 0.938), but
+    hit@1 drops by 0.06–0.11: for 4 / 3 questions the correct chunk fell from rank 1 to rank 2–3, the same in both runs.
+  - Answers (8b answers, calibrated grounded judge, "correct" = key fact and grounded): contextual 0.938 ×2 (built by 8b: 0.969 / 0.938),
+    graph 0.969 ×2 (built by 8b: 0.906 / 0.938); the baseline without an index 0.938 ×2. Every wrong question was read: q12 and q04 were wrong already in the baseline, and there is no new wrong question;
+    one answer of q04 was truncated at the output limit of the answer role (a problem of the answer role, not of the index). The top 5 all go to the answering model, so a rank change from 1 to 2 does not affect the answer.
+  - So the defaults of `contextual` and `graph` are changed to `ollama/qwen3:1.7b`, `reasoning_effort: none` (contextual had none set before, and now it is the same as the measured config).
+    answer is unchanged (8b). The role id enters the index identity: an existing contextual / graph kb that used the defaults no longer matches and must be rebuilt, or `qwen3:8b` must be written back in
+    `llm.roles` (`eval/configs/*-8b.yaml` do exactly this, for comparison). lite-mem's `extract` is not changed: 1.7b leaves more stale facts, and is not faster.
+  - `ollama pull qwen3:1.7b` is needed first. A caller that reads only the first hit (without going through answering) will feel the change in rank; in that case write 8b back.
+- **Fixes after the cross-repo check-up (2026-11-20)**: three fixes made after the whole of lite-ai was run through, each with a failing test written first. (1) `CREATE EXTENSION vector`
+  gets `SCHEMA public`: when the role and the schema have the same name (`lite_rag`), `"$user"` comes first in the search_path, and on a new database the extension would be installed into the application schema
+  and be deleted together with it when the schema is dropped; lite-mem and llm-steward have long written it this way. (2) When PgStore is opened, it checks for migrations not yet run and, if there are any, raises an error and hints
+  `literag migrate` (migrations are still run explicitly, not automatically); the local application schema had been behind by the three migrations 0004–0006 without anyone noticing.
+  (3) `errors.redact` uses the same rules as lite-mem: `password = x` (spaces around the equals sign), quoted values, prefixes such as `PGPASSWORD`, and passwords in URL parameters.
+  In addition, open mode gets the Origin and proxy header checks (§7), made into a middleware alongside `TrustedHostMiddleware` (the rules of the whole open mode are in one layer).
+  - /simplify: `pending()` is the same as lite-cache's (lists only file names, does not read SQL); the Origin check moved from a per-request dependency to the middleware; the tests use
+    `MagicMock(wraps=…)` to record the SQL sent. Not changed: the check sits in `PgStore.__init__` and not in `open_store` (it is together with `check_vector`, and
+    callers that construct `PgStore` directly are covered too); two more round trips at open (each process opens only once).
+  - Codex accepted 2 (failing tests first): `redact` also masks `Authorization: Bearer …`, `api_key=`, `token:` and `secret=`;
+    open mode also rejects `Via` and `X-Forwarded-Host/-Proto/-Port/-Prefix` (kept in step with lite-mem).
 
-- **S19 embedding 走 lite-model（2026-11-22）**：架构评审（2026-11-21）定的：HTTP embedder 收进 lite-model。lite-mem 在它的 S14
-  已经迁了；lite-rag 的 embedder 功能更多（并发、400/413 对半拆、可配的批大小、`dimensions`），所以先给 lite-model 补齐（0.6.0），再只迁
-  ollama 和 openai 两种。Voyage、Cohere、Gemini 的请求格式 lite-model 不支持，fastembed 和 sentence-transformers 在进程内跑，这几种照旧。
-  - 用户配置不变：`LITERAG_EMBEDDING__*` 的键和默认值都没变，`_LiteModelEmbedder` 由它生成 lite-model 的 `ModelsConfig`（backend 名就是
-    provider 名，openai 不设 `api_key_env` 时为 keyless）。
-  - 索引身份不变（先写测试固定）；Ollama 改走 `/v1/embeddings`，`-m ollama` 测试里向量与 `/api/embed` 逐元素相等，含前缀；把输出故意
-    倒序后测试变红。
-  - 吞吐：README 段落 130 条，默认并发 4、批 32，改前和改后交替各跑两组，每组 3 次，中位数都是 4.8 秒。
-  - 有意改的旧测试：`test_embedding.py` 里 Ollama / OpenAI 的线上格式改成 `/v1/embeddings` 的请求和回复。重试测试不再检查 lite-rag 自己
-    的退避秒数（退避现在是 SDK 的），只检查重试的是同一个模型、次数正确、4xx 不重试。新加：400/413 对半拆、Ollama 不发 `dimensions`。
-  - 行为变化：没有 key 的 OpenAI 兼容端点（TEI、vLLM）现在会收到 `Authorization: Bearer unused`，这是 lite-model 的占位符，因为 OpenAI
-    SDK 一定要有 key；以前不带这个头。这些服务没配鉴权时会忽略它；测试保证发出去的只会是占位符，不会是环境里的 key。
-    错误信息也不再带上游的原文（lite-model 规则 8）。
-  - 收尾：/simplify 采纳 6 条：
-    - dim 的探测和校验抽成 `_ProbedDim`，HTTP 和 lite-model 两种 embedder 共用；
-    - `_OpenAIShape` 只剩 Voyage 一个子类，并回 `VoyageEmbedder`；
-    - provider 之间的差别改成 `_role` / `_backend` 两个钩子，去掉 `sends_dimensions` 标志；
-    - 建 lite-model 客户端和转换错误改用 `llm.build_model`（多了 `roles` 参数），和 LLM 那边共用；
-    - Ollama 的默认地址交给 lite-model 的 profile，删掉 `OLLAMA_URL`；
-    - 删掉测试里一个死别名。
-  - Codex：没有 finding。检查：pytest 564 passed；`-m ollama` 10 passed；ruff、mypy 通过。
-- **S20 Voyage 走 lite-model（2026-11-22）**：用户要 Voyage（Anthropic 推荐的 embedding 提供方），并且希望 lite-mem、llm-steward 以后也能用，
-  所以先在 lite-model 0.7.0 加 `voyage` 类型（embed 的 `input_type`、`rerank()`，它的设计 §3.3），再把这里的 `VoyageEmbedder` 换过去。
-  - `VoyageEmbedder` 现在是 `_LiteModelEmbedder`：`input_type = True` 时把调用的角色（document / query）作 lite-model 的 `input_type` 发出；
-    批大小仍封顶 1000；`base_url` / `api_key_env` 照旧可配。索引身份没变：provider、model、空前缀、dim 都是同一套属性。
-  - 有意改的旧测试（`test_embedding_vendors.py`）：请求体多了 `encoding_format: "base64"`（OpenAI SDK 不带它时自己加上并解码；Voyage
-    不接受 "float"），JSON 浮点的回复照样读；`_base_url` 换成 S19 起的 `endpoint`；错误信息匹配 lite-model 的错误类型名
-    （`BadRequestError`、`AuthenticationError`），因为 lite-model 的错误信息不带上游文本（它的规则 8），不再有 "400" / "401"。对半拆的请求序列
-    测试原样通过（5 → 2 + 3 → 1 + 2）。
-  - Voyage rerank：`RerankConfig.provider` 加 `voyage`，`api_key_env`、`base_url`、`timeout_s`、`max_retries` 只给 voyage（fastembed 设了就报错），
-    model 不写时是 `rerank-2.5`（不把 fastembed 的默认模型名发给 Voyage）。`RerankError` 是 502。测试 `tests/unit/test_rerank_voyage.py`，
-    回复故意按相关度倒序，检查分数回到输入顺序；导入失败时全部红。
-  - `-m voyage`（`tests/integration/test_voyage.py`）：一次真实的 embed（文档与查询）加一次 rerank，没有 `VOYAGE_API_KEY` 时失败而不是跳过；
-    这次没有 key，没跑。契约测试的格式来自 Voyage 2025-12-10 的 API 参考，要等真实调用确认。
-  - /simplify 采纳：Voyage 的 backend 条目由 `voyage_backend()` 给 embedder 和 reranker 共用；`dimensions` 由 `_LiteModelEmbedder` 按
-    `sends_dimensions` 发出（Ollama 为 False，仍不发）；rerank 回复里有未打分的文本就报 `RerankError`，不悄悄过滤；fastembed 也拒绝
-    `timeout_s` / `max_retries`。拒绝：把 `ModelsConfig` 的构造再抽一层（重复很小）；`input_type` 由 lite-model 的 profile 决定而去掉
-    类上的标志（是否按角色发出是 lite-rag 对每种 embedder 的选择）。
-  - Codex：没有需要改的问题；一条小建议成立并修复（先红后绿）：`provider: voyage` 设了 fastembed 的 `cache_dir` 也报错。
-  - 依赖：lite-model 0.7.0、lite-cache 0.3.2（它的 wheel 也指向 lite-model 0.7.0）。检查：pytest 570 passed（PG），`-m ollama` 10 passed，
-    mypy、ruff 干净。
-- **S21 检索路由（2026-11-22）**：用户想要"先用一个小模型选检索方式"。embedding 是索引身份，不能按请求换，所以路由选的是检索模式。
-  2026-11-11 的测量（KB eval-results）说过：用 bge-m3 时，每题选对 vector 或 BM25 也只等于单用 vector，所以当时不做 `mode=auto`。这次先量上限。
-  - 上限（`eval/route_ceiling.py`，三组金标 60 题，六个配置：vector、bm25、hybrid、hybrid+rerank、graph-hybrid、graph-only）：
-    golden 32 题与 exact 12 题上 vector 已全中，逐题选也提不上去；rerank 一题都没帮上，只多约 1 秒。multihop 16 题：最好的固定配置
-    graph-hybrid 12，逐题选的上限 15。合计：vector 54/60，逐题上限 59/60，按题型选（多跳走 graph-hybrid、其余走 vector）56/60。过了门槛（≥2 题）。
-  - 设计：路由只在 `vector` 和 `hybrid`（vector + bm25 + graph）之间选。不给 graph-only：上限表里它在单跳题上只有 13/32，选错的代价太大；
-    hybrid 带 graph 在单跳题上只差 2 题。rerank 不进路由：它没有让任何一题变好。
-  - 结果（qwen3:1.7b 路由，与 graph-hybrid 同一次 eval、同一个图索引；vector 是同日的 mode-vector 运行）：路由 56/60（32、12、12），
-    graph-hybrid 53/60，vector 54/60。路由的选择全对：44 道单跳题全选 vector，12 道多跳题全选 hybrid（多跳集里 4 道关键词题两种都选过，都命中）。
-    也就是正好到了按题型选的上限；多跳题剩下的 4 题是图检索本身没找到。lite-eval compare 都不显著（McNemar p ≥ 0.5，题太少）。
-    代价：每次搜索多一次模型调用，p50 约 650–750 ms（本地 qwen3:1.7b），原来是 4–15 ms。
-  - 结论：不推翻 2026-11-11 的决定，默认不路由；`mode: route` 作为 opt-in 留下，适合问题里混有多跳题、又不想对所有问题都走图检索的场景。
-    llm-gateway 上的对比（2026-11-22，用户启动 gateway 后；四个配置在同一次 eval、同一个图索引）：
-    - gpt-sub：56/60（32、12、12），选择和 qwen3:1.7b 一样全对（多跳集里 4 道关键词题都选了 vector），p50 1.5–1.7 s，是本地 qwen3:1.7b 的两倍多。
-      结论：更大的模型在这组题上没有可提升的地方，本地小模型就够了。
-    - claude-sub-haiku：60 次全失败。gateway 回了 200，但用 `X-LLMGW-Ignored-Params` 说明 claude-agent-sdk 后端不支持输出上限
-      （`max_completion_tokens`），lite-model 按规则报 `IgnoredParameter`（另有 1 次 500）。路由报错、没有退回默认模式，这正是设计要的行为。
-      要在 lite-rag 里用 gateway 的 Claude profile，需要能把一个 role 的 `max_output_tokens` 设成"不限"：现在的 `LLMConfig` 做不到
-      （role 上写 null 会继承顶层的默认 1024，顶层写 null 又按 S15 的规则挪给 answer）。
-      修复（用户同意，2026-11-22）：顶层的 null 留在顶层，只有非 null 的值按 S15 挪给 answer。answer 的结果和以前一样（以前挪过去的 null 也是
-      继承顶层）；index role 和 route 照旧用自己的值，只有自己写了 null 的 role 才变成不限。测试 `test_a_top_level_null_cap_lets_a_role_run_uncapped`
-      （先红后绿）。`route-gateway-claude-haiku.yaml` 改为顶层和 route 都写 `max_output_tokens: null`。
-    - claude-sub-haiku 重跑（修复后，和 graph-hybrid 同一次 eval）：回答了的 57 题选择全对；3 次调用在重试后仍是 gateway 的 502
-      （这次 gateway 日志里约 120 次请求中有 21 次 502，`profile=-`，多数被 lite-model 的同目标重试接住），这 3 次搜索报错，没有退回默认模式。
-      命中 53/60（29、12、12），p50 3.2–3.6 s。
-    - 小结：三个路由模型在答出来的题上都没选错；本地 qwen3:1.7b 最快（0.7 s），gpt-sub 1.6 s，claude-sub-haiku 3.4 s 且有间歇 502。默认保持
-      本地 qwen3:1.7b。
-  - 测试：`tests/unit/test_route.py`、`tests/integration/test_route.py`，导入失败时全部红；后补的 span 测试改坏 span 的 kind 后变红。
-  - /simplify 采纳：每个 router 的 schema 只含它提供的模式（偏离由 schema 拒绝，结构和 graph 的两次尝试一样）；`_answered()` 共用；
-    `Route.mode` 用 `RouteMode`，去掉 cast；`router()` 建好后不再拿锁；提示词里重复的句子用变量；ceiling 脚本改用 lite-eval 的 `load_run`。
-    拒绝：路由和 query embedding 并发（本地 embedding 几十毫秒且有缓存，收益小）；提示词只渲染一次（每次渲染都要新 nonce）；
-    把 route 从每个 Hit 上移到一个返回类型里（会改 `search() -> list[Hit]` 的公开接口，llm-steward 在用）。
-  - Codex：两条 P2。成立一条，先写失败的测试再修：`search_kbs` 的 kb 都不存在时也调用了路由。拒绝一条："`mode: route` 只提供 vector / bm25 时
-    `hybrid_paths` 里的 graph 不该要求 graph.enabled"：`hybrid_paths` 也给按次指定的 `search(mode="hybrid")` 用，这条检查一直与 `mode` 无关。
-    缓存：`route` 不在 `cache.roles` 的默认里，要缓存路由就把它加进去。
-  - 检查：pytest 584 passed（PG），mypy、ruff 干净。
-- **S22 每个 kb 选自己的 embedder（2026-11-22）**：S21 的下一阶段，用户定的：建 kb 时指定（不自动挑），新写跨语言语料。
-  - 做法：`Settings.embeddings` 是命名的额外 embedder；runtime 按名字持有 `Indexer`（embedder、token 计数器、chunker），非 default 的第一次
-    用到才建（只查 default kb 的服务不需要别家的 key）。kb 表本来就记了 provider、model、dim、前缀，所以不加迁移：打开 kb 时按记录的
-    身份找回已配置的 embedder（`RagRuntime.signature` 只读配置、不建 embedder；同模型不同维度时才比 dim）。找不到就 `KbMismatch`，信息
-    列出已配置的名字；只配 default 时行为和以前一样。`search_kbs` 按 embedder 分组，每组 embed 一次 query，组内按相似度合并（和以前
-    一样），组间用 RRF；`Hit.scores["vector"]` 仍是它在自己模型下的相似度。contextualizer 的上下文预算仍用 default 的计数器（只影响
-    LLM 输入的截断，不进索引身份）。
-  - 跨语言评测集（`eval/corpus-xlang/{en,zh}`，各 4 篇虚构制度文档；`golden-xlang.jsonl` 24 题：中文问英文文档 8、英文问中文文档 8、同语言 8；
-    新字段 `doc_lang`，报告按它分组）。`literag eval --kb-per-dir`：每个子目录一个 kb，子目录名等于某个命名 embedder 时用它。
-    结果（hit@1 / hit@5 / MRR@10，用最终代码重跑，数字一致）：
+- **S19 Embedding goes through lite-model (2026-11-22)**: decided by the architecture review (2026-11-21): the HTTP embedders are taken into lite-model. lite-mem moved in its S14;
+  lite-rag's embedders have more features (concurrency, halving on 400/413, a configurable batch size, `dimensions`), so lite-model was first brought up to par (0.6.0), and only
+  the ollama and openai kinds were moved. lite-model does not support the request formats of Voyage, Cohere and Gemini, and fastembed and sentence-transformers run in-process, so those stay as they were.
+  - User config is unchanged: the keys and defaults of `LITERAG_EMBEDDING__*` did not change, and `_LiteModelEmbedder` generates lite-model's `ModelsConfig` from them (the backend name is the
+    provider name, and openai is keyless when `api_key_env` is not set).
+  - The index identity is unchanged (fixed by a test first); Ollama now goes through `/v1/embeddings`, and in the `-m ollama` test the vectors equal those of `/api/embed` element by element, prefixes included; the test turned red when the output was deliberately
+    put in reverse order.
+  - Throughput: 130 README paragraphs, default concurrency 4, batch 32, two groups before and two after run alternately, 3 runs per group, and the medians are all 4.8 seconds.
+  - Old tests changed on purpose: in `test_embedding.py` the wire format of Ollama / OpenAI is changed to the request and reply of `/v1/embeddings`. The retry test no longer checks lite-rag's own
+    backoff seconds (the backoff is now the SDK's), only that the same model is retried, the count is right, and 4xx is not retried. New: halving on 400/413, Ollama sends no `dimensions`.
+  - Behaviour change: an OpenAI-compatible endpoint without a key (TEI, vLLM) now receives `Authorization: Bearer unused`, which is lite-model's placeholder, because the OpenAI
+    SDK insists on a key; it was not sent before. These services ignore it when no authentication is configured; a test guarantees that what is sent can only be the placeholder, never a key from the environment.
+    Error messages also no longer carry the upstream text (lite-model rule 8).
+  - Close-out: /simplify accepted 6:
+    - the dim probe and check are extracted into `_ProbedDim`, shared by the HTTP and lite-model embedders;
+    - `_OpenAIShape` was left with only the Voyage subclass and is merged back into `VoyageEmbedder`;
+    - the differences between providers become the two hooks `_role` / `_backend`, and the `sends_dimensions` flag is removed;
+    - building the lite-model client and converting errors use `llm.build_model` (with a new `roles` parameter), shared with the LLM side;
+    - the default Ollama address is left to lite-model's profile, and `OLLAMA_URL` is deleted;
+    - a dead alias in the tests is deleted.
+  - Codex: no findings. Checks: pytest 564 passed; `-m ollama` 10 passed; ruff and mypy pass.
+- **S20 Voyage goes through lite-model (2026-11-22)**: the user wanted Voyage (the embedding provider Anthropic recommends), and wanted lite-mem and llm-steward to be able to use it later too,
+  so the `voyage` type was first added in lite-model 0.7.0 (`input_type` of embed, `rerank()`, its design §3.3), and then `VoyageEmbedder` here was switched over.
+  - `VoyageEmbedder` is now a `_LiteModelEmbedder`: with `input_type = True` the role of the call (document / query) is sent as lite-model's `input_type`;
+    the batch size is still capped at 1000; `base_url` / `api_key_env` are configurable as before. The index identity did not change: provider, model, empty prefixes and dim are the same attributes.
+  - Old tests changed on purpose (`test_embedding_vendors.py`): the request body gains `encoding_format: "base64"` (the OpenAI SDK adds it itself when it is not given and decodes; Voyage
+    does not accept "float"), and replies with JSON floats are still read; `_base_url` is replaced by the `endpoint` of S19; error messages match the error type names of lite-model
+    (`BadRequestError`, `AuthenticationError`), because lite-model's error messages do not carry the upstream text (its rule 8), so there is no more "400" / "401". The request sequence test for halving
+    passes as it was (5 → 2 + 3 → 1 + 2).
+  - Voyage rerank: `RerankConfig.provider` gets `voyage`, and `api_key_env`, `base_url`, `timeout_s`, `max_retries` are for voyage only (fastembed raises an error if they are set),
+    and when model is not written it is `rerank-2.5` (the default model name of fastembed is not sent to Voyage). `RerankError` is 502. The test is `tests/unit/test_rerank_voyage.py`;
+    the reply is deliberately in reverse relevance order, to check that the scores come back to input order; when the import fails, everything is red.
+  - `-m voyage` (`tests/integration/test_voyage.py`): one real embed (document and query) plus one rerank; it fails rather than skips when there is no `VOYAGE_API_KEY`;
+    there was no key this time, so it was not run. The format of the contract tests comes from the Voyage API reference of 2025-12-10, and waits for a real call to confirm.
+  - /simplify accepted: the Voyage backend entry is shared by the embedder and the reranker through `voyage_backend()`; `dimensions` is sent by `_LiteModelEmbedder` according to
+    `sends_dimensions` (False for Ollama, which still does not send it); an unscored text in the rerank reply raises `RerankError` rather than being filtered silently; fastembed also rejects
+    `timeout_s` / `max_retries`. Rejected: one more layer for the construction of `ModelsConfig` (the duplication is small); having lite-model's profile decide `input_type` and removing the flag on the
+    class (whether to send by role is lite-rag's choice for each embedder).
+  - Codex: nothing that needed a change; one small suggestion held up and was fixed (red then green): `provider: voyage` with fastembed's `cache_dir` set also raises an error.
+  - Dependencies: lite-model 0.7.0, lite-cache 0.3.2 (its wheel also points to lite-model 0.7.0). Checks: pytest 570 passed (PG), `-m ollama` 10 passed,
+    mypy and ruff clean.
+- **S21 Retrieval routing (2026-11-22)**: the user wanted "to pick the retrieval method with a small model first". The embedding is part of the index identity and cannot change per request, so the route picks the retrieval mode.
+  A measurement of 2026-11-11 (KB eval-results) said that with bge-m3, picking vector or BM25 correctly for each question only equals using vector alone, so `mode=auto` was not built then. This time the ceiling was measured first.
+  - Ceiling (`eval/route_ceiling.py`, three golden sets with 60 questions, six configs: vector, bm25, hybrid, hybrid+rerank, graph-hybrid, graph-only):
+    on the 32 golden questions and the 12 exact questions vector already hits all, so picking per question cannot raise it; rerank did not help a single question, and only added about 1 second. On the 16 multihop questions: the best fixed config
+    graph-hybrid gets 12, and the ceiling of picking per question is 15. In total: vector 54/60, the per-question ceiling 59/60, picking by question type (multi-hop goes to graph-hybrid, the rest to vector) 56/60. It passed the threshold (≥ 2 questions).
+  - Design: the route picks only between `vector` and `hybrid` (vector + bm25 + graph). Graph-only is not offered: in the ceiling table it gets only 13/32 on single-hop questions, and the cost of a wrong pick is too high;
+    hybrid with graph is only 2 questions behind on single-hop questions. Rerank does not enter the route: it did not improve any question.
+  - Result (qwen3:1.7b route, in the same eval and with the same graph index as graph-hybrid; vector is the mode-vector run of the same day): route 56/60 (32, 12, 12),
+    graph-hybrid 53/60, vector 54/60. All the route's picks are right: all 44 single-hop questions pick vector, all 12 multi-hop questions pick hybrid (in the multi-hop set, 4 keyword questions picked both ways, and both hit).
+    That is exactly the ceiling of picking by question type; the remaining 4 multi-hop questions are ones graph retrieval itself did not find. lite-eval compare is not significant anywhere (McNemar p ≥ 0.5, too few questions).
+    Cost: one more model call per search, p50 about 650–750 ms (local qwen3:1.7b), against 4–15 ms before.
+  - Conclusion: the decision of 2026-11-11 is not overturned, and there is no routing by default; `mode: route` stays as an opt-in, suitable where the questions include multi-hop ones and you do not want to send every question through graph retrieval.
+    Comparison on llm-gateway (2026-11-22, after the user started the gateway; four configs in the same eval and with the same graph index):
+    - gpt-sub: 56/60 (32, 12, 12), the picks are all right as with qwen3:1.7b (in the multi-hop set the 4 keyword questions all picked vector), p50 1.5–1.7 s, more than twice that of the local qwen3:1.7b.
+      Conclusion: a larger model has nothing to improve on this set of questions, and the local small model is enough.
+    - claude-sub-haiku: all 60 calls failed. The gateway returned 200, but said through `X-LLMGW-Ignored-Params` that the claude-agent-sdk backend does not support an output cap
+      (`max_completion_tokens`), and lite-model raised `IgnoredParameter` by its rules (plus one 500). The route raised an error and did not fall back to a default mode, which is exactly the behaviour the design wants.
+      To use the gateway's Claude profile in lite-rag, it must be possible to set the `max_output_tokens` of one role to "unlimited": the current `LLMConfig` cannot do it
+      (writing null on a role inherits the top-level default 1024, and writing null at the top level is moved to answer by the S15 rule).
+      Fix (the user agreed, 2026-11-22): a top-level null stays at the top level, and only non-null values are moved to answer by S15. The result for answer is the same as before (a null moved over before was also
+      inherited from the top level); the index roles and route use their own values as before, and only a role that writes null itself becomes unlimited. Test `test_a_top_level_null_cap_lets_a_role_run_uncapped`
+      (red then green). `route-gateway-claude-haiku.yaml` now writes `max_output_tokens: null` at both the top level and route.
+    - claude-sub-haiku re-run (after the fix, in the same eval as graph-hybrid): on the 57 questions that were answered all picks are right; 3 calls were still a gateway 502 after retries
+      (in the gateway log this time, 21 of about 120 requests were 502, `profile=-`, most caught by lite-model's same-target retry), and these 3 searches raised errors, with no fallback to a default mode.
+      Hits 53/60 (29, 12, 12), p50 3.2–3.6 s.
+    - Summary: none of the three route models picked wrongly on the questions they answered; the local qwen3:1.7b is the fastest (0.7 s), gpt-sub 1.6 s, claude-sub-haiku 3.4 s with intermittent 502s. The default stays
+      the local qwen3:1.7b.
+  - Tests: `tests/unit/test_route.py`, `tests/integration/test_route.py`, all red when the import fails; the span test added later turned red after the kind of the span was broken.
+  - /simplify accepted: the schema of each router contains only the modes it offers (a deviation is rejected by the schema, and the structure is the same as the two attempts of graph); `_answered()` is shared;
+    `Route.mode` uses `RouteMode`, removing the cast; `router()` no longer takes the lock once built; a repeated sentence in the prompt uses a variable; the ceiling script uses lite-eval's `load_run`.
+    Rejected: running the route and the query embedding concurrently (a local embedding takes tens of milliseconds and is cached, so the gain is small); rendering the prompt only once (every render needs a new nonce);
+    moving route from each Hit to a return type (it would change the public interface `search() -> list[Hit]`, which llm-steward uses).
+  - Codex: two P2. One held up, fixed after a failing test first: `search_kbs` called the route even when none of the kbs exists. One rejected: "when `mode: route` offers only vector / bm25,
+    graph in `hybrid_paths` should not require graph.enabled": `hybrid_paths` is also used by a per-call `search(mode="hybrid")`, and this check has always been independent of `mode`.
+    Cache: `route` is not in the default of `cache.roles`; to cache the route, add it.
+  - Checks: pytest 584 passed (PG), mypy and ruff clean.
+- **S22 Each kb picks its own embedder (2026-11-22)**: the next stage after S21, decided by the user: the embedder is given when the kb is created (not picked automatically), and a new cross-lingual corpus is written.
+  - Approach: `Settings.embeddings` holds the extra named embedders; the runtime holds an `Indexer` (embedder, token counter, chunker) per name, and a non-default one is built only when first
+    used (a service that queries only default kbs needs no key of another vendor). The kb table already recorded provider, model, dim and prefixes, so no migration is added: when a kb is opened, the configured embedder is found again from the recorded
+    identity (`RagRuntime.signature` only reads the config and builds no embedder; dim is compared only when the model is the same but the dimension differs). If none is found it raises `KbMismatch`, and the message
+    lists the configured names; with only default configured, behaviour is as before. `search_kbs` groups by embedder and embeds the query once per group, merges within a group by similarity (as before),
+    and across groups by RRF; `Hit.scores["vector"]` is still its similarity under its own model. The context budget of the contextualizer still uses the default's counter (it affects only the truncation of
+    the LLM input and does not enter the index identity).
+  - Cross-lingual eval set (`eval/corpus-xlang/{en,zh}`, 4 fictional policy documents each; `golden-xlang.jsonl` 24 questions: Chinese asking about English documents 8, English asking about Chinese documents 8, same language 8;
+    a new field `doc_lang`, by which the report groups). `literag eval --kb-per-dir`: one kb per subdirectory, and when the subdirectory name equals a named embedder, that embedder is used.
+    Results (hit@1 / hit@5 / MRR@10, re-run with the final code, numbers agree):
 
-    | 配置 | hit@1 | hit@5 | MRR@10 | p50 ms |
+    | Config | hit@1 | hit@5 | MRR@10 | p50 ms |
     | --- | --- | --- | --- | --- |
-    | bge-m3（两个 kb 都用） | 1.00 | 1.00 | 1.000 | 7 |
+    | bge-m3 (both kbs) | 1.00 | 1.00 | 1.000 | 7 |
     | Qwen3-Embedding-0.6B | 0.92 | 1.00 | 0.951 | 8 |
     | MiniLM | 0.92 | 1.00 | 0.918 | 5 |
     | multilingual-e5-large | 0.58 | 0.83 | 0.683 | 7 |
-    | 混用：en 用 Qwen3、zh 用 bge-m3 | 0.46 | 1.00 | 0.717 | 10 |
-    | 混用：en 用 e5、zh 用 bge-m3 | 0.50 | 1.00 | 0.750 | 8 |
-    | 混用 Qwen3 / bge-m3 + rerank | **1.00** | 1.00 | 1.000 | 813 |
-    | 混用 Qwen3 / bge-m3，hybrid | 0.42 | 0.92 | 0.587 | 14 |
+    | Mixed: en with Qwen3, zh with bge-m3 | 0.46 | 1.00 | 0.717 | 10 |
+    | Mixed: en with e5, zh with bge-m3 | 0.50 | 1.00 | 0.750 | 8 |
+    | Mixed Qwen3 / bge-m3 + rerank | **1.00** | 1.00 | 1.000 | 813 |
+    | Mixed Qwen3 / bge-m3, hybrid | 0.42 | 0.92 | 0.587 | 14 |
 
-    读法：bge-m3 单独就全对，这组题对它太容易，混用不可能更好。混用时 hit@5 不变，但 hit@1 掉到一半：两个 kb 各自的第一名在 RRF 里
-    同分（都是 1/(k+1)），按 key 排时总是先出 en kb 的；doc_lang=zh 的题 hit@1 全是 0。rank 融合分不出哪个 kb 的第一名更好，这是方案里
-    预料的风险。cross-encoder rerank 让两边的分数可比，恢复到 1.00（+0.8 秒）；hybrid 加 BM25 反而更差。
-  - 结论：能力保留（让 Voyage 这类 kb 和本地 kb 共存、用 `reindex --embedding` 换模型）；跨 embedder 的 `search_kbs` 应开 rerank。
-    引擎在跨 embedder 又没开 rerank 时警告一次（`RagRuntime.warn_once`）。
-  - 测试：`tests/unit/test_kb_embedders.py`、`tests/integration/test_kb_embedders.py`、`test_eval.py`（`--kb-per-dir`、xlang 金标、`doc_lang`、计费、kb 名）、
-    `test_cli.py`、`test_server.py`；都先看到红。"只有一个 embedder 时和以前一样"的测试第一版太弱（把融合改成总走 RRF 仍然通过），
-    改成和余弦相似度逐条比对后再验证变红。
-  - /simplify 采纳：`Indexer`/默认属性只存一份（`embedder`/`counter`/`chunker` 变成派生属性）；`KbMismatch` 文本合成 `_mismatch`；`KbInfo.signature()`；
-    `DEFAULT_EMBEDDING` 放到 `types.py`；`_open` 写路径一次 `get_or_create_kb`、检查过且名字相同就跳过；`create_kb` 不再多读一次；`_search` 不再
-    在两处判断 embedder 数（单组时就是按相似度合并）；`warn_once` 用 runtime 的锁；eval 只建用到的命名 embedder、无分组时当成一组。
-    拒绝：kb 表存 embedder 名（要迁移；按身份匹配可以经受改名）；签名缓存（开销小）；contextualizer 按 kb 用计数器（只影响预算）；
-    去掉 `RagEngine._chunker`（`test_parent_child.py` 直接改它来模拟估计偏低，按规则不改已有测试，保留并写明）。
-  - Codex：两条 P2，都成立，先写失败的测试再修：`--kb-per-dir` 的计费只看 default embedder（命名的付费 embedder 会被标成 free）；kb 名
-    直接用目录名，可能重名或不合法，改为按位置编号。顺带发现 S21 的缺口：`mode: route` 时计费没算 route role，补上并先写测试。
-  - 检查：pytest 606 passed（PG），`-m ollama` 10 passed，mypy、ruff 干净。llm-steward 只用 `upsert_text` 和 `search_kbs`，接口不变，这次不升它的 pin。
-- **S23 Cohere / Gemini 走 lite-model（2026-11-22）**：S19（ollama / openai）、S20（voyage）之后剩下的两个 HTTP embedder。lite-model 0.8.0 为它们加了
-  只做 embed 的 `cohere`、`gemini` 类型（它的设计 §3.4）。
-  - `CohereEmbedder`、`GeminiEmbedder` 改为 `_LiteModelEmbedder` 的子类；批上限 96 / 100 照旧；`vendor_backend()` 由 voyage、cohere、gemini 和 Voyage reranker 共用；
-    `input_type` 从类上的布尔改成方法 `_input_type(role)`，Gemini 在模型 profile 有前缀时返回 None（不发 taskType，和以前一样）。
-  - `_HTTPEmbedder`、`_retryable`、`_too_large` 删除（再没有人用）。
-  - 验证：`test_embedding_vendors.py` 里 Cohere / Gemini 的测试一条不改就通过（URL、`authorization` / `x-goog-api-key`、请求体、`input_type` / `taskType`、
-    `outputDimensionality`、批上限、gemini-embedding-2 的前缀、缺 key 报错），所以请求和索引身份都没变。
-  - Codex：两条都成立并修复：锁文件在同一个改动里升到 lite-model 0.8.0（和 lite-cache 0.3.3）；design 里描述 `_HTTPEmbedder` 为现行做法的那段改写为历史。
-    依赖：lite-model 0.8.0、lite-cache 0.3.3。检查：pytest 606 passed，`-m ollama` 通过，mypy、ruff 干净。
-- **S24 更难的跨语言评测（2026-11-22）**：S22 的跨语言集对 bge-m3 太容易（24/24），回答不了"按语料选模型是否更好"。新集合每份制度有
-  几个几乎一样的版本（云服务的三个档位、备份制度的两个年份、三个地区的机房、两档采购、两类员工的休假），只差数字或条件；问题点名版本，
-  证据句只在那一篇（生成脚本断言，测试再检查一遍）。36 题：中文问英文 12、英文问中文 12、同语言 12。`--kb-per-dir`，en / zh 两个 kb。
+    How to read it: bge-m3 alone is all correct, this set is too easy for it, and mixing cannot do better. When mixed, hit@5 is unchanged but hit@1 drops to half: the first place of each of the two kbs ties in RRF
+    (both 1/(k+1)), and when sorted by key the en kb always comes out first; for the doc_lang=zh questions hit@1 is all 0. Rank fusion cannot tell which kb's first place is better, a risk that was
+    foreseen in the plan. Cross-encoder rerank makes the scores of the two sides comparable and restores 1.00 (+0.8 s); hybrid with BM25 is worse instead.
+  - Conclusion: the capability stays (let kbs of Voyage and the like coexist with local kbs, and change models with `reindex --embedding`); `search_kbs` across embedders should turn on rerank.
+    The engine warns once when across embedders and rerank is not on (`RagRuntime.warn_once`).
+  - Tests: `tests/unit/test_kb_embedders.py`, `tests/integration/test_kb_embedders.py`, `test_eval.py` (`--kb-per-dir`, the xlang golden set, `doc_lang`, billing, kb name),
+    `test_cli.py`, `test_server.py`; all seen red first. The first version of the "same as before with only one embedder" test was too weak (it still passed after fusion was changed to always use RRF),
+    and it was changed to compare item by item with cosine similarity and then verified to turn red.
+  - /simplify accepted: `Indexer`/the default attributes are stored once (`embedder`/`counter`/`chunker` become derived attributes); the `KbMismatch` text is composed in `_mismatch`; `KbInfo.signature()`;
+    `DEFAULT_EMBEDDING` moves to `types.py`; the write path of `_open` does one `get_or_create_kb`, and skips when checked and the name is the same; `create_kb` no longer reads once more; `_search` no longer
+    checks the number of embedders in two places (with a single group it is just a merge by similarity); `warn_once` uses the runtime's lock; eval builds only the named embedders it uses, and treats it as one group when there is no grouping.
+    Rejected: storing the embedder name in the kb table (needs a migration; matching by identity survives a rename); a signature cache (the cost is small); the contextualizer using a counter per kb (it affects only the budget);
+    removing `RagEngine._chunker` (`test_parent_child.py` changes it directly to simulate an underestimate, and by the rules an existing test is not changed, so it stays, with a note).
+  - Codex: two P2, both held up, fixed after failing tests first: the billing of `--kb-per-dir` looked only at the default embedder (a named paid embedder would be marked free); the kb name
+    used the directory name directly, which could collide or be invalid, and was changed to a number by position. A gap of S21 was found on the way: with `mode: route` the billing did not count the route role, which was added, test first.
+  - Checks: pytest 606 passed (PG), `-m ollama` 10 passed, mypy and ruff clean. llm-steward uses only `upsert_text` and `search_kbs`, whose interfaces are unchanged, so its pin is not raised this time.
+- **S23 Cohere / Gemini go through lite-model (2026-11-22)**: the two HTTP embedders left after S19 (ollama / openai) and S20 (voyage). lite-model 0.8.0 added for them the
+  embed-only `cohere` and `gemini` types (its design §3.4).
+  - `CohereEmbedder` and `GeminiEmbedder` become subclasses of `_LiteModelEmbedder`; the batch limits 96 / 100 are as before; `vendor_backend()` is shared by voyage, cohere, gemini and the Voyage reranker;
+    `input_type` changes from a boolean on the class to a method `_input_type(role)`, and Gemini returns None when the model profile has a prefix (no taskType is sent, as before).
+  - `_HTTPEmbedder`, `_retryable` and `_too_large` are deleted (nobody uses them any more).
+  - Verification: the Cohere / Gemini tests in `test_embedding_vendors.py` pass without changing a single one (URL, `authorization` / `x-goog-api-key`, request body, `input_type` / `taskType`,
+    `outputDimensionality`, batch limit, the prefix of gemini-embedding-2, error on a missing key), so the requests and the index identity did not change.
+  - Codex: both held up and were fixed: the lock file is raised to lite-model 0.8.0 (and lite-cache 0.3.3) in the same change; the passage in the design that described `_HTTPEmbedder` as the current approach is rewritten as history.
+    Dependencies: lite-model 0.8.0, lite-cache 0.3.3. Checks: pytest 606 passed, `-m ollama` passes, mypy and ruff clean.
+- **S24 Harder cross-lingual eval (2026-11-22)**: the cross-lingual set of S22 was too easy for bge-m3 (24/24) and could not answer "is choosing the model by corpus better". In the new set each policy has
+  several almost identical versions (three tiers of a cloud service, two years of a backup policy, machine rooms in three regions, two tiers of procurement, leave for two kinds of employees), differing only in a number or a condition; the question names the version, and
+  the evidence sentence is in that one document only (the generation script asserts it, and a test checks it again). 36 questions: Chinese asking about English 12, English asking about Chinese 12, same language 12. `--kb-per-dir`, two kbs en / zh.
 
-  | 配置 | hit@1 | hit@5 | MRR@10 | doc_lang=zh hit@1 | p50 ms |
+  | Config | hit@1 | hit@5 | MRR@10 | doc_lang=zh hit@1 | p50 ms |
   | --- | --- | --- | --- | --- | --- |
   | bge-m3 | 0.94 | 1.00 | 0.968 | 0.889 | 15 |
   | Qwen3-Embedding-0.6B | **0.97** | 1.00 | 0.986 | 0.944 | 6–14 |
@@ -612,312 +612,312 @@ lite-rag/
   | MiniLM | 0.72 | 1.00 | 0.833 | 0.667 | 5 |
   | bge-m3 + rerank | 0.97 | 1.00 | 0.981 | 0.944 | 813 |
   | Qwen3 + rerank | 0.94 | 1.00 | 0.968 | 0.889 | 786 |
-  | 混用：en 用 bge-m3、zh 用 Qwen3（各自语言最好的） | 0.50 | 1.00 | 0.743 | 0.000 | 7 |
-  | 混用 + rerank | 0.94 | 1.00 | 0.968 | 0.889 | 815 |
+  | Mixed: en with bge-m3, zh with Qwen3 (the best for each language) | 0.50 | 1.00 | 0.743 | 0.000 | 7 |
+  | Mixed + rerank | 0.94 | 1.00 | 0.968 | 0.889 | 815 |
 
-  读法：英文文档上 bge-m3 和 Qwen3 都全对，中文文档上 Qwen3 最好，所以"各用各最好的"就是 en bge-m3 + zh Qwen3。可它不开 rerank 是 0.50
-  （S22 的平局：两边第一名同分，en 的总在前）；开 rerank 是 0.94，不如单用 Qwen3（0.97）。rerank 在这组题上本身就让一道中文题掉了名次。
-  lite-eval compare：Qwen3 对混用 + rerank、对 Qwen3 + rerank、对 bge-m3 都是 3 个不一致的题，McNemar p = 1，不显著。
-  结论：给不同语料选不同模型，没有赢过最强的单一多语言模型；默认仍是一个 embedder。按 kb 选 embedder（S22）的价值是让不同模型的 kb
-  共存、方便换模型，不是提高命中。默认模型不改（bge-m3：换成 Qwen3 要所有 kb 重建索引，在 36 题上差 1 题、不显著，值不值得是用户的决定）。
-  - 测试：`test_the_hard_cross_language_set_matches_its_corpus_and_its_generator`（先看到红：把一题的 doc 改成它的兄弟文档）。
+  How to read it: on English documents bge-m3 and Qwen3 are both all correct, and on Chinese documents Qwen3 is best, so "each uses its own best" is en bge-m3 + zh Qwen3. But without rerank it is 0.50
+  (the tie of S22: the first places of the two sides have the same score, and en always comes first); with rerank it is 0.94, which is not as good as Qwen3 alone (0.97). Rerank itself pushed one Chinese question down in rank on this set.
+  lite-eval compare: Qwen3 against mixed + rerank, against Qwen3 + rerank, and against bge-m3 each have 3 discordant questions, McNemar p = 1, not significant.
+  Conclusion: choosing different models for different corpora did not beat the strongest single multilingual model; the default is still one embedder. The value of choosing the embedder per kb (S22) is to let kbs of different models
+  coexist and to make changing models easy, not to raise hits. The default model is not changed (bge-m3: switching to Qwen3 would rebuild the index of every kb, and on 36 questions it is 1 question better, not significant, so whether it is worth it is the user's decision).
+  - Test: `test_the_hard_cross_language_set_matches_its_corpus_and_its_generator` (seen red first: the doc of one question was changed to its sibling document).
 
-- **S25 Lineage（2026-11-24/25）**：owner 要把 lite-rag 做成通用模块，并具备答案溯源。对照代码后发现"增量重处理"已经有了（文档 hash 跳过、
-  `embedding_cache_<dim>`、lite-cache L1、外键级联删除），所以选"账本"方案：通用层只记录和查询，不驱动计算；lite-rag 的流程不变，在已有事务里记账。
-  rule 3（换模型 = 新 kb）、rule 4（chunk id 固定、整篇替换）不变。决定与理由见 spec；实现计划 `docs/superpowers/plans/2026-11-25-lineage.md`。
-  - 测试抓到并修掉：trace 时间原来在模型回答之后取（回答期间改文档会显示"未记录"）；读 chunk 与取时间之间的竞态（Codex，改用 `started_by`）。
-  - 安全审查：删除的产物原文立即清空（原来要等 gc）。
-  - trace 存储：每条 trace 约 2×`top_k`（rerank 关）到 2×`top_n`+`top_k`（rerank 开）行；`in_context` 不存、读时推出：rerank 关（默认）时 search 的 trace 行数减半，ask 的少约三分之一。
-    估算：每天 1 万次、保留 90 天、rerank 开，PG 约 5–10 GB。
-  - 合并前补充：`record_cited` 每个 trace 一次；`literag trace purge`；模型失败的 ask 也写 trace（`failed`）；`record_many` 批量写入。
-  - 没做的：不剪稳定 chunk 指向旧文档版本的边（那是来历本身）；
-    账本的 HTTP 查询接口；llm-steward 改用 `search_kbs_traced` + `record_cited` 是它升级 pin 之后的事。
-  - 收尾记录（simplify、Codex）：每个阶段的提交信息里有；S25d 见其提交。
+- **S25 Lineage (2026-11-24/25)**: the owner wanted lite-rag to become a generic module, with answer lineage. After checking the code it turned out that "incremental reprocessing" already exists (document hash skip,
+  `embedding_cache_<dim>`, lite-cache L1, foreign-key cascade delete), so the "ledger" approach was chosen: the generic layer only records and queries and does not drive computation; lite-rag's flow is unchanged, and the ledger is written inside the existing transaction.
+  Rule 3 (changing the model = a new kb) and rule 4 (fixed chunk ids, whole-document replacement) are unchanged. The decisions and reasons are in the spec; the implementation plan is `docs/superpowers/plans/2026-11-25-lineage.md`.
+  - Caught by tests and fixed: the trace time used to be taken after the model answered (a document changed during the answer would show "not recorded"); the race between reading the chunks and taking the time (Codex, changed to use `started_by`).
+  - Security review: the source text of a deleted artifact is cleared at once (it used to wait for gc).
+  - Trace storage: each trace is about 2×`top_k` (rerank off) to 2×`top_n`+`top_k` (rerank on) rows; `in_context` is not stored and is derived at read time: with rerank off (the default) the trace rows of a search are halved, and those of an ask are about a third fewer.
+    Estimate: 10 thousand a day, kept 90 days, rerank on, about 5–10 GB on PG.
+  - Added before the merge: `record_cited` once per trace; `literag trace purge`; an ask whose model failed also writes a trace (`failed`); `record_many` batch writes.
+  - Not done: edges from a stable chunk to an old document version are not pruned (that is the lineage itself);
+    an HTTP query interface for the ledger; llm-steward switching to `search_kbs_traced` + `record_cited` is for after it raises its pin.
+  - Close-out records (simplify, Codex): in the commit message of each stage; for S25d see its commit.
 
-## 13. 待确认
+## 13. Open questions
 
-- 各依赖的 license（Ollama、pgvector、Chroma、jieba、bge-m3、bge-reranker、qwen3）：锁定版本时逐个核对，写进 README。
-- rerank 的打包方式：fastembed 的 cross-encoder 还是 sentence-transformers。S4 开始前查文档确认。前者更轻，不需要 torch。
-- PDF 纯文本抽取用哪个库：S2 时确认。
-- ~~PG 驱动与 async~~ → S1 已定（2026-11-08）：sync 核心 + psycopg 3（`psycopg[binary,pool]==3.3.8`）；向量以 `float8[]` 传入、在 SQL 里转换为 `vector` / `halfvec`，不需要 `pgvector` Python 包；S6 的服务层在线程池里调用，并发上限可配置。
-- S2 实现说明（2026-11-08）：
-  - 一张 `embeddings_<dim>` 表对应一种维度，HNSW（cosine）索引；维度 ≤ 2000 用 `vector`，2001–4000 用 `halfvec`（pgvector HNSW 的上限），更大则拒绝。
-  - 文档写入在一个事务里完成，并锁住该 kb 的 `kbs` 行，所以同一 kb 的写入是串行的，BM25 统计不会算错。chunk、向量、posting 都用 COPY 批量写入，每张表一次往返；旧版本先删除，再用一条 UPDATE 把统计的增减一次写进 `kbs`。连接池里每个连接的 `search_path` 只设一次。
-  - kb 记录建库时的 embedding（provider、模型、维度、查询前缀、文档前缀）和切块身份；用不同配置打开会被拒绝，并提示沿用原配置或换一个新的 kb 名。比较逻辑在引擎里（`KbInfo.differences`），store 只负责「有就取出，没有就创建」。切块身份由 `ChunkingConfig.identity()` 声明（只列会影响切块结果的字段，以后加字段要显式加进去，避免已有的 kb 因此打不开），再加上计数器的身份：`chars`、`estimate` 或 `hf:<tokenizer>`。`literag reindex` 留到 S5b。
-  - namespace 和 kb 名通过 `KbRef` 传给 store；物理键 `<namespace>:<kb>` 只在 `KbRef.key` 这一处生成，`kbs` 表上的 CHECK 约束保证 `name = namespace || ':' || kb`。
-  - 向量缓存是单独的 `VectorCache` 接口（`PgStore` 同时实现了它），由 `build_embedder(config, cache=store)` 包装上去；缓存表和 embedding 索引表分开建，读缓存不会顺带创建 HNSW 索引。
-  - 切块按 embedding 模型自己的 tokenizer（Hugging Face `tokenizers`，不需要 torch）计数。tokenizer 跟着模型 profile 走：bge-m3 用 `BAAI/bge-m3`，nomic 用 `nomic-ai/nomic-embed-text-v1.5`，`org/name` 形式的模型名直接把自己当作 tokenizer；未知模型用估算。配置 `embedding.tokenizer` 可以覆盖，设为 `""` 表示用估算。fastembed 也走同一张前缀表（用它的普通 `embed`），所以 kb 上记录的前缀就是实际使用的前缀。
-  - `markdown` 策略把标题路径拼在 chunk 前面，再做 embedding 和 BM25；`chunks.text` 保存原文切片，用于引用。
-  - PDF 抽取推迟到 S5b，S2 只支持 txt 和 md。
-- S6 实现说明（2026-11-08）：
-  - 决定（用户 2026-11-08 选定）：namespace 放在请求头，key 按 glob 限定范围；documents 表存原文以支持 reindex；镜像只构建不推送；所有 kb 沿用服务自己的配置（按 kb 单独配置留到以后）。
-  - **reindex**：迁移 0005 给 `documents` 加 `text`、`pages`。`literag reindex <kb> --into <新 kb>` 用当前配置从原文重建到一个新名字，原 kb 不动，切换就是让客户端改用新名字（就地替换要给所有 kb 外键加 `ON UPDATE CASCADE`，暂不做）。目标已存在、或有文档没有原文（0005 之前写入）都直接拒绝，一条也不写；中途失败会删掉建了一半的目标。
-  - 不在 S6 做：按 kb 单独配置；就地 reindex；向量与 BM25 两路并行（检索现在约 4 ms）；发布镜像。
-  - **收尾 /simplify（2026-11-08）**，改了：错误类自己带 HTTP 状态和"能否把信息返回给客户端"（`status` / `expose`），服务端只剩一个处理函数，不再依赖按顺序排列的映射表；`KbNotFound.of()` 统一"kb 不存在"的措辞；上传走 `RagEngine.ingest(doc_id=, source=)`，文档 id 规则只在 `loaders.doc_id_for` 一处，上传边写临时文件边计数，超过上限立即停；检索参数只定义一次；鉴权依赖改为 async、只返回引擎，每个请求现建一个 namespace 副本（浅拷贝，代价与查字典相当），不再有调用方能撑大的缓存；"没有 key 只能绑回环地址"由 `server.check_bind` 负责（`run()` 和 CLI 都经过它）；连接池大小与 `server.max_workers` 一致；reindex 先用一条 SQL 数缺原文的文档，再按 `doc_id` 分页读取，不把整个 kb 的原文读进内存。没改的：把引擎拆成"不绑 namespace 的运行时 + 按 namespace 的视图"（改动超出本阶段；S8 已拆成 `RagRuntime` + `RagEngine`）；`create_kb` 多查一次 kb 行（低频操作）。
-  - **Codex review（2026-11-08）**，5 条都成立并已修复，各有先红后绿的回归测试：上传大小上限原先在路由里才检查，而 FastAPI 在路由运行前已经把整个 multipart 请求读完并落盘，现在由 ASGI 中间件在解析前按 `Content-Length` 拒绝、没有长度时边收边数，返回 413（上限另加 8 KiB 给 multipart 边界）；reindex 先查"目标不存在"再写入，中间被别人建了同名 kb 就会写进去、失败时还会删掉它，现在用一条 `INSERT … ON CONFLICT DO NOTHING` 原子地创建目标，没建成就拒绝；上传报错原样带出客户端的文件名，文件类型不支持时甚至带出服务器上的临时路径，现在一律是固定措辞；不返回给客户端的上游错误写日志前去掉 URL 里的凭据和 `password=`；CI 冒烟测试在服务一直没就绪时也会继续往下跑，现在超时即失败，并检查容器仍在运行。Codex 未发现能越过 namespace 或 kb 授权的路径。
-  - **提交后安全审查（2026-11-09）**，3 条都成立，单独修复：不配 key 的开放模式只靠绑定回环地址，但浏览器里的网页可以用 DNS rebinding 以自己的域名访问回环地址，现在开放模式只接受 `localhost`、`127.0.0.1`、`[::1]` 这几个 Host（Starlette `TrustedHostMiddleware`）；请求体上限原来只管上传，JSON 请求体没有上限，而 FastAPI 在鉴权之前就会读完请求体，现在所有请求都有上限（`server.max_body_mb`，默认 10，上传仍用 `max_upload_mb`），超过返回 413；`GET /v1/kbs` 原来列出 namespace 下全部 kb，会把 key 的 `kbs` 范围之外的名字也告诉调用方，现在只列 key 能访问的。
-  - 端到端（`deploy/compose.yaml`，宿主机 Ollama）发现镜像里没有 `pdf` extra，上传 PDF 会失败；镜像现在带 `server` 和 `pdf`（443 MB）。docling 会带进几 GB 的 torch，不放进镜像，要用就自己构建。
-- S11 实现说明与收尾（2026-11-12）：
-  - 决定（用户 2026-11-12 选定）：lite-rag 尽量覆盖主流 RAG 方式；Graph RAG 第一版只做 local，只支持 PG。
-  - **两版打分**：第一版"实体权重相加 + 实体向量找种子"在多跳题上不如单用向量（见 §5）；离线比较几种打分后改为"问题点名的实体 → 共现扩展 → 范围内按向量排序"，删掉了实体向量表。数字记在 KB `projects/lite-rag/reference/eval-results.md`。
-  - **/simplify 改了**：`Contextualizer` 和 `GraphExtractor` 共用 `llm.BoundedCalls`（限流并发只剩一份）；种子规则从 SQL 搬回 `graph.seeds`；图查询拆成 `GraphStore` Protocol，Chroma 不再需要只会报错的方法；每个 kb 的图一次检索只走一次；`among` 按主键精确扫描；图是否计入 kb 身份统一由 `GraphConfig.index_identity()` 决定（engine 和 eval 共用）；去掉没用的 `doc` 参数、冗余的 `doc_id` 列和两个没用到的关系索引；测试经 `support.make_engine` 构造。
-  - **/simplify 没改的**：类别词判定每次查询扫一遍实体名（规模到了再预计算）；contextual 与图抽取串行（两次 LLM 遍历可以并行，超出本阶段）；两处 prompt 指纹的写法、测试里的 barrier 替身没有合并（收益很小）。
-  - **Codex review**：两条成立并已修复，各有先红后绿的测试：`where` 原先只过滤最终结果，被过滤掉的文档仍能在走图时当桥，现在种子和扩展都只看保留下来的文档；回复缺 `entities` 或 `relations` 字段时被当成空图写入，现在报错。一条不采纳：kb 身份不记录抽取用的 `base_url`、temperature 等，理由与 contextual 一致——身份记录模型和 prompt，不记录采样和传输参数（eval 同样把 `base_url` 视为传输参数）。
-  - 本阶段改了一个已有测试：`test_migrate.py` 的迁移列表加上 `0006_graph`（新增迁移即规格变化）。本阶段早先写的 `test_a_metadata_filter_applies_to_the_graph_path` 验证的是被 Codex 推翻的旧语义，由 `test_a_metadata_filter_also_scopes_the_walk` 取代。
-- S10 收尾（2026-11-09）：
-  - **/simplify 改了**：
-    - `_search` 直接接收已打开的 kb 列表，"kb 不存在时报错还是跳过"由 `search`、`search_kbs` 各自决定，去掉了 `skip_missing` 参数和 `_readable`；"某一路取满了"在合并之后再算。
-    - 多 kb 检索的键类型 `Key = (kb 序号, chunk id)` 只在 `ranking.py` 定义一次，`fusion.py` 引用它。
-    - 鉴权：`Authorizer.check` 接收请求涉及的所有 kb（路径里的或请求体里的），glob 判断只留一处；`POST /v1/search` 的 kb 由依赖 `ReadKbs` 授权，和路径里的 kb 走同一个入口，路由里不再手动检查（变异验证：去掉这条检查后 `test_a_multi_kb_search_needs_access_to_every_kb` 失败）。
-    - `Hit.kb` 改为必填的关键字参数，不再默认为空串；两个检索路由共用 `_hits` 序列化。
-  - **/simplify 没改的**：加深时只重查取满的 kb、一次查出多个 kb 的记录（`WHERE name = ANY`）：几个 kb 的规模下收益可以忽略，记在 §5。
-  - **Codex review**：没有发现问题。
-- S9 实现说明（2026-11-09）：
-  - llm-steward 的 `LiteRagProvider`（`backend/src/llm_steward/providers/literag.py`）把 llm-steward 的 namespace 映射为 `steward/<namespace_id>`，collection 映射为 kb `c-<collection_id>`，条目映射为 `doc_id = entry_id` 的文档。默认走 HTTP（用户 2026-11-09 选定），进程内是可选的 extra，依赖 lite-rag 锁定到一个 git commit（用户选定）。
-  - lite-rag 这边的改动：加 `py.typed`，让 llm-steward 的 mypy strict 能检查对 lite-rag 的调用；`redact`（去掉错误信息里的凭据）从 `server/app.py` 移到 `errors.py`，llm-steward 进程内调用时写日志也要用它（llm-steward 的 Codex review 发现日志里可能有数据库密码）。
-  - 验收：llm-steward 的 KB 合约测试在进程内和 HTTP（真实 `create_app`，经 ASGI，开启 API key）两种方式下都通过，另有一条经 llm-steward 治理层的端到端测试；手动端到端用真实的 `literag serve`（Ollama `bge-m3`）和 `steward serve`：active 条目能检索到，废弃后检索不到并在约 2 秒内从 lite-rag 删除，停掉 lite-rag 后 llm-steward 的 `/health` 报 degraded。
-- S8 收尾（2026-11-09）：
-  - 删掉两条只跑 PG、与合约测试重复的旧用例（`test_delete_kb_removes_everything`、`test_documents_are_read_page_by_page`），用户 2026-11-09 决定。
-  - **用户决定的三处改动**：
-    - 引擎拆成 `RagRuntime`（只建一次，持有 store、embedder、chunker 和模型）和按 namespace 的 `RagEngine`。去掉了 `for_namespace` 的浅拷贝、`serve` 编造的 `server` namespace，以及 `from_settings`、eval、测试里三份重复的组装代码；连接池大小由 `serve` 传入，不再从核心读服务端配置。模型在锁里懒加载，并发请求只建一次。
-    - 元数据过滤两个后端统一为"标量等值"，由引擎在嵌入查询之前检查（`stores.base.check_where`）。
-    - 错误类拆开：`InvalidRequest`（400，返回信息）是调用方的错；`ConfigError` 改为服务自身的配置错误（500，只写日志）。
-  - **/simplify 改了**：
-    - 前缀查找只留 `model_profiles.prefixes_for` 一处；
-    - 向量归一化只留 `chunking.unit` 一处；
-    - 句子切分只留 `chunking.sentences` 一处；
-    - 引用检查只解析一次编号；
-    - CLI 输出 JSON 用一个 helper；
-    - 回环地址只列一遍；
-    - store 里"kb 不存在"统一用 `KbNotFound.of`；
-    - `warm_up` 也预加载 jieba 词典（约 1 秒）；embedding 模型不预加载，以免每次启动都调用一次可能收费的 API。
-  - **contextual 改为并发**：`chunking.contextual.concurrency`（默认 4，不进 kb 身份）。一个 runtime 只有一个 contextualizer，用信号量限制同时进行的 LLM 调用总数，服务端并发摄取时也不会成倍增加（Codex 指出）。
-  - **/simplify 没改的**：
-    - pg 和 chroma 共用行编码 / 分页 helper：SQL 和 JSON 编码各不相同，拆出来反而把列名和语句分开；
-    - 去掉 `count_missing_text`：去掉后，失败会在部分文档重新嵌入之后才发生；
-    - eval 只设一次 schema：`--schema` 经过 `load_settings` 才有合法性校验；
-    - 统一 content hash 与 eval kb 名的哈希：content hash 已存进库，改格式会让所有文档被当成变化；
-    - store 后端注册表：只有两个后端；
-    - LLM provider 注册表；
-    - 按 id 统一 Chunker 协议；
-    - PG 读操作 autocommit、查询向量的进程内 LRU、向量与 BM25 并行、Chroma 读锁、在 SQLite 上维护 N / avgdl 计数：都只在大语料或高并发时才有收益，记在这里，按需再做。
-  - **Codex review（整个库，2026-11-09）**：
-    - 上传上限按路径后缀 `/files` 判断，任何以它结尾的路径都能拿到更大的上限：改为精确匹配 `/v1/kbs/{kb}/files`。
-    - contextual 线程数会随请求数成倍增加：改为共享的信号量。
-    - 删除不存在的文档时，报错说的是 kb 不存在：新增 `DocumentNotFound`。
-    - 两个相同内容的并发 upsert 可能都返回 `skipped=False`：存储结果一样，只在 `Upserted.skipped` 注明这是尽力而为。
-    - 不成立的一条：Codex 说"按 kb 限定的写 key 能通过 `PUT /v1/kbs` 建出范围外的 kb"，但并没有不带 kb 的建库路由，`PUT /v1/kbs/{kb}` 会检查 glob。补了回归测试（`test_a_write_key_cannot_create_or_write_kbs_outside_its_globs`），变异验证能抓到。
-  - **Codex 第二轮（S8 改动之后）**：一条成立并已修复：`RagRuntime.from_settings` 只在 embedder / reranker 构建失败时关闭 store，构建 chunker（在 `RagRuntime.__init__` 里）失败时 store 不会关；现在整个构建都在同一个 `try` 里，有先红后绿的回归测试。其余没有发现问题。
-- S7 实现说明（2026-11-09）：
-  - Store 合约测试 `tests/contract/`：`store` fixture 按 `pg`、`chroma` 参数化，只经过 `Store` / `VectorCache` 接口（kb、文档、chunk、向量与 BM25 查询、向量缓存），另有几条引擎级用例（三种检索模式、过滤、parent_child、reindex）。两个后端共用一个 Protocol `CachedStore`；`stores/factory.py` 按 `store.backend` 打开和迁移。
-  - Chroma 专属测试（`tests/integration/test_chroma.py`）：在每个步骤边界模拟崩溃（不触发 `except Exception` 的清理），确认崩溃后文档不可见、重新打开后两边都清理干净、能重新摄取；还测了失败时立即清理、清理也失败时留到下次打开、分批写入、过滤限制。
-  - `literag eval` 用 chroma 时，评测 kb 放在 `<data_dir>/<--schema>` 子目录，和应用数据分开。
-  - **收尾 /simplify（2026-11-09）**，改了：后端相关的选择（打开、迁移、数据位置 `location()`、评测用的隔离位置 `evaluation_store()`）都收进 `stores/factory.py`，CLI 和配置类里不再按后端分支；eval 判断"同一个 store"只比较决定位置的字段（以前 PG 也比较 `data_dir`）；`bm25_impl` 的默认值和校验合成一个 validator；BM25 过滤时每篇文档的元数据只解析一次；upsert 按 id 删旧向量；合约测试经过 factory 打开 store。没改的：向量查询放到锁外（并发删 kb 时查询会报错，单进程后端串行读可以接受）；N 和 avgdl 缓存在内存（要随每次写入失效，学习规模下现算只需毫秒级）；与 pg.py 共用分页和行转换的 helper（两边 SQL 不同）；与 PG 只测的旧用例重叠的两条测试暂不删除。
-  - **Codex review（2026-11-09）**：没有发现问题。未完成的文档不会被读到，打开时的恢复会清理两边；BM25 统计量和过滤与 PG 一致；store 的锁串行化了服务线程池里的操作。
-  - **Chroma 与 PG 对比**（eval 语料 32 题，同一组配置）：mode-vector、mode-bm25、chunk-markdown 三行的 hit@1、hit@5、MRR@10 完全相同（0.979 / 0.823 / 0.930），说明两个后端的向量与 BM25 排序一致。
-- S5c 实现说明（2026-11-08）：
-  - 托管 embedder（voyage、cohere、gemini）直接走 HTTP，和 Ollama、OpenAI 兼容接口共用 `_HTTPEmbedder` 的分批、并发和重试；`_call(batch, role)` 把文档 / 查询的角色交给子类，按各家的参数名发出去。请求和响应的格式按 2026-11-08 的官方 API 参考核对，单测用 MockTransport 回放这些格式，测试从不调用真实服务。
-  - `embedding.base_url` 默认不再是 Ollama 的地址，而是 `None`，按 provider 取各家默认（`EMBEDDING_URLS`）。以前 `provider: openai` 不填 base_url 会打到 Ollama，现在默认是 OpenAI。kb 身份里没有 base_url，已有 kb 不受影响。
-  - sentence-transformers 6.2.0：第一次用到模型时才导入 torch（单测从 27 秒降到 0.3 秒，也不要求 CI 装这个 extra）；6.x 把 `get_sentence_embedding_dimension` 改名为 `get_embedding_dimension`，旧名字会给弃用警告。
-  - **embedding 对比**（32 题、markdown 120/20、只用向量检索，每个模型用自己的 tokenizer 切块；ranx 核对一致）：
+- The licenses of each dependency (Ollama, pgvector, Chroma, jieba, bge-m3, bge-reranker, qwen3): checked one by one when the versions are locked, and written into the README.
+- How to package rerank: fastembed's cross-encoder or sentence-transformers. To be confirmed from the docs before S4 starts. The former is lighter and needs no torch.
+- Which library to use for PDF plain-text extraction: to be confirmed at S2.
+- ~~PG driver and async~~ → decided at S1 (2026-11-08): sync core + psycopg 3 (`psycopg[binary,pool]==3.3.8`); vectors are passed in as `float8[]` and converted to `vector` / `halfvec` in SQL, so the `pgvector` Python package is not needed; the S6 service layer calls it in a thread pool, and the concurrency limit is configurable.
+- S2 implementation notes (2026-11-08):
+  - One `embeddings_<dim>` table per dimension, with an HNSW (cosine) index; dimensions ≤ 2000 use `vector`, 2001–4000 use `halfvec` (the limit of pgvector HNSW), and larger is refused.
+  - A document is written in one transaction that locks the `kbs` row of that kb, so writes to the same kb are serial and the BM25 statistics cannot be miscounted. Chunks, vectors and postings are all written in bulk with COPY, one round trip per table; the old version is deleted first, then one UPDATE writes the statistics' increase and decrease into `kbs` at once. The `search_path` of each connection in the pool is set only once.
+  - A kb records the embedding it was built with (provider, model, dimension, query prefix, document prefix) and the chunking identity; opening it with a different config is refused, with a hint to keep the original config or use a new kb name. The comparison logic is in the engine (`KbInfo.differences`), and the store only does "fetch it if it exists, create it if not". The chunking identity is declared by `ChunkingConfig.identity()` (it lists only the fields that affect the chunking result; a field added later must be added to it explicitly, so that existing kbs do not become unopenable), plus the counter's identity: `chars`, `estimate` or `hf:<tokenizer>`. `literag reindex` is left to S5b.
+  - The namespace and the kb name are passed to the store through `KbRef`; the physical key `<namespace>:<kb>` is generated only in `KbRef.key`, and the CHECK constraint on the `kbs` table guarantees `name = namespace || ':' || kb`.
+  - The vector cache is a separate `VectorCache` interface (`PgStore` implements it too), wrapped on by `build_embedder(config, cache=store)`; the cache tables are built separately from the embedding index tables, so reading the cache does not create an HNSW index as a side effect.
+  - Chunking is counted with the embedding model's own tokenizer (Hugging Face `tokenizers`, no torch needed). The tokenizer follows the model profile: bge-m3 uses `BAAI/bge-m3`, nomic uses `nomic-ai/nomic-embed-text-v1.5`, a model name of the form `org/name` takes itself as its tokenizer; an unknown model uses an estimate. The config `embedding.tokenizer` can override it, and setting `""` means use the estimate. fastembed also goes through the same prefix table (with its plain `embed`), so the prefix recorded on the kb is the prefix actually used.
+  - The `markdown` strategy puts the heading path in front of the chunk before embedding and BM25; `chunks.text` keeps the slice of the original text, used for citations.
+  - PDF extraction is postponed to S5b, and S2 supports only txt and md.
+- S6 implementation notes (2026-11-08):
+  - Decisions (chosen by the user on 2026-11-08): the namespace goes in a request header, and keys are scoped by glob; the documents table stores the original text to support reindex; the image is only built and not pushed; all kbs follow the service's own config (per-kb config is left for later).
+  - **reindex**: migration 0005 adds `text` and `pages` to `documents`. `literag reindex <kb> --into <new kb>` rebuilds from the original text into a new name with the current config, and the original kb is untouched; switching means having the client use the new name (replacing in place would need `ON UPDATE CASCADE` on the foreign keys of all kbs, not done for now). If the target already exists, or some document has no original text (written before 0005), it refuses at once and writes none; a failure in the middle deletes the half-built target.
+  - Not done in S6: per-kb config; in-place reindex; running the vector and BM25 paths in parallel (retrieval now takes about 4 ms); publishing the image.
+  - **Close-out /simplify (2026-11-08)**, changed: the error classes carry their own HTTP status and "whether the message may be returned to the client" (`status` / `expose`), the server is left with a single handler, and no longer depends on an ordered mapping table; `KbNotFound.of()` unifies the wording of "the kb does not exist"; upload goes through `RagEngine.ingest(doc_id=, source=)`, the document id rule is in only one place, `loaders.doc_id_for`, and upload counts while writing the temporary file and stops at once when the limit is exceeded; the retrieval parameters are defined only once; the authentication dependency becomes async and returns only the engine, each request builds a namespace copy on the spot (a shallow copy, with a cost comparable to a dictionary lookup), and there is no cache a caller could blow up; "without a key it may bind only to loopback" is handled by `server.check_bind` (both `run()` and the CLI pass through it); the connection pool size matches `server.max_workers`; reindex first counts the documents missing original text with one SQL, then reads by `doc_id` page by page, without reading the original text of the whole kb into memory. Not changed: splitting the engine into "a runtime not bound to a namespace + a view per namespace" (a change beyond this stage; S8 has split it into `RagRuntime` + `RagEngine`); `create_kb` reading the kb row once more (a low-frequency operation).
+  - **Codex review (2026-11-08)**, all 5 held up and were fixed, each with a red-then-green regression test: the upload size limit used to be checked in the route, but FastAPI had already read the whole multipart request and written it to disk before the route ran; now an ASGI middleware rejects by `Content-Length` before parsing, counts while receiving when there is no length, and returns 413 (the limit plus 8 KiB for the multipart boundary); reindex checked "the target does not exist" before writing, so if someone created a kb with the same name in between it would write into it, and on failure delete it; now one `INSERT … ON CONFLICT DO NOTHING` creates the target atomically, and it refuses if it was not created; an upload error carried the client's file name verbatim, and for an unsupported file type even the temporary path on the server; now the wording is always fixed; upstream errors that are not returned to the client have the credentials in URLs and `password=` removed before being logged; the CI smoke test kept going when the service never became ready, and now it fails on timeout and checks that the container is still running. Codex found no path past the namespace or kb authorisation.
+  - **Post-commit security review (2026-11-09)**, all 3 held up, fixed separately: open mode without a key relied only on binding to loopback, but a web page in a browser can reach loopback under its own domain by DNS rebinding; now open mode accepts only the Hosts `localhost`, `127.0.0.1` and `[::1]` (Starlette `TrustedHostMiddleware`); the request body limit used to cover only uploads, JSON request bodies had no limit, and FastAPI reads the whole body before authentication; now every request has a limit (`server.max_body_mb`, default 10, uploads still use `max_upload_mb`) and over the limit it returns 413; `GET /v1/kbs` used to list all kbs under the namespace, which told the caller the names outside the key's `kbs` scope; now it lists only what the key can access.
+  - End to end (`deploy/compose.yaml`, Ollama on the host) it was found that the image had no `pdf` extra, so uploading a PDF would fail; the image now carries `server` and `pdf` (443 MB). docling would bring several GB of torch, so it is not put in the image; build your own if you want it.
+- S11 implementation notes and close-out (2026-11-12):
+  - Decisions (chosen by the user on 2026-11-12): lite-rag covers the mainstream RAG methods as far as possible; the first version of Graph RAG does only local mode, and only PG.
+  - **Two versions of scoring**: the first version, "sum of entity weights + entity vectors to find seeds", was worse than vector alone on multi-hop questions (see §5); after comparing several scorings offline it was changed to "entity named by the question → co-occurrence expansion → rank by vector within the range", and the entity vector table was deleted. The numbers are in the KB `projects/lite-rag/reference/eval-results.md`.
+  - **/simplify changed**: `Contextualizer` and `GraphExtractor` share `llm.BoundedCalls` (the concurrency limiting is left in one copy); the seed rule moves from SQL back to `graph.seeds`; the graph query is split into the `GraphStore` Protocol, so Chroma no longer needs methods that can only raise errors; the graph of each kb is walked only once per retrieval; `among` is an exact scan by primary key; whether the graph counts into the kb identity is decided uniformly by `GraphConfig.index_identity()` (shared by engine and eval); the unused `doc` parameter, the redundant `doc_id` column and two unused relation indexes are removed; the tests are constructed through `support.make_engine`.
+  - **/simplify not changed**: the category-word check scans the entity names on every query (precompute when the size calls for it); contextual and graph extraction run in series (the two LLM passes could run in parallel, beyond this stage); the two ways of writing the prompt fingerprint and the barrier stand-in in the tests were not merged (the gain is small).
+  - **Codex review**: two held up and were fixed, each with a red-then-green test: `where` used to filter only the final result, and a filtered-out document could still serve as a bridge when walking the graph; now seeds and expansion look only at the documents that are kept; a reply missing the `entities` or `relations` field was written as an empty graph, and now raises an error. One not accepted: the kb identity does not record the `base_url`, temperature and so on used for extraction, for the same reason as contextual — the identity records the model and the prompt, not sampling and transport parameters (eval likewise treats `base_url` as a transport parameter).
+  - This stage changed one existing test: the migration list in `test_migrate.py` gains `0006_graph` (a new migration is a change of spec). `test_a_metadata_filter_applies_to_the_graph_path`, written earlier in this stage, verified the old semantics that Codex overturned, and is replaced by `test_a_metadata_filter_also_scopes_the_walk`.
+- S10 close-out (2026-11-09):
+  - **/simplify changed**:
+    - `_search` takes the list of already opened kbs directly, and "raise an error or skip when a kb does not exist" is decided by `search` and `search_kbs` each, so the `skip_missing` parameter and `_readable` are removed; "a path was filled up" is computed after the merge.
+    - The key type of multi-kb retrieval `Key = (kb index, chunk id)` is defined only once, in `ranking.py`, and `fusion.py` refers to it.
+    - Authentication: `Authorizer.check` takes all the kbs the request involves (in the path or in the body), and the glob check is left in one place; the kbs of `POST /v1/search` are authorised by the dependency `ReadKbs`, through the same entry as the kb in a path, and the route no longer checks by hand (mutation check: after removing this check `test_a_multi_kb_search_needs_access_to_every_kb` fails).
+    - `Hit.kb` becomes a required keyword argument and no longer defaults to an empty string; the two retrieval routes share the `_hits` serialisation.
+  - **/simplify not changed**: re-querying only the kbs that were filled up when deepening, and fetching the records of several kbs in one query (`WHERE name = ANY`): at the size of a few kbs the gain is negligible, noted in §5.
+  - **Codex review**: no problems found.
+- S9 implementation notes (2026-11-09):
+  - llm-steward's `LiteRagProvider` (`backend/src/llm_steward/providers/literag.py`) maps an llm-steward namespace to `steward/<namespace_id>`, a collection to the kb `c-<collection_id>`, and an entry to a document with `doc_id = entry_id`. It goes over HTTP by default (chosen by the user on 2026-11-09); in-process is an optional extra, and the dependency on lite-rag is locked to a git commit (chosen by the user).
+  - Changes on the lite-rag side: add `py.typed`, so that llm-steward's mypy strict can check the calls into lite-rag; `redact` (removes credentials from error messages) moves from `server/app.py` to `errors.py`, because llm-steward also needs it when logging in-process (llm-steward's Codex review found that logs might contain a database password).
+  - Acceptance: llm-steward's KB contract tests pass both in-process and over HTTP (the real `create_app`, through ASGI, with API key on), plus one end-to-end test through llm-steward's governance layer; manual end to end with the real `literag serve` (Ollama `bge-m3`) and `steward serve`: an active entry can be retrieved, after it is retired it cannot be retrieved and is deleted from lite-rag in about 2 seconds, and after lite-rag is stopped llm-steward's `/health` reports degraded.
+- S8 close-out (2026-11-09):
+  - Two old cases that ran only on PG and duplicated the contract tests were deleted (`test_delete_kb_removes_everything`, `test_documents_are_read_page_by_page`), decided by the user on 2026-11-09.
+  - **Three changes decided by the user**:
+    - The engine is split into `RagRuntime` (built only once, holding the store, embedder, chunker and models) and a per-namespace `RagEngine`. The shallow copy of `for_namespace`, the `server` namespace that `serve` made up, and the three duplicated assembly codes in `from_settings`, eval and the tests are removed; the connection pool size is passed in by `serve`, and the core no longer reads the server config. Models are loaded lazily under a lock, and concurrent requests build them only once.
+    - Metadata filtering is unified in both backends as "scalar equality", checked by the engine before the query is embedded (`stores.base.check_where`).
+    - The error classes are split: `InvalidRequest` (400, message returned) is the caller's fault; `ConfigError` becomes the service's own config error (500, logged only).
+  - **/simplify changed**:
+    - the prefix lookup is left in one place, `model_profiles.prefixes_for`;
+    - vector normalisation is left in one place, `chunking.unit`;
+    - sentence splitting is left in one place, `chunking.sentences`;
+    - the citation check parses the numbers only once;
+    - CLI JSON output uses one helper;
+    - loopback addresses are listed only once;
+    - "the kb does not exist" in the store uniformly uses `KbNotFound.of`;
+    - `warm_up` also preloads the jieba dictionary (about 1 second); the embedding model is not preloaded, so that every start does not call an API that may cost money.
+  - **contextual becomes concurrent**: `chunking.contextual.concurrency` (default 4, not in the kb identity). A runtime has only one contextualizer, and a semaphore limits the total number of concurrent LLM calls, so concurrent ingestion on the server does not multiply them (pointed out by Codex).
+  - **/simplify not changed**:
+    - pg and chroma sharing the row encoding / paging helper: the SQL and the JSON encoding differ, and splitting it out would separate the column names from the statements;
+    - removing `count_missing_text`: without it, a failure would come after some documents have been re-embedded;
+    - eval setting the schema only once: only `--schema` going through `load_settings` gets validated;
+    - unifying the hash of the content hash and of the eval kb name: the content hash is already stored in the database, and changing the format would make all documents be treated as changed;
+    - a store backend registry: there are only two backends;
+    - an LLM provider registry;
+    - unifying the Chunker Protocol by id;
+    - autocommit for PG reads, an in-process LRU for query vectors, running vector and BM25 in parallel, a Chroma read lock, keeping the N / avgdl counters on SQLite: all of these pay off only with a large corpus or high concurrency; noted here, to be done when needed.
+  - **Codex review (the whole library, 2026-11-09)**:
+    - The upload limit was decided by the path suffix `/files`, so any path ending with it could get the larger limit: changed to an exact match of `/v1/kbs/{kb}/files`.
+    - The number of contextual threads multiplied with the number of requests: changed to a shared semaphore.
+    - Deleting a document that does not exist reported that the kb does not exist: `DocumentNotFound` is added.
+    - Two concurrent upserts of the same content might both return `skipped=False`: the stored result is the same, and `Upserted.skipped` only notes that this is best effort.
+    - One that did not hold up: Codex said "a write key scoped to a kb can create a kb outside its range through `PUT /v1/kbs`", but there is no kb-creating route without a kb, and `PUT /v1/kbs/{kb}` checks the glob. A regression test was added (`test_a_write_key_cannot_create_or_write_kbs_outside_its_globs`), and a mutation check can catch it.
+  - **Codex round two (after the S8 changes)**: one held up and was fixed: `RagRuntime.from_settings` closed the store only when the embedder / reranker failed to build, and when building the chunker (in `RagRuntime.__init__`) failed the store was not closed; now the whole build is in the same `try`, with a red-then-green regression test. No other problems were found.
+- S7 implementation notes (2026-11-09):
+  - Store contract tests `tests/contract/`: the `store` fixture is parametrised by `pg` and `chroma`, and goes only through the `Store` / `VectorCache` interface (kb, document, chunk, vector and BM25 queries, vector cache), plus a few engine-level cases (three retrieval modes, filter, parent_child, reindex). The two backends share one Protocol `CachedStore`; `stores/factory.py` opens and migrates by `store.backend`.
+  - Chroma-specific tests (`tests/integration/test_chroma.py`): a crash is simulated at each step boundary (without triggering the cleanup of `except Exception`), confirming that after a crash the document is invisible, after reopening both sides are cleaned up, and it can be ingested again; also tested: immediate cleanup on failure, leaving it to the next open when the cleanup also fails, batched writes, filter limits.
+  - When `literag eval` uses chroma, the eval kbs go in the subdirectory `<data_dir>/<--schema>`, apart from the application data.
+  - **Close-out /simplify (2026-11-09)**, changed: the backend-dependent choices (open, migrate, the data location `location()`, the isolated location for eval `evaluation_store()`) are all collected into `stores/factory.py`, and the CLI and config classes no longer branch by backend; eval decides "the same store" by comparing only the fields that decide the location (PG used to compare `data_dir` too); the default value and validation of `bm25_impl` are merged into one validator; the metadata of each document is parsed only once when BM25 filters; upsert deletes the old vectors by id; the contract tests open the store through the factory. Not changed: moving the vector query outside the lock (a concurrent kb delete would make the query raise an error, and serial reads in a single-process backend are acceptable); caching N and avgdl in memory (they must be invalidated on every write, and computing them on the spot at learning scale takes only milliseconds); sharing the paging and row-conversion helper with pg.py (the SQL on the two sides differs); two tests that overlap old cases tested only on PG are not deleted for now.
+  - **Codex review (2026-11-09)**: no problems found. A document that is not complete is never read, and recovery at open cleans both sides; the BM25 statistics and the filter agree with PG; the store's lock serialises the operations in the service thread pool.
+  - **Chroma vs PG comparison** (eval corpus of 32 questions, the same set of configs): the three rows mode-vector, mode-bm25 and chunk-markdown have exactly the same hit@1, hit@5 and MRR@10 (0.979 / 0.823 / 0.930), which shows that the vector and BM25 rankings of the two backends agree.
+- S5c implementation notes (2026-11-08):
+  - The hosted embedders (voyage, cohere, gemini) go straight over HTTP, sharing the batching, concurrency and retries of `_HTTPEmbedder` with the Ollama and OpenAI-compatible interfaces; `_call(batch, role)` hands the document / query role to the subclass, which sends it with each vendor's parameter name. The request and response formats were checked against the official API references of 2026-11-08, the unit tests replay these formats with MockTransport, and the tests never call a real service.
+  - `embedding.base_url` no longer defaults to Ollama's address but to `None`, taking each provider's default (`EMBEDDING_URLS`). Before, `provider: openai` without a base_url would hit Ollama, and now the default is OpenAI. The kb identity does not contain base_url, so existing kbs are not affected.
+  - sentence-transformers 6.2.0: torch is imported only when the model is first used (the unit tests drop from 27 seconds to 0.3 seconds, and CI is not required to install this extra); 6.x renamed `get_sentence_embedding_dimension` to `get_embedding_dimension`, and the old name gives a deprecation warning.
+  - **Embedding comparison** (32 questions, markdown 120/20, vector retrieval only, each model chunked with its own tokenizer; ranx check agrees):
 
-    | 模型 | 维度 | hit@1 | hit@5 | MRR@10 | 费用 |
+    | Model | Dimensions | hit@1 | hit@5 | MRR@10 | Cost |
     | --- | --- | --- | --- | --- | --- |
-    | ollama `bge-m3:567m`（默认） | 1024 | 0.97 | 1.00 | 0.979 | 0（本地） |
-    | fastembed `intfloat/multilingual-e5-large` | 1024 | 0.94 | 1.00 | 0.969 | 0（本地） |
-    | sentence-transformers `Qwen/Qwen3-Embedding-0.6B` | 1024 | 0.91 | 1.00 | 0.953 | 0（本地） |
-    | fastembed `paraphrase-multilingual-MiniLM-L12-v2` | 384 | 0.69 | 0.97 | 0.815 | 0（本地） |
+    | ollama `bge-m3:567m` (default) | 1024 | 0.97 | 1.00 | 0.979 | 0 (local) |
+    | fastembed `intfloat/multilingual-e5-large` | 1024 | 0.94 | 1.00 | 0.969 | 0 (local) |
+    | sentence-transformers `Qwen/Qwen3-Embedding-0.6B` | 1024 | 0.91 | 1.00 | 0.953 | 0 (local) |
+    | fastembed `paraphrase-multilingual-MiniLM-L12-v2` | 384 | 0.69 | 0.97 | 0.815 | 0 (local) |
 
-    默认仍是 bge-m3。e5-large 只差一题，可以作为不依赖 Ollama 的进程内替代；MiniLM 体积小（0.22 GB），但关键词题 hit@5 掉到 0.94、hit@1 只有 0.69，不适合做检索主力。付费模型（voyage、cohere、gemini、OpenAI）没有跑：需要用户提供 key 并同意后再跑，费用以各家当时的价目表为准。32 题太少，只能排除明显差的模型，分不出前三名的高下。
-  - **收尾 /simplify（2026-11-08）**，改了：每个 provider 的默认地址、key 环境变量和每批上限都作为它自己 embedder 类的属性（`default_url`、`key_env`、`max_batch`），`build_embedder` 改为按 provider 名查 `EMBEDDERS` 表（有测试保证配置里每个 provider 都有实现），config 里不再有按 provider 分支的默认地址；key 一律经 `api_key()` 取得，没配置时请求不带认证头；Voyage 继承 OpenAI 兼容实现，只多一个 `input_type`、维度字段名不同；Gemini 的规则统一为"模型配置有前缀就用前缀，否则发 `taskType`"，未知的 Gemini 型号也不会两样都没有；加前缀的逻辑只在 `_Prefixing` 基类里写一次，HTTP 与进程内两类实现共用。没改的：托管 API 的默认每批条数（Voyage 还限制每次请求的总 token 数，要实测再定）；未配置 `dimensions` 时启动探测维度的那一次调用（kb 身份检查在写入前就要知道维度，每个进程一次；配置 `dimensions` 即可省掉）。
-  - **Codex review（2026-11-08）**：只有一条 P2，成立并已修复：Voyage 除了每次最多 1000 条，还限制每次请求的总 token 数（随模型变化，例如 `voyage-4-large` 是 12 万），一批长 chunk 会收到不可重试的 4xx。现在所有 HTTP embedder 在一批被以 400 / 413 拒绝时把它对半拆开分别重发，直到单条；单条仍被拒绝就报错，其他客户端错误（例如 401）不拆分。Codex 核对了 Gemini 的请求字段、角色、维度和前缀与官方文档一致，`base_url` 默认值的变化已在本节写明。
+    The default is still bge-m3. e5-large is only one question behind and can serve as an in-process alternative that does not depend on Ollama; MiniLM is small (0.22 GB), but on keyword questions hit@5 drops to 0.94 and hit@1 is only 0.69, so it is not suited as the main retriever. The paid models (voyage, cohere, gemini, OpenAI) were not run: they run only after the user provides a key and agrees, and the cost follows each vendor's price list at that time. 32 questions are too few; they can only rule out models that are clearly worse and cannot separate the top three.
+  - **Close-out /simplify (2026-11-08)**, changed: each provider's default address, key environment variable and per-batch limit become attributes of its own embedder class (`default_url`, `key_env`, `max_batch`), `build_embedder` now looks up the `EMBEDDERS` table by provider name (a test guarantees that every provider in the config has an implementation), and the config no longer has default addresses that branch by provider; keys are always obtained through `api_key()`, and when none is configured the request carries no auth header; Voyage inherits the OpenAI-compatible implementation, with only an extra `input_type` and a different dimension field name; Gemini's rule is unified as "use the prefix if the model config has one, otherwise send `taskType`", so an unknown Gemini model does not end up with neither; the logic that adds the prefix is written only once in the `_Prefixing` base class, shared by the HTTP and in-process implementations. Not changed: the default number of items per batch of the hosted APIs (Voyage also limits the total number of tokens per request, to be fixed after measuring); the one call at start-up that probes the dimension when `dimensions` is not configured (the kb identity check must know the dimension before writing, once per process; configuring `dimensions` saves it).
+  - **Codex review (2026-11-08)**: only one P2, which held up and was fixed: besides at most 1000 items per call, Voyage also limits the total number of tokens per request (which varies by model, for example 120 thousand for `voyage-4-large`), and a batch of long chunks would get a non-retryable 4xx. Now when a batch is rejected with 400 / 413, all HTTP embedders split it in half and resend the parts separately, down to a single item; if a single item is still rejected it raises an error, and other client errors (for example 401) are not split. Codex checked that Gemini's request fields, roles, dimensions and prefixes agree with the official docs, and the change of the default `base_url` is noted in this section.
 
-- S5b 实现说明（2026-11-08）：
-  - **页码**：`load_file` 返回 `Loaded(title, text, pages)`，`pages` 是每页在全文里的起始 offset（各页用空行连接）。chunk 的 `page` 是它起始位置所在的页（`bisect`）；没有分页的文档为空，从不编页码。内容哈希只在有分页时才把它算进去，已有文档的哈希不变。迁移 `0004_pages_parents_context` 给 `chunks` 加 `page`、`parent_n`、`context`，并新建 `parents` 表（随文档级联删除）。
-  - **docling 2.148 实测**（三页的生成样本，无 OCR）：首次约 1 分钟，大部分是加载模型；每一级标题都输出成 `##`（层级被拍平）；中文标题"退货规则"被当成普通段落。`export_to_markdown(page_break_placeholder=…)` 可以保留分页。
-  - **chonkie 1.7.0 实测**：`threshold` 是固定的余弦相似度，不是分位数；先按 3 句窗口算相似度，相似度序列至少要有 `filter_window`（5）个值才会找切点，所以大约 8 句以下的文本不会按语义切，只按大小切。在 10 句咖啡 + 10 句税务的文本上，它的切点落在交界之后，自写版正好切在交界。默认分隔符没有中文句末标点，适配器补上了。
-  - **评测结果**（bge-m3、32 题、120/20 token、hybrid，ranx 核对一致；与 S5 基线逐位相同，说明 eval 可复现）：
+- S5b implementation notes (2026-11-08):
+  - **Page numbers**: `load_file` returns `Loaded(title, text, pages)`, where `pages` is the start offset of each page in the full text (pages are joined by blank lines). A chunk's `page` is the page its start falls on (`bisect`); for a document without pages it is empty, and page numbers are never invented. The content hash includes them only when there are pages, so the hash of existing documents does not change. Migration `0004_pages_parents_context` adds `page`, `parent_n` and `context` to `chunks`, and creates the `parents` table (deleted by cascade with the document).
+  - **docling 2.148 measured** (a generated sample of three pages, no OCR): the first run takes about 1 minute, most of it loading the models; every heading level is output as `##` (levels are flattened); the Chinese heading "退货规则" (return rules) is treated as an ordinary paragraph. `export_to_markdown(page_break_placeholder=…)` can keep the page breaks.
+  - **chonkie 1.7.0 measured**: `threshold` is a fixed cosine similarity, not a percentile; similarity is first computed over a 3-sentence window, and the similarity sequence must have at least `filter_window` (5) values before it looks for cut points, so text of fewer than about 8 sentences is not cut by meaning and is cut only by size. On a text of 10 sentences about coffee + 10 sentences about tax, its cut falls after the boundary, while the self-written version cuts exactly at the boundary. The default separators have no Chinese sentence-end punctuation, which the adapter adds.
+  - **Eval results** (bge-m3, 32 questions, 120/20 tokens, hybrid, ranx check agrees; identical bit for bit to the S5 baseline, which shows that eval is reproducible):
 
-    | 配置 | hit@1 | hit@5 | MRR@10 | 改写 hit@5 |
+    | Config | hit@1 | hit@5 | MRR@10 | paraphrase hit@5 |
     | --- | --- | --- | --- | --- |
-    | markdown（S5 基线） | 0.91 | 0.94 | 0.930 | 0.88 |
-    | semantic（自写，57 块） | 0.91 | 0.94 | 0.925 | 0.88 |
-    | semantic（chonkie） | 0.91 | 0.94 | 0.930 | 0.88 |
+    | markdown (S5 baseline) | 0.91 | 0.94 | 0.930 | 0.88 |
+    | semantic (self-written, 57 chunks) | 0.91 | 0.94 | 0.925 | 0.88 |
+    | semantic (chonkie) | 0.91 | 0.94 | 0.930 | 0.88 |
     | parent_child 120/480 | 0.91 | 0.94 | 0.927 | 0.88 |
-    | contextual（qwen3:8b） | 0.88 | 0.97 | 0.907 | 0.94 |
+    | contextual (qwen3:8b) | 0.88 | 0.97 | 0.907 | 0.94 |
     | markdown 40 | 0.72 | 0.94 | 0.814 | 0.88 |
     | parent_child 40/120 | 0.88 | 0.97 | 0.916 | 0.94 |
 
-    - 这份语料的章节都很短：按标题切开后几乎每节都不到 120 token。所以 chonkie 版和 parent_child 120/480 切出的块与 markdown 逐块相同（各 49 块），结果相同或相近是语料决定的，不说明策略本身无效。parent_child 120/480 比 markdown 少 0.003，只差 q12 一题：它每条路径取 50 个候选（候选池 10 × 每父块约 5 个子块），markdown 取 40；多取的那一块在向量路径排 41、BM25 排 8，两路都出现，RRF 融合分就超过了只在向量路径出现的答案块，把答案（原第 10 名）挤出前 10。**RRF 的结果依赖每条路径取多深**：取得越深，"两路都出现"的块越容易挤上来。
-    - parent_child 的作用在小块上看得出来：子块同为 40 token 时，返回父块把 MRR 从 0.814 提到 0.916；但它没有超过直接用 120 token 的 markdown（0.930）。注意父块更长，更容易包含证据原文，这对 parent_child 有利。
-    - contextual 有得有失（hit@5 +1 题，hit@1 −1 题），32 题里差 1 题不算数；代价是建库时每个 chunk 一次 LLM 调用（主语料约 3 分钟）。
-    - semantic：没有带来提升，自写版保留（不依赖额外的库）；chonkie 在本语料上无法和自写版区分，在长文本上切点不准，所以 **不把它作为默认实现**，适配器保留为可选的对比项（`[chonkie]`），等有长文档语料再评。
-  - **PDF 加载器对比**（两份生成的结构化 PDF、10 题；几个章节用相同的小标题，正文不出现章节名）：
+    - The sections of this corpus are all short: after cutting by heading almost every section is under 120 tokens. So the chunks cut by the chonkie version and by parent_child 120/480 are the same as markdown chunk by chunk (49 chunks each), and the same or similar results are decided by the corpus and do not show that the strategy itself is ineffective. parent_child 120/480 is 0.003 below markdown, with only q12 differing: it takes 50 candidates per path (candidate pool 10 × about 5 children per parent), markdown takes 40; the extra chunk ranks 41 on the vector path and 8 on BM25, appears on both paths, and its RRF fused score then exceeds the answer chunk that appears only on the vector path, pushing the answer (originally rank 10) out of the top 10. **The result of RRF depends on how deep each path goes**: the deeper it goes, the more easily a chunk that "appears on both paths" climbs up.
+    - The effect of parent_child shows on small chunks: with child chunks of the same 40 tokens, returning the parent raises MRR from 0.814 to 0.916; but it does not exceed using markdown with 120 tokens directly (0.930). Note that a parent is longer and more likely to contain the original evidence text, which favours parent_child.
+    - contextual gains some and loses some (hit@5 +1 question, hit@1 −1 question), and a difference of 1 in 32 questions does not count; the cost is one LLM call per chunk at build time (about 3 minutes for the main corpus).
+    - semantic: it brought no improvement, and the self-written version is kept (it does not depend on an extra library); chonkie cannot be told apart from the self-written version on this corpus and its cut points are inaccurate on long text, so **it is not made the default implementation**; the adapter is kept as an optional comparison (`[chonkie]`), to be evaluated when there is a corpus of long documents.
+  - **PDF loader comparison** (two generated structured PDFs, 10 questions; several sections have the same small headings, and the body text does not contain the section name):
 
-    | 配置 | hit@1 | hit@5 | MRR@10 |
+    | Config | hit@1 | hit@5 | MRR@10 |
     | --- | --- | --- | --- |
     | pypdf + recursive | 0.60 | 1.00 | 0.767 |
     | docling + recursive | 0.70 | 1.00 | 0.833 |
     | docling + markdown | 0.60 | 1.00 | 0.750 |
 
-    docling + markdown 没有胜出，原因正是标题被拍平：三个"退款期限"小节的 `heading_path` 都只剩"退款期限"，区分它们的上一级标题（机票、酒店、火车）丢了；recursive 的 120 token 块反而经常把"## 机票"这一行带进去。10 题里差 1 题就是 0.1，生成的 PDF 也比真实 PDF 干净，所以结论只是：**默认仍用 pypdf**，docling 留作可选；要真正用上结构，需要能还原标题层级的解析（例如按字号推断），这超出 v1 范围（§1）。
-  - eval：语料按 PDF 加载器分别加载，加载器进入 index 身份；比对证据原文前去掉 Markdown 标记（标题符号、加粗、转义），并去掉中文字符之间的空白（PDF 在句中断行）。
-  - **收尾（2026-11-08）**：/simplify（复用、简化、效率、层次 4 个角度）改了：prompt 渲染与 nonce 防护合并到 `lite_rag.prompts.render_pair`；contextual 的 kb 身份直接用 `contextual.prompt_digest()`；标题正则只留 `loaders.ATX` 一份；docling 转换器用 `@cache`；`embedding_text(chunk, header)` 统一决定被索引的文本；parent_child 先按父块去重、再截到候选池、再 rerank（rerank 不再多打 4 倍），引擎不再判断策略名，改由 chunker 声明 `children_per_parent`（考虑重叠），去重键用 `parents.n`；contextual 每篇只数一次 token；semantic 每个向量只归一化一次。没改的及原因：pypdf 中文断行不在加载器里合并（标题行和下一行之间的换行与句中断行无法区分，合并会把标题拼进正文；只在 eval 比对时归一化）；父块文本不拆成第二次查询（一次搜索最多几百行，多一次往返不划算）；contextual 并发调用推迟到 S5c（本地 Ollama 的并发由服务端决定）；`semantic` 不放进 `STRATEGIES`（这个注册表是不需要模型的策略，通用测试遍历它）；身份字段不改成查表（只有 3 个条件，还要处理 `effective_parent_size` 这种推导值）；`run_configs` 仍接受 dict 或函数（已有测试用 dict）。
-  - **Codex review（2026-11-08）**，修了：`children_per_parent` 只是估计，搜索在去重后凑不满候选池、且某条路径取满时把深度翻倍再取（也兜住检索与删除之间的竞争）；`top_k=0` 不再被当成未指定，小于 1 报错；contextual 的身份加上 `CODE_VERSION`（窗口截取、回复清理这些代码规则改了要升版本）；rerank 测试改为断言送去打分的是每个父块一个子块、最终顺序按 rerank 分数；chonkie 补了 `unit: chars` 和超长无断点串的测试。驳回及原因：跨文档父块被误去重（`documents` 主键是 `(kb, doc_id)`，检索只在一个 kb 内，`(doc_id, n)` 已唯一）；nonce 标签能被正文闭合（`_material` 转义所有 `</source…`，已有测试覆盖）；chonkie 在 chars 模式下超出 `size`（它用的就是 lite-rag 的计数器，之后还会再 `_fit`，新测试已验证）；空页导致页码错位（页间有分隔符，起点不重复，加了测试锁住）；semantic 把超长句子送去 embed（每句先经过 `_fit`，最细到 token 窗口）；已有 semantic kb 的身份变化（S5b 之前没有 semantic）；金标题只按一个加载器校验（simplify 之后已对每个加载器校验）。
-- S5 实现说明（2026-11-08）：
-  - **金标按"证据原文"标注**，不按 chunk id：每道题写明答案所在的文档和一段原文。某个命中只有同时满足"来自这篇文档"和"包含这段原文"（空白字符统一后比较）才算答对。这样同一套题可以对比不同的切块方式，否则 chunk id 一变，标注就失效了。加载金标时会校验每段原文确实出现在对应文档里。
-  - **语料**：`eval/corpus` 下 8 篇自写文档，中英文各 4 篇，内容是公开常识，外加一篇虚构的制度文档。`eval/golden.jsonl` 共 32 题，每篇 4 题：2 道用文中关键词提问，2 道换个说法提问。
-  - **`literag eval -c a.yaml -c b.yaml`**：输出 hit@1、hit@5、MRR@10、文档级 hit@5 和 p50/p95 延迟，hit@5 还会按题型分开统计。几处设计（S5 simplify，2026-11-08）：
-    - 索引配置（切块 + embedding）相同的几个配置共用一个 kb，只建一次，然后各自用自己的检索和 rerank 设置去查。kb 名取自索引配置的 hash。
-    - 所有配置共用同一个 store，embedder 和 reranker 按配置各建一次。
-    - 评测使用独立的 schema `lite_rag_eval`（迁移自动执行），不会碰到应用数据，结束后 kb 会被删除。
-    - 配置文件的优先级高于 `LITERAG_*` 环境变量和 `.env`（`load_settings(file_wins=True)`），否则开发者 `.env` 里的设置会悄悄覆盖配置文件，几个配置实际测的是同一套设置。每份报告都会记录当时实际生效的设置。
-    - 延迟只计检索（加 rerank）本身：计时前先算好所有问题的查询向量，再做一次热身搜索。第一次跑时 fixed 测出 40 ms，原因是第一个配置要为每个问题现算一次查询 embedding，而后面的配置直接读缓存，并不是当时写的"tokenizer 首次加载"，已更正。
-    - 检索深度固定为 10（为了算 MRR@10）。hybrid 模式下每条路径取 10 × candidate_factor 个候选，比默认 top_k=5 时的候选池更深。
-    - Codex review 后的修复（2026-11-08）：
-      - 判断"索引是否相同"时，除了只影响取数方式的设置（批大小、并发、重试、超时、缓存），embedding 的其他设置都会参与比较。因此即使模型名相同，只要端点不同，也算作不同的索引。
-      - kb 在开始构建之前就先登记，这样构建失败时，建了一半的 kb 也会被清理。清理时逐个删除 kb，原来的错误照常抛出，清理中遇到的问题作为附注附在上面。
-      - p95 改用 nearest-rank 方法计算，结果一定是某一个实际测到的值。
-      - 所有配置必须使用同一个数据库；没有传 `--config` 时给出明确的报错。
-      - 8 道题的证据原文重写过（q10、q11、q19、q24、q25、q26、q28、q30），现在每段原文里都同时出现问的对象和答案，比如"有害垃圾……例如废电池"，而不再只是一串例子。
-  - **指标经过独立核对**：`eval/crosscheck_ranx.py` 用 ranx 0.3.21 重新计算了 6 个配置的 hit@1、hit@5、MRR@10，与我们的结果完全一致。ranx 依赖太重（pandas、numba 等），所以没有加进项目依赖，需要时用 `uv run --with` 临时运行。（S12 起由 `literag eval --crosscheck` 取代，脚本已删除。）
-  - **第一次实测**（bge-m3 + qwen3 本地运行，切块大小 120 token / overlap 20）：
+    docling + markdown did not win, and the reason is exactly that the headings are flattened: the `heading_path` of the three "退款期限" (refund period) sections is only "退款期限" in all of them, and the higher-level headings that tell them apart (flights, hotels, trains) are lost; the 120-token chunks of recursive often carry the line "## 机票" (flights) along instead. 1 question in 10 is already 0.1, and generated PDFs are cleaner than real PDFs, so the conclusion is only: **the default is still pypdf**, and docling stays optional; to really use the structure, a parser that can restore heading levels is needed (for example by inferring from font size), which is beyond v1 (§1).
+  - eval: the corpus is loaded separately by PDF loader, and the loader enters the index identity; before comparing against the evidence text, Markdown marks (heading symbols, bold, escapes) are removed, and so is the whitespace between Chinese characters (a PDF breaks lines in the middle of a sentence).
+  - **Close-out (2026-11-08)**: /simplify (4 angles: reuse, simplification, efficiency, layering) changed: prompt rendering and the nonce guard are merged into `lite_rag.prompts.render_pair`; the kb identity of contextual uses `contextual.prompt_digest()` directly; the heading regex is left in one copy, `loaders.ATX`; the docling converter uses `@cache`; `embedding_text(chunk, header)` decides the indexed text uniformly; parent_child first dedups by parent, then cuts to the candidate pool, then reranks (rerank no longer scores 4 times as many), the engine no longer checks the strategy name and the chunker declares `children_per_parent` instead (taking overlap into account), and the dedup key uses `parents.n`; contextual counts tokens only once per document; semantic normalises each vector only once. Not changed, and why: pypdf's Chinese line breaks are not merged in the loader (the line break between a heading line and the next line cannot be told from a break in the middle of a sentence, and merging would stick the heading into the body; they are normalised only when eval compares); the parent text is not split into a second query (one search is at most a few hundred rows, and one more round trip is not worth it); concurrent contextual calls are postponed to S5c (the concurrency of local Ollama is decided by the server); `semantic` is not put into `STRATEGIES` (this registry holds the strategies that need no model, and the generic tests iterate over it); the identity fields are not changed to a table lookup (there are only 3 conditions, and a derived value such as `effective_parent_size` must be handled); `run_configs` still accepts a dict or a function (existing tests use a dict).
+  - **Codex review (2026-11-08)**, fixed: `children_per_parent` is only an estimate, and when the search cannot fill the candidate pool after dedup and some path was filled up, it doubles the depth and fetches again (this also covers the race between retrieval and deletion); `top_k=0` is no longer treated as unspecified, and less than 1 raises an error; the identity of contextual gains `CODE_VERSION` (when code rules such as window cutting and reply cleaning change, the version must be raised); the rerank test is changed to assert that what is sent for scoring is one child per parent and that the final order follows the rerank scores; chonkie gained tests for `unit: chars` and for an overlong string without break points. Dismissed, and why: a cross-document parent wrongly deduped (the primary key of `documents` is `(kb, doc_id)`, retrieval is inside one kb, and `(doc_id, n)` is already unique); a nonce tag that the body can close (`_material` escapes every `</source…`, and an existing test covers it); chonkie going beyond `size` in chars mode (it uses lite-rag's own counter and `_fit` is applied afterwards, verified by a new test); an empty page misaligning the page numbers (there is a separator between pages and start points are not duplicated, and a test was added to lock it); semantic sending an overlong sentence to embed (every sentence first passes `_fit`, down to the token window); a change of identity of existing semantic kbs (there was no semantic before S5b); golden questions validated against only one loader (after the simplify they are validated against each loader).
+- S5 implementation notes (2026-11-08):
+  - **The golden set is annotated by "evidence text"**, not by chunk id: each question states the document where the answer is and a passage of original text. A hit counts as correct only when it both "comes from this document" and "contains this passage" (compared after unifying whitespace). This way the same set of questions can compare different chunking methods; otherwise the annotation would become invalid whenever a chunk id changes. When the golden set is loaded, it is checked that each passage really appears in its document.
+  - **Corpus**: 8 self-written documents under `eval/corpus`, 4 in Chinese and 4 in English, of public common knowledge, plus one fictional policy document. `eval/golden.jsonl` has 32 questions in all, 4 per document: 2 ask with keywords from the text, 2 ask in other words.
+  - **`literag eval -c a.yaml -c b.yaml`**: outputs hit@1, hit@5, MRR@10, document-level hit@5 and p50/p95 latency, and hit@5 is also broken down by question type. Several design points (S5 simplify, 2026-11-08):
+    - Configs with the same index config (chunking + embedding) share one kb, built only once, and then each queries with its own retrieval and rerank settings. The kb name is taken from the hash of the index config.
+    - All configs share the same store, and the embedder and reranker are built once per config.
+    - Eval uses its own schema `lite_rag_eval` (migrations run automatically), does not touch application data, and the kbs are deleted at the end.
+    - The config file takes priority over the `LITERAG_*` environment variables and `.env` (`load_settings(file_wins=True)`); otherwise the settings in a developer's `.env` would silently override the config file, and several configs would in fact be measuring the same settings. Every report records the settings actually in effect at the time.
+    - Latency counts only retrieval (plus rerank) itself: the query vectors of all questions are computed before timing, followed by one warm-up search. On the first run fixed measured 40 ms, because the first config had to compute a query embedding on the spot for each question while the later configs read the cache directly, and it was not "the first load of the tokenizer" as written at the time, which has been corrected.
+    - The retrieval depth is fixed at 10 (to compute MRR@10). In hybrid mode each path takes 10 × candidate_factor candidates, a deeper pool than with the default top_k=5.
+    - Fixes after the Codex review (2026-11-08):
+      - When judging "whether the index is the same", all the other embedding settings take part in the comparison, except the settings that affect only how data is fetched (batch size, concurrency, retries, timeout, cache). So even with the same model name, a different endpoint counts as a different index.
+      - A kb is registered before the build starts, so that when the build fails, the half-built kb is also cleaned up. In the cleanup the kbs are deleted one by one, the original error is raised as usual, and problems met during the cleanup are attached to it as notes.
+      - p95 is computed with the nearest-rank method, so the result is always an actually measured value.
+      - All configs must use the same database; when `--config` is not passed, a clear error is given.
+      - The evidence text of 8 questions was rewritten (q10, q11, q19, q24, q25, q26, q28, q30), and now each passage contains both the object asked about and the answer, for example "有害垃圾……例如废电池" (hazardous waste … for example used batteries), and no longer just a list of examples.
+  - **The metrics were checked independently**: `eval/crosscheck_ranx.py` recomputed hit@1, hit@5 and MRR@10 of 6 configs with ranx 0.3.21, exactly the same as our results. ranx's dependencies are too heavy (pandas, numba and so on), so it was not added to the project dependencies, and is run temporarily with `uv run --with` when needed. (Replaced since S12 by `literag eval --crosscheck`, and the script is deleted.)
+  - **First measurement** (bge-m3 + qwen3 run locally, chunk size 120 tokens / overlap 20):
 
-    | 配置 | hit@1 | hit@5 | MRR@10 | 换说法题 hit@5 | p50 ms |
+    | Config | hit@1 | hit@5 | MRR@10 | paraphrase question hit@5 | p50 ms |
     | --- | --- | --- | --- | --- | --- |
     | fixed + hybrid | 0.88 | 1.00 | 0.919 | 1.00 | 5 |
     | recursive + hybrid | 0.84 | 1.00 | 0.905 | 1.00 | 4 |
     | markdown + hybrid | 0.91 | 0.94 | 0.930 | 0.88 | 5 |
-    | markdown + 只用向量 | 0.97 | 1.00 | 0.979 | 1.00 | 3 |
-    | markdown + 只用 BM25 | 0.75 | 0.91 | 0.823 | 0.81 | 2 |
+    | markdown + vector only | 0.97 | 1.00 | 0.979 | 1.00 | 3 |
+    | markdown + BM25 only | 0.75 | 0.91 | 0.823 | 0.81 | 2 |
     | markdown + hybrid + rerank | 0.97 | 1.00 | 0.979 | 1.00 | 1061 |
 
-    结论：在这份小语料上，只用向量检索的效果和加 rerank 相同；hybrid 反而被 BM25 拖累，问题集中在换说法提问的题上，BM25 排进来的错误结果经过 RRF 挤占了正确答案的位置。rerank 能把损失补回来，代价是每次查询多花约 1 秒。32 道题太少，这些差距未必稳定；能比较确定的只有一条：只用 BM25 时，换说法的题明显变差。默认配置暂不调整，等语料和题目扩充后再决定。
-  - **哪些自己写、哪些用库**（2026-11-08 决定）：切块、BM25、融合、评测指标自己实现，这几部分正是本项目学习的重点，也需要和精确的 offset、kb 身份信息、namespace、同一事务写入紧密配合；容易写错的底层部分全部用成熟库，包括 pgvector、PostgreSQL、jieba、tokenizers、fastembed、Ollama、官方 SDK。semantic 切块先评估 chonkie（S5b）；数据量变大后再加 `pg_search` 作为 BM25 后端（S7b）；不引入 LangChain 或 LlamaIndex 这类整体框架。
-- S4 实现说明（2026-11-08）：
-  - **Rerank**：用 fastembed 的 `TextCrossEncoder`（extra `[fastembed]`），默认模型 `BAAI/bge-reranker-v2-m3-int8`（Apache-2.0、多语言、约 0.6 GB）。`jinaai/jina-reranker-v2-base-multilingual` 是 CC-BY-NC 协议，不用作默认。rerank 默认关闭，可以用 `search(rerank=True)`、`--rerank` 或配置项 `rerank.enabled` 打开。开启后，融合结果中排名前 `rerank.top_n`（默认 20）的候选交给 cross-encoder 打分；送进模型的文本包含 chunk 的标题和标题路径。每条命中都会记录 `scores["rerank"]` 和 `ranks["rerank"]`。
-  - **LLM**：`ollama` 和 `openai` 共用 OpenAI SDK，只是 base URL 不同，Ollama 用本机的 `/v1`。`anthropic` 用官方 SDK（extra）。几个实测或核对过的细节：
-    - 各 provider 的差异记在 `llm.PROVIDERS` 这张表里，不写成代码分支：默认 base URL、默认 key 变量、token 上限用哪个字段、默认 temperature。
-      - Ollama 不认 `max_completion_tokens`，所以发 `max_tokens`；OpenAI 发 `max_completion_tokens`。个别 OpenAI 兼容端点只认另一个字段时，用 `llm.max_tokens_param` 覆盖。配置项本身叫 `max_output_tokens`。
-      - 默认 temperature：Ollama 为 0；OpenAI 默认不发，因为它的推理模型拒绝非默认的 temperature。
-      - anthropic 不支持 `temperature`、`reasoning_effort` 和 `max_tokens_param`，配置了就在加载配置时报错，不会悄悄丢掉。
-      - `reasoning_effort` 只接受固定的几个取值，写错在加载配置时就会报错。
-      - openai 3.x 和 anthropic 2.x 的 SDK 底层用的都是 httpx2，不是 httpx，所以超时要用 SDK 自己导出的 `Timeout`（连接超时默认 5 s，读取超时默认 120 s，`max_retries` 默认 1）。
-    - Ollama 把 qwen3 的思考过程放在 `message.reasoning` 字段里，不会混进 `content`；`reasoning_effort: none` 可以关掉思考，一句话的回答从约 350 个 token 降到 7 个。
-    - anthropic 2.6 SDK 的 `messages.create` 签名里已经没有 `temperature` 参数，所以不传。
-    - 开启 rerank 时，reranker 在 `from_settings` 里就创建，配置错误在启动时就能发现，不过模型要到第一次使用时才加载。LLM 则在第一次使用时才创建，所以只做检索的引擎不需要 LLM key。
-    - "chunk 在哪里"只由一个函数生成：`chunking.chunk_context(title, heading_path)`，reranker、提示词模板和 CLI 都用它。embedding 文本只加标题路径、不加文档标题，这是有意的：标题会在同一篇文档的每个 chunk 里重复出现，把这些 chunk 在向量空间里拉得过近。
-    - `Answer.status` 取值为 `answered` 或 `no_sources`。没有命中时 `text` 为空，提示语由调用方用自己的语言渲染，CLI 显示英文。删除引用时只处理引用标记本身，不改动模型写的其他文字。
-    - Codex review 修复（2026-11-08）：
-      - **来源不能被伪造**：每条来源放在 `<source-NONCE id="n" from="标题 > 章节">…</source-NONCE>` 里。NONCE 是每次构造提示时随机生成的 12 位十六进制数（安全审查建议），文档事先不可能知道它，所以无法打开或关闭一个来源块。作为第二道防线，文档正文里的 `<source…` 和当前的 tag 都会被转义；`from` 属性里的引号和尖括号也会转义。系统提示里写明：来源里的文字只是资料，不是指令。
-      - **记录 fused 这一级**：hybrid 模式下 `Hit.scores` 和 `Hit.ranks` 也包含 `fused`（没有 rerank 时 `score` 就等于它）。
-      - **搜索途中 chunk 被删除**：对整个排名列表取 chunk 内容，先剔除已经被删除的，再截取所需数量，这样空出来的位置会由后面的候选补上。
-      - **模型返回空回复时报错**：内容为空或只有空白（比如 token 预算全被思考用掉）时抛出 `LLMError`，不会当成正常回答返回。
-      - **合法的分组引用保持原样**：一组编号全部有效时（如 `[1, 3]`、`[1，3]`），保留模型原来的写法；只有含无效编号的组才会改写。
-    - 暂不实现（S4 simplify 评估过）：ollama 默认 `reasoning_effort=none`（目前只在 qwen3 上验证过，换成不支持思考的模型会怎样还未知，所以只作推荐）；rerank 文本截断、提示词里合并相互重叠的 chunk（等 S5 的评测数据再决定）；服务启动时预热 rerank 模型（S6）。
-  - **回答**：提示词放在 `prompts/answer_system.j2` 和 `answer_user.j2` 两个模板里，用 StrictUndefined，缺字段直接报错。模型回答里引用的编号由代码逐一核对：不在 1..k 范围内的编号从正文中删除，记进 `Answer.dropped`。没有命中时不调用模型。`Answer` 会记录 `provider/model` 和 token 用量。
-- S3 实现说明（2026-11-08）：
-  - **BM25 有两种实现**：`keyword.py`（Python，便于阅读）和 SQL（更快），由 `store.bm25_impl` 选择。两者共用同一个统计量 CTE：N 和 avgdl 取自 `kbs`，n(t) 用窗口函数在元数据过滤**之前**统计，所以过滤只缩小候选，不改变分数，有测试按两种实现分别检查。posting 表里直接存了 chunk 的 `length` 和 `doc_id`（迁移 0003），打分时只读 posting 表，不用再逐行回查 `chunks`。
-  - **向量检索**的事务里会设置 `hnsw.iterative_scan = strict_order`（pgvector 0.8）。多个 kb 共用同一张 `embeddings_<dim>` 表和同一个 HNSW 索引，kb 过滤发生在索引扫描之后；不开这个参数，规划器一旦选择 HNSW，候选（`ef_search`=40）可能全部属于其他 kb，结果就会不足 top_k。kb 很小时，规划器通常会先用主键按 kb 过滤再精确排序，这样本来就是正确的。实测：同表另有 2000 条向量时，关闭该参数只返回 1 条，`strict_order` 返回 5 条。
-  - **只读操作不会创建 kb**：在不存在的 kb 上搜索会抛出 `KbNotFound`，因为拼错的名字应该报错，而不是返回空结果；删除操作则返回 False，保持幂等。写入操作会在 kb 不存在时创建它。
-  - 用户写在连接串里的 `options` 会被保留，`search_path` 追加在它后面。
-  - 打开 store 和执行 `literag migrate` 时都会检查 pgvector 版本，要求不低于 0.8（`iterative_scan` 需要）。
-  - 只有 hybrid 模式才按 `top_k × candidate_factor` 向两条路径取候选；单一模式只取 `top_k`。`Hit.scores` 里只放各阶段自己的分数，最终分数是 `Hit.score`。
-  - **平局与浮点误差**（Codex review，2026-11-08）：每个 chunk 的各项分数按词的固定顺序相加，Python 版先排序再求和，SQL 版用 `sum(... ORDER BY term)`。这样一个 chunk 的分数不会因为数据库返回行的顺序不同而在最后一位产生差异。排序时分数先舍入到 9 位小数（`ranking.PRECISION`，SQL 用 `round(score::numeric, 9)`）再比较，只差浮点噪声的两个分数视为平局，平局按 chunk_id 排。
-  - **读操作每次都检查 kb**：kb 是否存在、身份是否一致，读操作每次都会重新确认，代价是多一次很轻的查询。这样另一个进程删掉 kb 后，下一次搜索会报 `KbNotFound`，而不是返回空结果。写操作每个引擎只检查一次；kb 若在之后被删除，加锁写入时会报 `KbNotFound`。
-  - `stats()` 不做身份校验，这是有意为之：它的用途正是查看一个 kb 是用什么模型和配置建的，配置不一致时也必须能看到；kb 不存在时返回 None（CLI 会显示 "does not exist"）。Codex 建议它也走读操作的检查，未采纳，理由同上。
-  - 暂不实现（S3 simplify 评估过，2026-11-08）：向量和 BM25 两条路径并行执行，留到 S6 服务层；读操作改用 autocommit、缓存写入移出请求路径，等有实测数据再定；向量距离只算一次，需要先用 EXPLAIN 确认不影响 HNSW。
-  - 测试里 HNSW 召回不全的数据要用分布均匀的随机向量构造。bag-of-words 的 fake embedder 生成的 8 维向量大量重复，会让 HNSW 图里有些节点永远搜不到，真实模型不会出现这种情况。
-- S12 实现说明（2026-11-14，评测迁到 lite-eval）：
-  - 适配器 `LiteRagTarget` 实现 lite-eval 的 Target 协议：`config()` 是 `effective_settings`，`setup_identity()` 是 `index_identity`，所以同一索引的配置由 lite-eval 分成一组，第一个建 kb，其余接过它的 kb 和 embedder；整组跑完才删 kb。setup 失败（建库或算查询向量）时适配器自己删掉 kb（lite-eval 只 teardown setup 成功的 target），删除再失败就作为附注挂在原错误上。
-  - setup 里不计时地算好全部查询向量（存进 embedding 缓存，所以只在 `embedding.cache` 开着时生效，和 S12 之前一样）；lite-eval 在计时前再做一次预热搜索。每个运行在 `target.info.latency_scope` 记下延迟的口径，表格脚注照此写，口径不同的配置分别写明。并发为 1（检索是同步的），输出缓存关闭（延迟是本次运行的测量，缓存的输出会带着旧运行的延迟）。
-  - 语料每种 PDF loader 只解析一次，embedder 和 reranker 每种配置只建一次；生成的 suite 的 `python:` 入口 `built_in_code` 只会报错：target 在代码里构造（共用一个 store），这个 suite 只用于记录，不能单独重跑。lite-eval 的报错（如 setup 失败）在 CLI 里是一行 `error:`，退出码 1。
-  - 依赖：lite-eval 声明版本区间（它的 AGENTS 规则 13），lite-rag 的 docling extra 要求 typer < 0.28，解析到 typer 0.27.3。
-  - 迁移后本机真实运行（bge-m3）的 mode-vector、mode-bm25、chunk-markdown 三行和 S5 基线（2026-11-08）的 hit@1、hit@5、MRR@10 逐项相同（收尾修改后又跑了一次，仍相同）。
-  - 验证：pytest 480 passed（`--all-extras` 和 CI 的 `--extra anthropic` 两种安装都跑过）；`-m ollama` 的 bge-m3 等价测试通过；改坏脚本 19/19 变红。
-  - **/simplify 改了**：配置名转 lite-eval 名时去掉开头的非字母数字（`_x`、`.hidden` 原先会被 lite-eval 拒绝）；setup 算查询向量失败时也删 kb；语料每个 loader 只解析一次（原先每个 setup 组各解析一次：两个组时 8 篇文档解析 24 次）；golden 每篇文档只 normalise 一次；去掉 `make()`、可空 store 和 `_owns_store`，工厂改为必填参数；删 kb 失败报 `StoreError`；`--out` 写 lite-eval 的运行记录加逐题排名；表格下逐个打印运行的状态和警告；lite-eval 的错误在 CLI 里变成一行错误。前四条各有先红后绿的测试。
-  - **/simplify 没改的**：lite-eval 公开 `run_suite(targets=…)`（等第二个使用方；lite-rag 按提交锁定 lite-eval，每次升级跑等价测试）；lite-eval 在 setup 失败后也调用 teardown（要改 Target 协议，改为在适配器里处理）；ranx 合并调用、数据集重复拷贝（耗时可忽略）。
-  - **Codex review**：一条成立并已修复（先红后绿）：表格脚注总说"查询向量已算好"，`embedding.cache` 关闭时延迟其实包含查询 embedding，现在按每个运行记录的口径写。一条不采纳：Codex 认为解析计数测试把核对时的 `load_corpus` 也算进去了，实际上 `len(parsed)` 先求值，测试是对的（改坏脚本让它变红）；但写法依赖求值顺序，已改为打补丁前先算好期望值。
-  - **推送后 CI 发现两处**（都先红后绿）：`cli.py` 在顶层导入 lite_eval，而服务镜像不装 `eval` extra，结果整个 `literag` 都启动不了（镜像冒烟测试失败）。现在 lite-eval 只在 `literag eval` 里导入，没装时给一行 "install the eval extra" 错误；`_errors` 只在 `lite_eval.errors` 已加载时才认 lite-eval 的错误。另一处：CLI 报错测试在 CI 里被 `CI=true` 的计费保护抢先拒绝，测试改为清掉 `CI`。
-- S13 实现说明（2026-11-18，回答的 grounded 评审，lite-eval E5b）：
-  - 依赖 lite-eval 0.3.0（release wheel）；升级后 lite-rag 全部测试（含 S12 的等价测试）不改一行就通过。
-  - **校准集**（`eval_grounded.py`，`eval/make_judge_grounded.py` 生成，提交；测试核对提交的和生成器一致）：
-    - 合格回答 = 证据所在的那一句（分句只认句末的 `.!?` 加空格和 `。！？`，比切块的分句窄：基础回答要是读者会整句引用的一句），引用它的段落为来源 [1]；证据跨句的题（q07）没有干净的基础回答，不用。
-    - 机械改法用 lite-eval 的 `judges/construct.py`：改一个数字、加一句别的文档的话、换成别题的回答、去掉引用。插入和交换只取**同语言**的其他文档：语言取自金标集（文档的语言 = 它的题目的语言），不按字符猜（Codex 发现：英文句子里引一个汉字就会被当成中文）。
-    - 手写改法（`hand-corruptions.jsonl`，每题两条）：把来源说的一件事说反（`contradict_source`），以及加一句听起来合理但没有任何来源说过的话（`plausible_elaboration`）。测试核对手写和插入的内容不在该题的整篇文档里。
-    - 真实回答（`real-answers.jsonl`）：第一次真实回答检查的 32 个回答，带它们拿到的全部来源，逐条读后标注（28 grounded、2 unsupported、2 unclear 留档不用）；标注是模型读的，待 owner 抽查。
-  - **为什么有手写改法和真实回答**：只有机械改法时，qwen3:8b（思考关）262/262 全对；但拿真实回答一读，它放过了两条有问题的回答（q04 加了来源没有的解释，q20 和自己引用的来源矛盾），又把一条忠实的转述（q27）判成 unsupported。构造的标签继承了构造的样子（方法论 §2、lite-eval 设计 §3 L2）：真实模型的错误是看似合理的补充和不起眼的矛盾，不是整句换掉。
-  - **结果**（223 例 × 2 次，温度 0，两次完全一致）：思考关整体 0.955；机械改法、合格回答、说反来源都是 1.000；合理补充 0.774（31 条漏 7 条：都是归因、机制、经验规则，如"SCA 标准""国家规定"）；真实回答 0.900，但两条有问题的真实回答都没判出来。结论：只能做粗筛（找错答、矛盾、编造），**不能做门禁**。思考开：整体 0.982；合理补充 0.968（31 条漏 1 条）；真实回答 0.933，不再误判那条忠实转述，但两条有问题的真实回答仍然都没判出来（它们引用了多个来源，评审认为补充的说法"明示或暗示"有依据）；新增一条误判（去掉引用的 q21，评审把春分那半句读成了惊蛰）；p50 11.8 秒，是思考关的 3.7 倍。结论不变：要用就用思考开，但真实回答里那种跨多个来源的补充说法，两种设置都抓不住，而两条样本也不够量出漏判率。
-  - **换一个模型家族**（owner 2026-11-18 定，经 llm-gateway 的 gpt-sub，ChatGPT 订阅额度；Suite `eval/judge-grounded/suites/calibrate-gateway.yaml`，1 次重复）：整体 0.996；合理补充 31/31，两条有问题的真实回答都判出来了（q20 还指出补充的话和它引用的来源 [5] 相矛盾）。唯一错的是 q28 的合格基准：答案就是来源原句，评审却因为"没有直接回答问题"判为不支持，把相关性混进了有没有依据。下一步：规则里写明只看来源支持不支持（改了规则就是换了仪器，要重新判一遍）；当门禁之前在 `gpt-api` 上再跑一次（订阅通道不等于 API）。真实切片和手写改法的标签仍是模型写的，等 owner 检查。
-  - **收紧规则的尝试**（同日，未采纳）：在 lite-eval 的 grounded 提示词里加"不判是否回答了问题"，两种写法都修好了 q28，却各放过一条换成别题答案的回答（q01、q08；评审自己的理由说来源里没有，结论却是 grounded）。三种规则都判过的 119 例：原规则 119/119，两版收紧各 118/119。门禁最怕放过错误，所以保留原规则，q28 作为已知误报。第三轮跑到约 120 次时 ChatGPT 订阅额度用完（上游 429），那一轮的 0.529 不代表评审水平。
-  - **gpt-api 未跑成**（同日）：`calibrate-gateway.yaml` 加了 `gpt-api` 配置（经 llm-gateway，gpt-5.6-luna，按 token 计费）。试判 1 条时 OpenAI 返回 401，本机的 API key 不被接受，没有产生费用。等 owner 换上有效的 key 后，先判 1 条，看真实 token 用量估算 223 条的费用，再由 owner 决定是否跑全量。
-  - **待测（额度或 key 恢复后再做；开发已完成，2026-11-18 记）**：
-    1. **gpt-sub 第 2 次重复**：ChatGPT 订阅额度恢复后，用原规则（提示词版本 `26e4dc07801c`）把 `calibrate-gateway.yaml --config gpt-sub` 再跑一遍，看订阅通道在同一用例上是否稳定（它不保证遵守温度 0）。约 223 次订阅调用。
-    2. **gpt-api**：owner 换上有效的 OpenAI key 后，先判 1 条，用真实 token 用量估算全量费用，owner 同意后跑 `--config gpt-api` 全量。这是拿 gpt-sub 当门禁之前必须做的（订阅通道不等于 API）。
-    3. **新的真实回答**：再跑一批 `literag ask`，逐条标注后作为新的真实切片。以后要改 grounded 规则，用这批来比较，不再拿这 223 例调提示词。
-    4. **owner 检查标签**：`real-answers.jsonl` 的标签（q04、q20 unsupported，q27 grounded，q03、q28 unclear）和 `hand-corruptions.jsonl` 的 62 句。有改动就重新生成校准集，上面各项都要重跑。
-  - **`literag eval-answers`**：`LiteRagAnswerTarget`（`LiteRagTarget` 的子类，`query_key = "question"`，构造时给 `llm_for`）对金标题跑 `ask`，输出 `{question, answer, sources, status, dropped}`，延迟含一次回答调用；计费用 `billing(settings, answers=True)`，把回答模型算进去。评审取自校准 suite 里那条配置（含 key 变量、价格、原样的 URL；记录里没有这些），lite-eval 在任何调用之前逐项核对、核对校准的一致率；CLI 在打开 store 之前先检查校准运行。输出缓存开着：同一批回答可以换评审重新判，不用重新生成。
-  - 生成的数据集和 suite 共用 `write_generated_dataset`、`golden_cases`、`write_suite`（检索评测的 `dataset.yaml` 字节不变，所以数据集哈希和以前的运行仍可比；Codex 发现过一次差点改掉）。
-  - **自评偏差**：回答和评审都是 qwen3:8b。换一个模型家族的评审（经 llm-gateway，按 owner 的指示）是下一步的对照。
-- S14 实现说明（2026-11-18，回答对不对、自动路由的效果；lite-model 设计 §15 的那一项）：
-  - **为什么**：lite-model 的路由（LiteLLM Proxy 的 `smart-router`）要量"自动路由值不值"。grounded 评审只判"有没有
-    依据"，而且漏掉真实回答最常见的错；所以先加"答对没"（`key_fact`），再把实际回答的模型记下来（`response_model`）。
-  - **`key_fact`**：32 题各一个正则。第一版太宽（独立 review 发现：数字没边界，`16` 匹配"7 gram … 16 grams"，
-    `不予受理` 不带天数，q08 的 `not|no` 几乎匹配任何英文回答），收紧后加了反例测试（改数字、换别题答案都不能匹配；
-    q12 的改数字改的是倾角，问的是哪颗行星，答案仍对，列为例外）。说反方向的回答正则看不出，交给评审。
-  - **`eval-answers` 的缓存缺陷（S13 起就有）**：suite 没写 `cache`，lite-eval 默认 `auto` 会复用上次的输出，第二次
-    运行 32 个全命中，延迟也是上次的。这次实验的第 2 次运行因此作废重跑；修为 `cache: off`，回归测试先红。
-  - **`response_model`**：先叫 `answered`；独立 review 指出它和 lite-model 的 `Provenance.answered`、`status:
-    "answered"` 撞名，而且普通 LiteLLM 别名时只是别名，改名并写明是过渡字段（§6）。
-  - **结果**（32 题 × 2 次真实运行，温度 0；"对" = `key_fact` 且 grounded；评审 qwen3:8b 思考开，校准一致率 0.982）：
+    Conclusion: on this small corpus, vector-only retrieval does as well as adding rerank; hybrid is instead dragged down by BM25, and the problem is concentrated in the questions asked in other words, where the wrong results that BM25 brought in took the place of the correct answer through RRF. Rerank can make up the loss, at the cost of about 1 more second per query. 32 questions are too few, and these gaps may not be stable; the only thing that can be said fairly surely is that with BM25 only, the paraphrase questions get clearly worse. The default config is not adjusted for now, to be decided after the corpus and questions are expanded.
+  - **What is written ourselves and what uses a library** (decided 2026-11-08): chunking, BM25, fusion and the eval metrics are implemented by ourselves, since these parts are exactly the focus of learning in this project, and they also need to fit closely with exact offsets, kb identity information, namespaces and writes in the same transaction; the low-level parts that are easy to get wrong all use mature libraries, including pgvector, PostgreSQL, jieba, tokenizers, fastembed, Ollama and the official SDKs. For semantic chunking, chonkie is evaluated first (S5b); `pg_search` is added as a BM25 backend when the data grows (S7b); no whole framework such as LangChain or LlamaIndex is introduced.
+- S4 implementation notes (2026-11-08):
+  - **Rerank**: uses fastembed's `TextCrossEncoder` (extra `[fastembed]`), with the default model `BAAI/bge-reranker-v2-m3-int8` (Apache-2.0, multilingual, about 0.6 GB). `jinaai/jina-reranker-v2-base-multilingual` is under the CC-BY-NC license and is not used as the default. Rerank is off by default, and can be turned on with `search(rerank=True)`, `--rerank` or the config item `rerank.enabled`. When on, the candidates ranked in the first `rerank.top_n` (default 20) of the fusion result are handed to the cross-encoder for scoring; the text sent to the model contains the chunk's title and heading path. Every hit records `scores["rerank"]` and `ranks["rerank"]`.
+  - **LLM**: `ollama` and `openai` share the OpenAI SDK, with only the base URL different, and Ollama uses the local `/v1`. `anthropic` uses the official SDK (extra). Some details that were measured or checked:
+    - The differences between providers are recorded in the table `llm.PROVIDERS` and not written as code branches: the default base URL, the default key variable, which field the token cap uses, and the default temperature.
+      - Ollama does not recognise `max_completion_tokens`, so it gets `max_tokens`; OpenAI gets `max_completion_tokens`. When an individual OpenAI-compatible endpoint recognises only the other field, override it with `llm.max_tokens_param`. The config item itself is called `max_output_tokens`.
+      - Default temperature: 0 for Ollama; for OpenAI it is not sent by default, because its reasoning models reject a non-default temperature.
+      - anthropic does not support `temperature`, `reasoning_effort` and `max_tokens_param`; if they are configured, an error is raised when the config is loaded, and they are not dropped silently.
+      - `reasoning_effort` accepts only a fixed set of values, and a wrong one raises an error at config load.
+      - The openai 3.x and anthropic 2.x SDKs both use httpx2 underneath, not httpx, so the timeout must use the `Timeout` that the SDK itself exports (connect timeout 5 s by default, read timeout 120 s by default, `max_retries` 1 by default).
+    - Ollama puts the thinking process of qwen3 in the `message.reasoning` field, and it does not get mixed into `content`; `reasoning_effort: none` turns thinking off, and a one-sentence answer drops from about 350 tokens to 7.
+    - The `messages.create` signature of the anthropic 2.6 SDK no longer has a `temperature` parameter, so it is not passed.
+    - When rerank is on, the reranker is created already in `from_settings`, so a config error is found at start-up, though the model is loaded only on first use. The LLM is created only on first use, so an engine that only does retrieval needs no LLM key.
+    - "Where the chunk is" is produced by one function only: `chunking.chunk_context(title, heading_path)`, used by the reranker, the prompt template and the CLI. The embedding text adds only the heading path and not the document title, which is intentional: the title would repeat in every chunk of the same document and pull these chunks too close together in vector space.
+    - `Answer.status` takes the value `answered` or `no_sources`. With no hit, `text` is empty, and the hint is rendered by the caller in its own language; the CLI shows English. When citations are removed, only the citation marks themselves are handled, and other text written by the model is not touched.
+    - Codex review fixes (2026-11-08):
+      - **Sources cannot be forged**: each source is put in `<source-NONCE id="n" from="title > section">…</source-NONCE>`. The NONCE is a 12-digit hexadecimal number generated at random every time the prompt is built (suggested by the security review), which a document cannot know in advance, so it cannot open or close a source block. As a second line of defence, `<source…` and the current tag in the document body are both escaped; quotes and angle brackets in the `from` attribute are also escaped. The system prompt states that the text in a source is only material, not an instruction.
+      - **Record the fused level**: in hybrid mode `Hit.scores` and `Hit.ranks` also contain `fused` (without rerank, `score` equals it).
+      - **A chunk deleted in the middle of a search**: the chunk contents are fetched for the whole ranking list, those already deleted are removed first, and then the needed number is cut off, so the places left empty are filled by the candidates behind.
+      - **An error when the model returns an empty reply**: when the content is empty or only whitespace (for example because the token budget was all used up by thinking), `LLMError` is raised, and it is not returned as a normal answer.
+      - **Valid grouped citations are kept as they are**: when all the numbers of a group are valid (such as `[1, 3]`, `[1，3]`), the model's original way of writing is kept; only a group that contains an invalid number is rewritten.
+    - Not implemented for now (evaluated in the S4 simplify): `reasoning_effort=none` by default for ollama (so far verified only on qwen3, and what happens with a model that does not support thinking is not yet known, so it is only a recommendation); rerank text truncation, and merging overlapping chunks in the prompt (to be decided with the S5 eval data); warming up the rerank model at service start-up (S6).
+  - **Answering**: the prompt is in the two templates `prompts/answer_system.j2` and `answer_user.j2`, using StrictUndefined, so a missing field raises an error directly. The numbers cited in the model's answer are checked one by one by the code: a number outside the range 1..k is removed from the text and recorded in `Answer.dropped`. When there is no hit, the model is not called. `Answer` records `provider/model` and the token usage.
+- S3 implementation notes (2026-11-08):
+  - **BM25 has two implementations**: `keyword.py` (Python, easy to read) and SQL (faster), chosen by `store.bm25_impl`. Both share the same statistics CTE: N and avgdl come from `kbs`, and n(t) is counted with a window function **before** the metadata filter, so filtering only narrows the candidates and does not change scores, with tests checking each of the two implementations. The postings table stores the chunk's `length` and `doc_id` directly (migration 0003), so scoring reads only the postings table and does not need to look back into `chunks` row by row.
+  - The transaction of the **vector query** sets `hnsw.iterative_scan = strict_order` (pgvector 0.8). Several kbs share the same `embeddings_<dim>` table and the same HNSW index, and the kb filter happens after the index scan; without this parameter, once the planner chooses HNSW the candidates (`ef_search`=40) may all belong to other kbs, and the result would fall short of top_k. When the kb is very small, the planner usually filters by kb with the primary key first and then sorts exactly, which is correct as it is. Measured: with 2000 other vectors in the same table, turning the parameter off returns only 1 row, and `strict_order` returns 5.
+  - **Read operations do not create a kb**: searching in a kb that does not exist raises `KbNotFound`, because a misspelled name should raise an error and not return an empty result; a delete operation returns False, which keeps it idempotent. A write operation creates the kb when it does not exist.
+  - The `options` that the user wrote in the connection string are kept, and `search_path` is appended after it.
+  - The pgvector version is checked both when the store is opened and when `literag migrate` runs, and it must be at least 0.8 (`iterative_scan` needs it).
+  - Only hybrid mode takes candidates from the two paths by `top_k × candidate_factor`; a single mode takes only `top_k`. `Hit.scores` holds only the scores of each stage itself, and the final score is `Hit.score`.
+  - **Ties and floating-point error** (Codex review, 2026-11-08): the terms of each chunk's score are added in a fixed order of words; the Python version sorts first and then sums, and the SQL version uses `sum(... ORDER BY term)`. This way the score of a chunk does not differ in the last digit because the database returns rows in a different order. When sorting, scores are first rounded to 9 decimal places (`ranking.PRECISION`, SQL uses `round(score::numeric, 9)`) and then compared, two scores that differ only by floating-point noise are treated as a tie, and ties are ordered by chunk_id.
+  - **Read operations check the kb every time**: whether the kb exists and whether the identity matches is confirmed again by every read operation, at the cost of one more light query. This way, after another process deletes the kb, the next search raises `KbNotFound` and does not return an empty result. A write operation checks only once per engine; if the kb is deleted afterwards, the locked write raises `KbNotFound`.
+  - `stats()` does no identity check, which is intentional: its very use is to see with which model and config a kb was built, and it must be visible even when the config does not match; when the kb does not exist it returns None (the CLI shows "does not exist"). Codex suggested that it also go through the check of read operations, which was not accepted, for the same reason as above.
+  - Not implemented for now (evaluated in the S3 simplify, 2026-11-08): running the vector and BM25 paths in parallel, left to the S6 service layer; making read operations use autocommit and moving cache writes off the request path, to be decided when there is measured data; computing the vector distance only once, which needs EXPLAIN first to confirm that it does not affect HNSW.
+  - In tests, data where HNSW recall is incomplete must be built with evenly distributed random vectors. The 8-dimension vectors generated by the bag-of-words fake embedder contain many duplicates, which make some nodes in the HNSW graph never reachable by search; a real model does not have this.
+- S12 implementation notes (2026-11-14, eval moves to lite-eval):
+  - The adapter `LiteRagTarget` implements lite-eval's Target protocol: `config()` is `effective_settings` and `setup_identity()` is `index_identity`, so configs of the same index are grouped by lite-eval, the first builds the kb, and the others take over its kb and embedder; the kb is deleted only after the whole group has run. When setup fails (building the kb or computing the query vectors), the adapter itself deletes the kb (lite-eval tears down only targets whose setup succeeded), and if the delete fails again it is attached to the original error as a note.
+  - In setup all the query vectors are computed without timing (stored in the embedding cache, so this works only when `embedding.cache` is on, as before S12); lite-eval does one more warm-up search before timing. Each run records the basis of the latency in `target.info.latency_scope`, the table footnote is written accordingly, and configs with a different basis are stated separately. Concurrency is 1 (retrieval is synchronous), and the output cache is off (latency is a measurement of this run, and a cached output would carry the latency of an old run).
+  - The corpus is parsed only once per PDF loader, and the embedder and reranker are built only once per config; the `python:` entry `built_in_code` of the generated suite only raises an error: the target is constructed in code (sharing one store), and this suite is only for the record and cannot be re-run alone. A lite-eval error (such as a setup failure) is one `error:` line in the CLI, with exit code 1.
+  - Dependencies: lite-eval declares a version range (its AGENTS rule 13), lite-rag's docling extra requires typer < 0.28, and it resolves to typer 0.27.3.
+  - After the migration, the real local run (bge-m3) of the three rows mode-vector, mode-bm25 and chunk-markdown is the same item by item as the S5 baseline (2026-11-08) in hit@1, hit@5 and MRR@10 (run once more after the close-out changes, still the same).
+  - Verification: pytest 480 passed (both installs, `--all-extras` and CI's `--extra anthropic`, were run); the bge-m3 equivalence test of `-m ollama` passes; 19/19 broken scripts turn red.
+  - **/simplify changed**: when a config name is turned into a lite-eval name, leading non-alphanumeric characters are removed (`_x` and `.hidden` used to be rejected by lite-eval); a kb is also deleted when computing the query vectors in setup fails; the corpus is parsed only once per loader (before, once per setup group: with two groups, 8 documents were parsed 24 times); golden normalises each document only once; `make()`, the nullable store and `_owns_store` are removed, and the factory becomes a required parameter; a failure to delete a kb raises `StoreError`; `--out` writes lite-eval's run record plus the per-question ranks; under the table, the status and warnings of each run are printed one by one; lite-eval's errors become a one-line error in the CLI. The first four each have a red-then-green test.
+  - **/simplify not changed**: lite-eval publishing `run_suite(targets=…)` (waiting for a second user; lite-rag pins lite-eval by commit and runs the equivalence tests at every upgrade); lite-eval also calling teardown after a setup failure (it would change the Target protocol, so it is handled in the adapter instead); merged ranx calls and duplicate copies of the dataset (the time is negligible).
+  - **Codex review**: one held up and was fixed (red then green): the table footnote always said "the query vectors have been computed", but when `embedding.cache` is off the latency in fact includes the query embedding, and now it is written by the basis recorded for each run. One not accepted: Codex thought the parse-count test also counted the `load_corpus` of the check, but in fact `len(parsed)` is evaluated first and the test is right (a broken script turns it red); but the way it is written depends on the evaluation order, and it was changed to compute the expected value before patching.
+  - **Two things found by CI after the push** (both red then green): `cli.py` imported lite_eval at the top level, while the service image does not install the `eval` extra, so the whole `literag` could not start (the image smoke test failed). Now lite-eval is imported only in `literag eval`, and when it is not installed a one-line "install the eval extra" error is given; `_errors` recognises lite-eval's errors only when `lite_eval.errors` is already loaded. The other: the CLI error test was refused ahead of time in CI by the billing guard of `CI=true`, and the test now clears `CI`.
+- S13 implementation notes (2026-11-18, the grounded judge of answers, lite-eval E5b):
+  - Depends on lite-eval 0.3.0 (release wheel); after the upgrade all of lite-rag's tests (including the equivalence tests of S12) pass without changing a line.
+  - **Calibration set** (`eval_grounded.py`, generated by `eval/make_judge_grounded.py`, committed; a test checks that the committed one agrees with the generator):
+    - The qualified answer = the sentence where the evidence is (sentence splitting recognises only `.!?` followed by a space at the end of a sentence, and `。！？`, which is narrower than the sentence splitting of chunking: the base answer must be a sentence that a reader would quote whole), with the paragraph that cites it as source [1]; a question whose evidence spans sentences (q07) has no clean base answer and is not used.
+    - The mechanical corruptions use lite-eval's `judges/construct.py`: change a number, add a sentence from another document, replace with the answer of another question, remove the citation. Insertion and swapping take only other documents of the **same language**: the language is taken from the golden set (the language of a document = the language of its questions) and is not guessed from characters (found by Codex: an English sentence quoting one Chinese character would be treated as Chinese).
+    - Hand-written corruptions (`hand-corruptions.jsonl`, two per question): stating the opposite of something the source says (`contradict_source`), and adding a sentence that sounds reasonable but that no source has said (`plausible_elaboration`). A test checks that the hand-written and inserted content is not in the whole document of that question.
+    - Real answers (`real-answers.jsonl`): the 32 answers of the first real-answer check, with all the sources they received, annotated after reading one by one (28 grounded, 2 unsupported, 2 unclear kept on file and not used); the annotation was read by a model and awaits a spot check by the owner.
+  - **Why there are hand-written corruptions and real answers**: with only mechanical corruptions, qwen3:8b (thinking off) was 262/262 correct; but reading real answers, it let through two problematic answers (q04 added an explanation that the source does not have, q20 contradicted a source it cited), and judged one faithful paraphrase (q27) as unsupported. The labels of a construction inherit the shape of the construction (methodology §2, lite-eval design §3 L2): the errors of a real model are reasonable-looking additions and inconspicuous contradictions, not whole sentences replaced.
+  - **Results** (223 cases × 2 runs, temperature 0, the two runs exactly the same): thinking off overall 0.955; mechanical corruptions, qualified answers and reversed sources are all 1.000; plausible additions 0.774 (7 of 31 missed: all attributions, mechanisms and rules of thumb, such as "SCA standard" and "national regulation"); real answers 0.900, but neither of the two problematic real answers was caught. Conclusion: it can only be a coarse screen (finding wrong answers, contradictions, fabrication) and **cannot be a gate**. Thinking on: overall 0.982; plausible additions 0.968 (1 of 31 missed); real answers 0.933, no longer misjudging that faithful paraphrase, but the two problematic real answers are still both not caught (they cite several sources, and the judge considered the added claim "explicitly or implicitly" supported); one new misjudgment (q21 with the citation removed, where the judge read the spring equinox half-sentence as the awakening of insects); p50 11.8 seconds, 3.7 times that of thinking off. The conclusion is unchanged: if used, use thinking on, but an added claim across several sources of the kind in the real answers is caught by neither setting, and two samples are not enough to measure the miss rate.
+  - **Switching to another model family** (decided by the owner 2026-11-18, through llm-gateway's gpt-sub, ChatGPT subscription quota; suite `eval/judge-grounded/suites/calibrate-gateway.yaml`, 1 repetition): overall 0.996; plausible additions 31/31, and both problematic real answers were caught (q20 also pointed out that the added words contradict the source [5] it cites). The only mistake is the qualified baseline of q28: the answer is the original sentence of the source, but the judge ruled it unsupported because it "does not directly answer the question", mixing relevance into whether there is grounding. Next step: write into the rules that only whether the source supports it is looked at (changing the rules means changing the instrument, so everything must be judged again); before using it as a gate, run once more on `gpt-api` (a subscription channel is not the API). The labels of the real slices and the hand-written corruptions were still written by a model, awaiting the owner's check.
+  - **An attempt to tighten the rules** (same day, not accepted): "do not judge whether the question was answered" was added to lite-eval's grounded prompt, and both wordings fixed q28, but each let through one answer that was replaced with another question's answer (q01, q08; the judge's own reasoning said it was not in the sources, yet the conclusion was grounded). On the 119 cases judged by all three rules: the original rule 119/119, the two tightened versions 118/119 each. A gate fears most letting an error through, so the original rule is kept, and q28 stays as a known false positive. The third round ran out of ChatGPT subscription quota at about 120 calls (upstream 429), and the 0.529 of that round does not represent the judge's level.
+  - **gpt-api did not get run** (same day): `calibrate-gateway.yaml` gained a `gpt-api` config (through llm-gateway, gpt-5.6-luna, billed per token). On trying to judge 1 case, OpenAI returned 401, the local API key was not accepted, and no cost was incurred. After the owner puts in a valid key, judge 1 case first, estimate the cost of 223 cases from the real token usage, and then the owner decides whether to run the full set.
+  - **To be measured (do it after quota or key is restored; development is finished, noted 2026-11-18)**:
+    1. **A second repetition of gpt-sub**: after the ChatGPT subscription quota is restored, run `calibrate-gateway.yaml --config gpt-sub` once more with the original rule (prompt version `26e4dc07801c`), to see whether the subscription channel is stable on the same cases (it does not guarantee to obey temperature 0). About 223 subscription calls.
+    2. **gpt-api**: after the owner puts in a valid OpenAI key, judge 1 case first, estimate the full cost from the real token usage, and with the owner's agreement run `--config gpt-api` in full. This must be done before taking gpt-sub as a gate (a subscription channel is not the API).
+    3. **New real answers**: run another batch of `literag ask`, annotate one by one, and use them as a new real slice. When the grounded rule is changed later, compare with this batch, and stop tuning the prompt on these 223 cases.
+    4. **The owner checks the labels**: the labels of `real-answers.jsonl` (q04 and q20 unsupported, q27 grounded, q03 and q28 unclear) and the 62 sentences of `hand-corruptions.jsonl`. If anything changes, regenerate the calibration set, and all the items above must be run again.
+  - **`literag eval-answers`**: `LiteRagAnswerTarget` (a subclass of `LiteRagTarget`, `query_key = "question"`, given `llm_for` at construction) runs `ask` on the golden questions and outputs `{question, answer, sources, status, dropped}`, and the latency includes one answering call; billing uses `billing(settings, answers=True)`, which counts the answering model. The judge is taken from that one config in the calibration suite (including the key variable, the price and the URL as written; the record does not have these), lite-eval checks it item by item before any call and checks the agreement rate of the calibration; the CLI checks the calibration run before opening the store. The output cache is on: the same batch of answers can be judged again with another judge, without regenerating.
+  - The generated dataset and suite share `write_generated_dataset`, `golden_cases` and `write_suite` (the `dataset.yaml` of the retrieval eval is byte for byte unchanged, so the dataset hash is still comparable with earlier runs; Codex found that it was once almost changed).
+  - **Self-evaluation bias**: the answer and the judge are both qwen3:8b. A judge of another model family (through llm-gateway, as the owner instructed) is the next control.
+- S14 implementation notes (2026-11-18, whether the answer is correct, and the effect of auto-routing; that item of lite-model design §15):
+  - **Why**: lite-model's routing (the `smart-router` of the LiteLLM Proxy) needs to measure "is auto-routing worth it". The grounded judge only judges "whether there is
+    grounding", and it misses the most common errors of real answers; so "did it answer correctly" (`key_fact`) was added first, and then the model that actually answered was recorded (`response_model`).
+  - **`key_fact`**: one regular expression for each of the 32 questions. The first version was too wide (found by an independent review: numbers had no boundary, `16` matched "7 gram … 16 grams",
+    `不予受理` (not accepted) carried no number of days, and the `not|no` of q08 matched almost any English answer); after tightening, counterexample tests were added (a changed number or another question's answer must not match;
+    for q12 the changed number is the tilt angle while the question asks which planet, the answer is still correct, listed as an exception). An answer that states the opposite direction cannot be seen by the regex, and is left to the judge.
+  - **The cache defect of `eval-answers` (since S13)**: the suite did not write `cache`, and lite-eval's default `auto` reused the last output, so the second
+    run hit all 32 and the latency was the last one's too. The second run of this experiment was therefore voided and re-run; fixed to `cache: off`, with the regression test red first.
+  - **`response_model`**: it was first called `answered`; an independent review pointed out that it collided with lite-model's `Provenance.answered` and `status:
+    "answered"`, and that with a plain LiteLLM alias it is only the alias, so it was renamed and written down as a transitional field (§6).
+  - **Results** (32 questions × 2 real runs, temperature 0; "correct" = `key_fact` and grounded; judge qwen3:8b thinking on, calibration agreement 0.982):
 
-    | 配置 | 对（两次 / 平均） | grounded 平均 | 延迟 p50 |
+    | Config | Correct (two runs / mean) | grounded mean | Latency p50 |
     | --- | --- | --- | --- |
-    | 直连 Ollama qwen3:8b | 0.938 / 0.938 / 0.938 | 0.969 | 12.0 s |
-    | Proxy workhorse（qwen3:8b） | 0.938 / 0.938 / 0.938 | 0.969 | 11.9 s |
-    | Proxy small（qwen3:1.7b） | 0.719 / 0.781 / 0.750 | 0.781 | 3.8 s |
+    | Direct Ollama qwen3:8b | 0.938 / 0.938 / 0.938 | 0.969 | 12.0 s |
+    | Proxy workhorse (qwen3:8b) | 0.938 / 0.938 / 0.938 | 0.969 | 11.9 s |
+    | Proxy small (qwen3:1.7b) | 0.719 / 0.781 / 0.750 | 0.781 | 3.8 s |
     | Proxy smart-router | 0.875 / 0.812 / 0.844 | 0.891 | 5.2 s |
 
-  - **路由按语言分，不按难度分**：两次都是 16 道中文题全部去 1.7b，去 8b 的 10 题全是英文（启发式分类器看的是英文技术词、
-    代码和推理词，中文提示在它眼里都"简单"）。选 8b 的 10 题全对（其中 2 题 1.7b 单独会错）；选 1.7b 的题比全用 8b 少对
-    2–3 题，损失都在中文题。第 2 次 q31 的 1.7b 把 1024 个输出 token 全用在思考上，回答为空。
-  - **逐条读过每个未通过的回答**：8b 的都是轻微补充（如"磨细会提高萃取、降低酸度"）；1.7b 的有真实错误（说惊蛰是"第二个"
-    节气、命令里多一个 `*`、说用过的餐巾纸可回收、来源有却说没有、第 2 次把"磨细"说成"磨粗"）。`key_fact` 单看会放过这些，
-    所以只报"对"。q12 每个配置都答"资料没有"：是检索没找到，不是模型的问题。
-  - **经 Proxy 不改变质量**：直连和 workhorse 两次都相同。
-  - **局限**：32 道单文档事实题；评审也是 qwen3:8b；路由和评审共用一台 Ollama，模型切换的加载时间算进了路由的延迟。
-  - 实验期间另一个会话把 lite-eval 升到 0.4.1（`3eec810`）：只多了"目标错误占多数时警告"和报告里一行，判分和评审不变，两次运行可比。
-  - **收尾 review**：`/simplify`（4 个角度）：改用 lite-eval 的 `parse_scorer_id` / `spec_name`，legacy `Question` 直接带
-    `key_fact`，金标测试走 `load_golden`，`key_fact` 全有或全无，未检查时报告写明；跳过：`_send` 改返回 `Completion`、
-    四个配置合并（`load_settings` 没有 include）。Codex 不可用（额度用完，到 2026-12-03），由一个独立的 Claude agent 做同样
-    的只读 review：`key_fact` 太宽（高，已修，见上）、`answered` 撞名且未写进设计（中，已改名并写进 §6）、两条路径的
-    `max_tokens` 参数名和思考默认不同（中，**不改**：lite-model S0 实测 LiteLLM 1.108.9 经 `ollama_chat/` 两个参数名都生效、
-    不设 `reasoning_effort` 时两边都开思考且思考不进回答正文，两次实验的输出 token 也接近）、路由延迟含模型切换（低，记为局限）。
+  - **The route splits by language, not by difficulty**: in both runs all 16 Chinese questions went to 1.7b, and the 10 questions that went to 8b were all English (the heuristic classifier looks at English technical words,
+    code and reasoning words, and in its eyes Chinese prompts are all "simple"). The 10 questions that picked 8b were all correct (2 of which 1.7b alone would get wrong); the questions that picked 1.7b got 2–3 fewer correct than all-8b,
+    and the losses are all in Chinese questions. In the second run, on q31, 1.7b used all 1024 output tokens on thinking, and the answer was empty.
+  - **Every answer that did not pass was read one by one**: those of 8b are all slight additions (such as "磨细会提高萃取、降低酸度" (grinding finer raises extraction and lowers acidity)); those of 1.7b have real errors (saying the awakening of insects is the "second" solar term,
+    one extra `*` in a command, saying used napkins are recyclable, saying there is none while the source has it, and in the second run saying "磨粗" (grind coarser) for "磨细" (grind finer)). `key_fact` alone would let these through,
+    so only "correct" is reported. On q12 every config answers "资料没有" (not in the materials): the retrieval did not find it, and it is not a problem of the model.
+  - **Going through the Proxy does not change quality**: direct and workhorse are the same in both runs.
+  - **Limits**: 32 single-document fact questions; the judge is also qwen3:8b; the route and the judge share one Ollama, and the model switching load time is counted into the route's latency.
+  - During the experiment another session raised lite-eval to 0.4.1 (`3eec810`): it only added a "warn when target errors are the majority" and one line in the report, judging and the judge are unchanged, and the two runs are comparable.
+  - **Close-out review**: `/simplify` (4 angles): switched to lite-eval's `parse_scorer_id` / `spec_name`, the legacy `Question` carries
+    `key_fact` directly, the golden test goes through `load_golden`, `key_fact` is all or nothing, and the report says so when not checked; skipped: `_send` returning `Completion`, and
+    merging the four configs (`load_settings` has no include). Codex was unavailable (quota used up, until 2026-12-03), and an independent Claude agent did the same
+    read-only review: `key_fact` too wide (high, fixed, see above), `answered` collides and was not written into the design (medium, renamed and written into §6), the two paths differ in the
+    `max_tokens` parameter name and in the thinking default (medium, **not changed**: lite-model S0 measured that LiteLLM 1.108.9 through `ollama_chat/` honours both parameter names,
+    and when `reasoning_effort` is not set both sides think and the thinking does not enter the answer body, and the output tokens of the two experiments are close too), route latency includes model switching (low, noted as a limit).
 
-**S18（2026-11-19）接 lite-cache L1。**
-- `cache` extra（lite-cache v0.1.0 release wheel）与 `cache` 配置（`enabled` 默认关、`roles`、`ttl_s`、`schema`、`question_log`、
-  `prompt_secret_env`）；只支持 PG，用 lite-rag 自己的 `database_url`；`cache.schema` 不能与 `store.schema` 相同。缓存不进索引身份。
-- runtime 的 lite-model 注册 lite-cache 的 `CacheHook`（`RagRuntime(model=…)` 可注入，测试用录制 transport）；`contextual`、`graph`、
-  `answer` 的调用各自在 `cache_context` 里（scope `literag/<namespace>`，`roles` 里没有的 role 照旧不缓存）；lite-cache 的错误转成
-  lite-rag 的 `StoreError`（503），读失败不发请求。
-- **发现**：§6 的来源块 nonce 每个 prompt 随机，请求永不重复，L1 一次也命中不了（写入成功、hits 为 0）。主人选方案 A：缓存的调用在
-  `keyed_nonces` 里渲染，nonce = `HMAC-SHA256(密钥, 用占位 tag 渲染的 prompt)` 的前 12 位十六进制；密钥来自 `LITERAG_PROMPT_SECRET`
-  （≥32 字符且至少 12 种不同字符，否则 `ConfigError`；Codex 指出长度证明不了随机，挡住明显重复的值，README 写明用 `openssl rand -hex 32` 生成）。不知道密钥算不出 nonce，强度与随机 nonce 相同（48 位）；缓存关闭或该 role 不缓存时仍是随机 nonce。
-- **发现**：lite-model 0.2.1 的 `Bounded.map` 用普通线程池，工作线程不继承 contextvar，`call_context` 到不了 hook，`contextual` 并发 > 1
-  时缓存静默失效（并发 4 时 hook 看到的 scope 全是 None）。`BoundedLLM.map` 按项 `copy_context()` 绕过；lite-model 0.3.0 计划里修根上。
-  2026-11-20：升到 lite-model 0.3.0 / lite-cache 0.2.0，lite-model 自己的 `Bounded.map` 带上调用方 context，绕过已删；
-  `test_contextual_concurrency_four_still_hits` 不改照样通过，作为回归测试。
-- `Completion` / `Answer` 带 `cached`；CLI 标 `(cached answer …)`，HTTP 回答多一个 `cached` 字段（只增不改）；`ask()` 可选的提问日志。
-- 检查：单测 + 集成 556 个、`-m ollama` 9 个；变异：去掉 keyed nonce 4 个缓存测试变红，去掉 `copy_context` 并发测试变红（测试文本起初只切出 1 个 chunk，
-  `Bounded.map` 走串行，这条变异没被抓住，改成 4 段后抓住），去掉 `Answer.cached` 3 个测试变红。`-m ollama` 的真实往返没跑：本机
-  Ollama 当时没起，随后 `brew services run ollama` 起来补跑：`-m ollama` 9 个全过，其中新加的真实往返（生产路径
-  `RagEngine.from_settings`，qwen3:8b）第二次 ask `cached` 为真、hits 1 stored 1；去掉注册 hook 时它变红。
-- **收尾 review**：`/simplify`（4 个角度）修了：`cache.schema` 拒绝 `public` / `information_schema` / `pg_*`（与 store 共用
-  `sql_identifier`，先红）；开着缓存时 `from_settings` 就检查 extra 和密钥（像 reranker，先红）；`close()` 从注入的模型上撤销 hook
-  （先红）；带密钥时 `render_pair` 只渲染一次；`cache.py` 的 extra 导入和错误转换各只一处；测试共用 `tests/chat.py`。不改：密钥存进
-  `CacheBinding`（第一次进 `cache_context` 时模型和 binding 还没建）、`prompt_key` 改用 `extras.api_key`（报错说 API key）。
-  Codex 1 条（见上，密钥强度）。独立的整分支 review（"修完可合并"）：重要 2 条——**问题文本没有像文档那样转义，带密钥时固定占位符
-  会被问题里同样的字符串冒充成真 tag**，改为每次渲染用不可预测的随机占位符、算 HMAC 前把它规范成固定标记（先红：问题里的占位符
-  多出一个真 tag）；注入的模型上 hook 重名时把 lite-model 的错误转成 lite-rag 的 `ConfigError`（先红）。次要：reindex 测试也比对
-  图、补 ingest 时读缓存失败的测试、测试关闭 runtime、用公开的 `hooks[name]`、CLI 对缓存答案写 `saved` 而不是 `tokens`（先红）、
-  提问日志加锁（未测：交错难以稳定复现）。换 `LITERAG_PROMPT_SECRET` 等于让全部缓存失效（README 已写）。
+**S18 (2026-11-19) Connect lite-cache L1.**
+- The `cache` extra (lite-cache v0.1.0 release wheel) and the `cache` config (`enabled` off by default, `roles`, `ttl_s`, `schema`, `question_log`,
+  `prompt_secret_env`); PG only, using lite-rag's own `database_url`; `cache.schema` cannot be the same as `store.schema`. The cache does not enter the index identity.
+- The runtime's lite-model registers lite-cache's `CacheHook` (`RagRuntime(model=…)` can be injected, tests use a recording transport); the calls of `contextual`, `graph` and
+  `answer` are each inside `cache_context` (scope `literag/<namespace>`, and a role not in `roles` is still not cached); lite-cache's errors are turned into
+  lite-rag's `StoreError` (503), and when a read fails no request is sent.
+- **Finding**: the source block nonce of §6 is random for every prompt, so requests never repeat and L1 cannot hit even once (writes succeed, hits stay 0). The owner chose plan A: cached calls are
+  rendered inside `keyed_nonces`, with nonce = the first 12 hexadecimal digits of `HMAC-SHA256(secret, the prompt rendered with a placeholder tag)`; the secret comes from `LITERAG_PROMPT_SECRET`
+  (≥32 characters and at least 12 distinct characters, otherwise `ConfigError`; Codex pointed out that length does not prove randomness, so obviously repetitive values are blocked, and the README says to generate it with `openssl rand -hex 32`). Without the secret the nonce cannot be computed, and the strength is the same as a random nonce (48 bits); when the cache is off or the role is not cached it is still a random nonce.
+- **Finding**: lite-model 0.2.1's `Bounded.map` uses a plain thread pool, whose worker threads do not inherit the contextvar, so `call_context` does not reach the hook, and when `contextual` concurrency is > 1
+  the cache fails silently (with concurrency 4 the scopes the hook sees are all None). `BoundedLLM.map` works around it with `copy_context()` per item; lite-model 0.3.0 plans to fix the root.
+  2026-11-20: raised to lite-model 0.3.0 / lite-cache 0.2.0, lite-model's own `Bounded.map` now carries the caller's context, and the workaround was deleted;
+  `test_contextual_concurrency_four_still_hits` passes unchanged and serves as the regression test.
+- `Completion` / `Answer` carry `cached`; the CLI marks `(cached answer …)`, the HTTP answer gets one more `cached` field (additive only); `ask()` has an optional question log.
+- Checks: 556 unit + integration tests, 9 under `-m ollama`; mutations: removing the keyed nonce turns 4 cache tests red, removing `copy_context` turns the concurrency test red (the test text at first was cut into only 1 chunk,
+  `Bounded.map` ran serially, and this mutation was not caught; after changing it to 4 sections it was caught), removing `Answer.cached` turns 3 tests red. The real round trip of `-m ollama` was not run at first: the local
+  Ollama was not up at the time, and was then started with `brew services run ollama` and run afterwards: all 9 of `-m ollama` pass, including the newly added real round trip (production path
+  `RagEngine.from_settings`, qwen3:8b), where on the second ask `cached` is true and hits 1 stored 1; it turns red when the hook registration is removed.
+- **Close-out review**: `/simplify` (4 angles) fixed: `cache.schema` rejects `public` / `information_schema` / `pg_*` (shares
+  `sql_identifier` with the store, red first); when the cache is on, `from_settings` already checks the extra and the secret (like the reranker, red first); `close()` removes the hook from the injected model
+  (red first); with a secret, `render_pair` renders only once; the extra import and the error conversion of `cache.py` are each in one place only; the tests share `tests/chat.py`. Not changed: storing the secret in
+  `CacheBinding` (on the first entry into `cache_context` the model and the binding have not been built yet), and `prompt_key` using `extras.api_key` (the error says API key).
+  Codex 1 finding (see above, the strength of the secret). The independent whole-branch review ("mergeable once fixed"): 2 important — **the question text is not escaped the way documents are, and with a secret the fixed
+  placeholder could be impersonated as a real tag by the same string in the question**, changed to use an unpredictable random placeholder at every render and normalise it into a fixed marker before computing the HMAC (red first: the placeholder
+  in the question produced one more real tag); when the hook name is duplicated on an injected model, lite-model's error is turned into lite-rag's `ConfigError` (red first). Minor: the reindex test also compares
+  the graph, a test is added for a cache read failure during ingest, the tests close the runtime, use the public `hooks[name]`, the CLI writes `saved` and not `tokens` for a cached answer (red first),
+  and the question log gets a lock (untested: the interleaving is hard to reproduce stably). Changing `LITERAG_PROMPT_SECRET` is equivalent to invalidating the whole cache (the README says so).

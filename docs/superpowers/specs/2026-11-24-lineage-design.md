@@ -1,89 +1,89 @@
-# lite-rag S25：Lineage（溯源账本）设计
+# lite-rag S25: Lineage (the lineage ledger) design
 
-> 状态：草案，待 owner 确认（2026-11-24）。取代 `docs/LINEAGE_GUIDE.md` 中与本文冲突的部分：guide 是初始意图，本文是对照现有代码后的定稿方向。
-> 实现时同步更新 `docs/lite-rag-design.md` §4（新表）、§9（配置）、§12（S25 阶段与验收）。
+> Status: draft, awaiting owner confirmation (2026-11-24). Replaces the parts of `docs/LINEAGE_GUIDE.md` that conflict with this document: the guide is the initial intent, this document is the final direction after checking the existing code.
+> When implementing, also update `docs/lite-rag-design.md` §4 (new tables), §9 (configuration) and §12 (S25 stage and acceptance).
 
-## 1. 意图
+## 1. Intent
 
-owner 希望 lite-rag 成为跨项目复用的通用 RAG 模块，并具备成熟 RAG 应有的**答案溯源**能力：
+The owner wants lite-rag to be a general RAG module reused across projects, with the **answer lineage** that a mature RAG should have:
 
-- 任何一个已索引的 chunk 都能查到它来自哪篇文档的**哪个版本**；
-- 任何一篇文档都能查到它派生出的全部产物（影响分析）；
-- 任何一次问答都能查到用了哪些 chunk（检索到 / 放进 prompt / 被引用），以及**当时这些 chunk 是否已经过期**，并能看到过期版本当时的原文。
+- For any indexed chunk, we can find which **version** of which document it came from.
+- For any document, we can find all the artifacts derived from it (impact analysis).
+- For any question and answer, we can find which chunks were used (retrieved / put into the prompt / cited), whether those chunks **were already stale at that time**, and the original text of the stale version as it was then.
 
-最典型的用法：用户投诉"答案说签证费 100 元，实际是 120 元"——查 trace 能说清是"当时文档就写 100、之后才改"，还是检索 / 模型的问题。
+The typical use: a user complains "答案说签证费 100 元，实际是 120 元" (the answer says the visa fee is 100 yuan, but it is actually 120). The trace shows whether the document said 100 at the time and was changed later, or whether retrieval or the model is at fault.
 
-记录"谁派生了谁"的那一层是**通用的**（不认识 RAG），将来给 TenderTED、Cairn、AdForge 等项目复用；RAG 专属的部分（chunk 怎么记、查询 trace）在 lite-rag 里。
+The layer that records "who derived from whom" is **general** (it knows nothing about RAG) and will be reused later by TenderTED, Cairn, AdForge and other projects. The RAG-specific parts (how chunks are recorded, query traces) live in lite-rag.
 
-## 2. 目标 / 非目标 / 反目标
+## 2. Goals / Non-goals / Anti-goals
 
-**目标**
-1. 通用账本包 `lite_rag.lineage`：记录产物（artifact）、版本、派生边；查上游、下游、某时刻的有效版本；清理过期原文。
-2. lite-rag 的写入路径（upsert / delete / delete_kb / reindex）在**同一事务**里记账。
-3. 查询 trace：`search` / `ask` 可选地记录四个阶段（retrieved / reranked / in_context / cited）用到的 chunk 版本。
-4. 旧版本 chunk 保留原文，默认 90 天后清掉原文、保留 hash 和元数据行。
+**Goals**
+1. A general ledger package `lite_rag.lineage`: it records artifacts, versions and derivation edges; it looks up upstream, downstream and the version that was valid at a given time; it cleans up stale original text.
+2. lite-rag's write paths (upsert / delete / delete_kb / reindex) record in the ledger **in the same transaction**.
+3. Query trace: `search` / `ask` can optionally record the chunk versions used in four stages (retrieved / reranked / in_context / cited).
+4. Old chunk versions keep their original text; by default the text is removed after 90 days, while the hash and the metadata row are kept.
 
-**非目标**
-- 不由账本驱动计算（不做 guide §4 的 `run_step(fn)`、不做基于指纹的跳过）。lite-rag 已有：文档 hash 未变即跳过（`engine.py` `upsert_text`）、`embedding_cache_<dim>` 按 `(model_id, key)` 复用向量、lite-cache L1 复用 contextual / graph 的 LLM 调用、PG 外键级联删除向量。
-- 不改 rule 3（换 embedding 模型 = 新 kb + `reindex`）和 rule 4（chunk id `"{doc_id}#{n}"` 稳定、upsert 整篇替换）。检索表只放当前数据，账本是旁路的只追加记录。
-- 不做 run / step 表（guide §3 的 `lineage_steps` / `lineage_runs`）。产出方式（chunker 配置、模型）记在 artifact 的 `producer` 和 `metadata` 里。
-- 不做可视化 UI、不做 OpenLineage 集成、不做 trace 聚合统计。
-- 不拆独立 repo（触发条件见 §8）。
+**Non-goals**
+- The ledger does not drive computation (no `run_step(fn)` from guide §4, no fingerprint-based skipping). lite-rag already has: skip when the document hash is unchanged (`engine.py` `upsert_text`), `embedding_cache_<dim>` reuses vectors by `(model_id, key)`, lite-cache L1 reuses the contextual / graph LLM calls, and PG foreign keys cascade-delete vectors.
+- It does not change rule 3 (a new embedding model = a new kb + `reindex`) or rule 4 (chunk id `"{doc_id}#{n}"` is stable, upsert replaces the whole document). The retrieval tables hold only current data; the ledger is a side, append-only record.
+- No run / step tables (`lineage_steps` / `lineage_runs` in guide §3). How an artifact was produced (chunker config, model) is recorded in the artifact's `producer` and `metadata`.
+- No visualization UI, no OpenLineage integration, no trace aggregate statistics.
+- No split into a separate repo (trigger conditions in §8).
 
-**反目标**（技术上能跑也算失败）
-- 账本写入改变了 lite-rag 现有的任何检索或摄取结果（eval 数字变化、upsert 跳过逻辑变化）。
-- 账本与索引不一致：索引里有的 chunk 在账本里找不到当前有效的 artifact，或反之。
-- `lite_rag.lineage` import 了任何 `lite_rag.*` 的其他模块。
-- trace 写入失败被静默吞掉（违背 rule 5 "no silent fallbacks"）。
+**Anti-goals** (it counts as a failure even if it runs technically)
+- Ledger writes change any existing retrieval or ingestion result in lite-rag (eval numbers change, upsert skip logic changes).
+- The ledger and the index disagree: a chunk in the index has no currently valid artifact in the ledger, or the reverse.
+- `lite_rag.lineage` imports any other `lite_rag.*` module.
+- A failed trace write is silently swallowed (violates rule 5, "no silent fallbacks").
 
-## 3. 约束（来自现有代码与规则）
+## 3. Constraints (from existing code and rules)
 
-- 两个存储后端都要支持：PostgreSQL（默认，`stores/pg.py`，一次 upsert 一个事务、`_lock_kb` 按 kb 串行）和 Chroma + SQLite（`stores/chroma.py`，SQLite 事务 + `pending/ready` 状态，单进程）。账本表放在**同一个数据库**里（PG：同一 schema；Chroma 后端：同一个 `lite_rag.sqlite`），这样能进同一个事务。
-- PG 迁移由 `db.migrate(conn, schema)` 执行（`migrations/000N_*.sql`），SQLite 由 `migrate_sqlite`（`migrations_sqlite/`）执行。
-- 测试不调真实模型；PG 集成测试用 `LITERAG_TEST_DATABASE_URL`、schema `lite_rag_test`；新测试每个都要先见红。
-- 每个 stage 走 close-out（simplify → Codex 只读审查 → 修复 → 全部检查重跑）。
+- Both storage backends must be supported: PostgreSQL (default, `stores/pg.py`, one transaction per upsert, `_lock_kb` serializes per kb) and Chroma + SQLite (`stores/chroma.py`, SQLite transaction + `pending/ready` status, single process). The ledger tables live in the **same database** (PG: the same schema; Chroma backend: the same `lite_rag.sqlite`), so they can join the same transaction.
+- PG migrations are run by `db.migrate(conn, schema)` (`migrations/000N_*.sql`); SQLite migrations are run by `migrate_sqlite` (`migrations_sqlite/`).
+- Tests do not call real models; PG integration tests use `LITERAG_TEST_DATABASE_URL` and schema `lite_rag_test`; every new test must be seen red first.
+- Every stage goes through the close-out (simplify → Codex read-only review → fix → re-run all checks).
 
-## 4. 方案对比（owner 已选 A）
+## 4. Option comparison (owner chose A)
 
-| | A. 账本（选定） | B. 驱动（guide 原版） | C. 只做 RAG 内置溯源 |
+| | A. Ledger (chosen) | B. Driver (original guide) | C. RAG built-in lineage only |
 |---|---|---|---|
-| 做法 | 通用层只记录和查询；lite-rag 流程不变，在已有事务里记账 | 通用层 `run_step(fn)` 算指纹决定是否计算；ingestion 改造成 step | `documents` 加版本、chunk 记来源版本、两张 trace 表 |
-| 复用 | 可（账本不认识 RAG） | 可，且附带增量引擎 | 不可 |
-| 代价 | 别的项目要自己做"跳过重算" | 与已有跳过 / 向量缓存 / lite-cache 重叠；ingestion 重写，风险大 | 违背"通用模块"目标 |
+| Approach | The general layer only records and queries; lite-rag's flow is unchanged and records in existing transactions | The general layer's `run_step(fn)` computes a fingerprint to decide whether to compute; ingestion is rebuilt as steps | `documents` gets versions, chunks record their source version, two trace tables |
+| Reuse | Yes (the ledger knows nothing about RAG) | Yes, with an incremental engine included | No |
+| Cost | Other projects must build their own "skip recompute" | Overlaps with the existing skip / vector cache / lite-cache; ingestion rewrite, high risk | Goes against the "general module" goal |
 
-选 A 的理由：同时满足"通用"和"RAG 溯源"，不重复已有能力，不动 24 个 stage 积累的行为。artifact 带 `content_hash`，将来有不自带跳过逻辑的项目接入时，可在账本之上加 `run_step`，不用重做账本。
+Why A: it satisfies both "general" and "RAG lineage", does not duplicate existing abilities, and does not touch the behavior built up over 24 stages. Artifacts carry `content_hash`, so when a project without its own skip logic is added later, `run_step` can be built on top of the ledger without redoing the ledger.
 
-## 5. 通用层 `lite_rag.lineage`
+## 5. The general layer `lite_rag.lineage`
 
-### 5.1 概念
+### 5.1 Concepts
 
-| 概念 | 含义 |
+| Concept | Meaning |
 |---|---|
-| artifact | 一个**不可变**的产物版本：源文档的某个版本、某个 chunk 的某个版本……都是 artifact。由 `(namespace, kind, key)` 标识逻辑身份，`content_hash` 标识内容 |
-| 版本 | 同一 `(namespace, kind, key)` 的多个 artifact，按 `version` 递增；任一时刻最多一个 `active` |
-| edge | `parent → child` 的派生关系，只记派生（kb 成员关系、查询消费不放这里） |
-| 有效期 | `valid_from` / `ended_at`；`status` 为 `active` / `superseded` / `deleted` |
+| artifact | One **immutable** version of a product: a version of a source document, a version of a chunk, and so on, are all artifacts. `(namespace, kind, key)` identifies the logical identity; `content_hash` identifies the content |
+| version | Several artifacts with the same `(namespace, kind, key)`, increasing by `version`; at most one is `active` at any time |
+| edge | A `parent → child` derivation relation. Only derivation is recorded (kb membership and query consumption do not go here) |
+| validity | `valid_from` / `ended_at`; `status` is `active` / `superseded` / `deleted` |
 
-**决定：源文档不单独建表，作为 `kind` 的一种 artifact。** 理由：边只连 artifact，上下游递归查询只有一种节点；版本、有效期、删除对文档和 chunk 是同一套规则。guide §3 的 `lineage_documents` 字段（`source_uri`、`metadata`）放进 artifact 的 `key` / `metadata`。
+**Decision: source documents get no table of their own; they are one `kind` of artifact.** Reason: edges connect only artifacts, so the recursive upstream / downstream query has one kind of node; versions, validity and deletion follow the same rules for documents and chunks. The fields of guide §3's `lineage_documents` (`source_uri`, `metadata`) go into the artifact's `key` / `metadata`.
 
-**决定：所有派生关系都写边，不在 artifact 上存 `parent_id`。** 理由：lite-rag 里 embedding 不单独成为 artifact（见 6.1），剩下的 document → chunk 是一对多，每个 chunk 一条边，没有 guide 担心的一对一膨胀。
+**Decision: every derivation is written as an edge; no `parent_id` is stored on the artifact.** Reason: in lite-rag an embedding is not an artifact by itself (see 6.1), and the remaining document → chunk relation is one-to-many with one edge per chunk, so the one-to-one bloat the guide worried about does not occur.
 
-### 5.2 表（PG 写法；SQLite 用 TEXT 存 JSON 和时间，语义相同）
+### 5.2 Tables (PG syntax; SQLite stores JSON and times as TEXT, same semantics)
 
 ```sql
 CREATE TABLE lineage_artifacts (
-  id           TEXT PRIMARY KEY,           -- uuid4 字符串
-  namespace    TEXT NOT NULL,              -- 调用方给定的隔离键；lite-rag 用 kb 物理键 "<ns>:<kb>"
-  kind         TEXT NOT NULL,              -- 通用层不解释："document"、"chunk"……
-  key          TEXT NOT NULL,              -- 逻辑身份：doc_id、chunk_id……
-  version      INT  NOT NULL,              -- 同 (namespace, kind, key) 内从 1 递增
+  id           TEXT PRIMARY KEY,           -- uuid4 string
+  namespace    TEXT NOT NULL,              -- isolation key given by the caller; lite-rag uses the kb physical key "<ns>:<kb>"
+  kind         TEXT NOT NULL,              -- not interpreted by the general layer: "document", "chunk", ...
+  key          TEXT NOT NULL,              -- logical identity: doc_id, chunk_id, ...
+  version      INT  NOT NULL,              -- counts up from 1 within the same (namespace, kind, key)
   content_hash TEXT NOT NULL,
-  producer     TEXT,                       -- 怎么做出来的，如 "chunker:markdown@<digest>"
-  payload      TEXT,                       -- 原文，可为 NULL；gc 后置 NULL
+  producer     TEXT,                       -- how it was produced, e.g. "chunker:markdown@<digest>"
+  payload      TEXT,                       -- original text, may be NULL; set to NULL after gc
   metadata     JSONB NOT NULL DEFAULT '{}',
   status       TEXT NOT NULL DEFAULT 'active',   -- active / superseded / deleted
   valid_from   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  ended_at     TIMESTAMPTZ,                -- superseded 或 deleted 的时刻
+  ended_at     TIMESTAMPTZ,                -- the time it became superseded or deleted
   UNIQUE (namespace, kind, key, version)
 );
 CREATE UNIQUE INDEX ON lineage_artifacts (namespace, kind, key) WHERE status = 'active';
@@ -92,86 +92,86 @@ CREATE INDEX ON lineage_artifacts (namespace, status);
 CREATE TABLE lineage_edges (
   parent_id TEXT NOT NULL REFERENCES lineage_artifacts (id) ON DELETE CASCADE,
   child_id  TEXT NOT NULL REFERENCES lineage_artifacts (id) ON DELETE CASCADE,
-  metadata  JSONB NOT NULL DEFAULT '{}',   -- 子节点在这个父节点里的位置等（如 chunk_id、offset）
+  metadata  JSONB NOT NULL DEFAULT '{}',   -- position of the child inside this parent, etc. (e.g. chunk_id, offset)
   PRIMARY KEY (parent_id, child_id)
 );
 CREATE INDEX ON lineage_edges (child_id);
 ```
 
-- `ended_at` 取代 guide 的 `superseded_at`，因为删除也用它。
-- 边带 `metadata`：同一个产物可能出现在父节点的不同版本、不同位置（见 6.1），位置信息属于"这条派生关系"，不属于不可变的产物本身。
-- 迁移文件放在包内 `lite_rag/lineage/migrations/`（PG）和 `migrations_sqlite/`，有自己的版本表 `lineage_schema_migrations`，由通用层的 `migrate(conn)` 执行。**lite-rag 侧（实现者的决定，审阅后定）**：`db.migrate`、`migrate_store` 和 Chroma store 打开时的自动迁移都在 lite-rag 自己的迁移之后调用它；`PgStore` 打开时"有未执行迁移就拒绝"的检查同时覆盖账本迁移。理由：llm-steward 的合约测试直接调用 `lite_rag.db.migrate`、进程内 provider 自己建 store，只挂在 `literag migrate` 上会让它们在第一次 upsert 时才失败。这样 `lineage.enabled: true` 作为默认值对库用户也安全，pin 升级时 llm-steward 不需要改代码。
+- `ended_at` replaces the guide's `superseded_at`, because deletion uses it too.
+- Edges carry `metadata`: the same artifact can appear in different versions and at different positions of a parent (see 6.1). Position information belongs to "this derivation relation", not to the immutable artifact itself.
+- The migration files live inside the package, in `lite_rag/lineage/migrations/` (PG) and `migrations_sqlite/`, with their own version table `lineage_schema_migrations`, run by the general layer's `migrate(conn)`. **lite-rag side (the implementer's decision, fixed after review)**: `db.migrate`, `migrate_store` and the automatic migration when a Chroma store opens all call it after lite-rag's own migrations; the check in `PgStore` that "refuses to open when migrations are pending" also covers the ledger migrations. Reason: llm-steward's contract tests call `lite_rag.db.migrate` directly and its in-process provider builds its own store, so attaching it only to `literag migrate` would make them fail only at the first upsert. This way `lineage.enabled: true` is safe as a default for library users too, and llm-steward needs no code change when its pin is upgraded.
 
 ### 5.3 API
 
-通用层接收调用方的连接，在调用方的事务里工作，自己不开、不提交事务。两个实现：`PgLedger(conn)`（psycopg）和 `SqliteLedger(conn)`（sqlite3），满足同一个 `Ledger` Protocol。
+The general layer takes the caller's connection, works inside the caller's transaction, and never opens or commits a transaction itself. There are two implementations, `PgLedger(conn)` (psycopg) and `SqliteLedger(conn)` (sqlite3), both satisfying the same `Ledger` Protocol.
 
 ```python
 record(namespace, kind, key, content_hash, *, parents=(), producer=None,
        payload=None, metadata=None, edge_metadata=None) -> Artifact
-    # 已有同 key 的 active 版本且 content_hash 相同 → 复用它，补上 parents 的边，返回它
-    # 否则新建 version+1，旧 active 版本标 superseded（ended_at=now），写边，返回新的
+    # an active version with the same key and the same content_hash exists → reuse it, add the edges to parents, return it
+    # otherwise create version+1, mark the old active version superseded (ended_at=now), write the edges, return the new one
 
 retire(artifact_id, *, status="superseded"|"deleted") -> list[Artifact]
-    # 结束这个 artifact，并级联结束它的后代中"已没有任何 active 父节点"的那些；
-    # 返回被结束的清单（含自身）
+    # end this artifact, and cascade to end those of its descendants that "no longer have any active parent";
+    # return the list of ended artifacts (including itself)
 
 active(namespace, kind, key) -> Artifact | None
-as_of(namespace, kind, key, at: datetime) -> Artifact | None   # 某时刻有效的版本
+as_of(namespace, kind, key, at: datetime) -> Artifact | None   # the version valid at a given time
 get(artifact_ids) -> dict[str, Artifact]
-upstream(artifact_id) -> list[Artifact]      # 递归向上，含边信息足以还原路径
-downstream(artifact_id) -> list[Artifact]    # 递归向下（影响分析）
+upstream(artifact_id) -> list[Artifact]      # recursive upwards; the edge information is enough to rebuild the path
+downstream(artifact_id) -> list[Artifact]    # recursive downwards (impact analysis)
 retire_namespace(namespace, status="deleted") -> int
-gc(ended_before: datetime) -> int            # 已结束且 ended_at 早于该时刻的 artifact：payload 置 NULL
+gc(ended_before: datetime) -> int            # artifacts that have ended and whose ended_at is earlier than that time: set payload to NULL
 migrate(conn) -> list[str]
 ```
 
-**核心规则："孤儿即结束"**：一个 artifact 只在它所有父节点都结束后才结束。这条规则让"文档出新版本、未变的 chunk 继续有效"自然成立（见 6.2），也让删除级联成立。
+**Core rule: "an orphan ends".** An artifact ends only after all of its parents have ended. This rule makes "when a document gets a new version, unchanged chunks stay valid" hold naturally (see 6.2), and it also makes deletion cascade.
 
-### 5.4 边界
+### 5.4 Boundary
 
-- `lite_rag/lineage/` 只依赖标准库、psycopg（PG 实现）和 sqlite3；一个测试遍历它的源码 import，出现 `lite_rag.`（自身包除外）即失败。
-- 不读 lite-rag 的 settings；表名前缀固定 `lineage_`，PG schema 由调用方连接的 `search_path` 决定。
+- `lite_rag/lineage/` depends only on the standard library, psycopg (the PG implementation) and sqlite3. A test walks the imports in its source and fails on any `lite_rag.` import (its own package excepted).
+- It does not read lite-rag's settings; the table name prefix is fixed to `lineage_`, and the PG schema is decided by the `search_path` of the caller's connection.
 
-## 6. RAG 层（lite-rag 里）
+## 6. RAG layer (inside lite-rag)
 
-### 6.1 记什么
+### 6.1 What is recorded
 
-| kind | key | content_hash | producer | payload | 父节点 |
+| kind | key | content_hash | producer | payload | Parents |
 |---|---|---|---|---|---|
-| `document` | `doc_id` | lite-rag 现有的 `content_hash(title, text, metadata, pages)` | — | 不存（全文已在 `documents.text`；旧版本原文由 chunk 原文覆盖） | 无 |
-| `chunk` | `"{doc_id}/{text_hash}/{k}"` | `text_hash` = sha256(chunk 原文 `Chunk.text`) | kb 的 chunker 身份 digest | chunk 原文 | 包含它的每个文档版本 |
+| `document` | `doc_id` | lite-rag's existing `content_hash(title, text, metadata, pages)` | — | Not stored (the full text is already in `documents.text`; the original text of old versions is covered by the chunk text) | None |
+| `chunk` | `"{doc_id}/{text_hash}/{k}"` | `text_hash` = sha256(chunk original text `Chunk.text`) | The digest of the kb's chunker identity | The chunk original text | Every document version that contains it |
 
-- **chunk 按内容认身份，不按位置（实现者的决定，审阅后定）。** 位置 `doc#n` 和 offset 会因为前面段落的增删而整体移动；contextual 开启时，每个 chunk 的 context 由整篇文档生成，任何修改都会改变它。如果把这些算进身份，改一个字就会让后面所有 chunk 出新版本，"只有那一段过期"就不成立。所以身份只看 chunk 原文：
-  - `k` 是同一篇文档里同样原文的第几次出现（从 0 开始），用来区分重复的套话段落；
-  - 位置信息（`chunk_id`、`n`、`start`、`end`、`page`、`parent_n`）和这个版本的 contextual context 写在**边的 metadata** 上：同一个 chunk 在 v1 是 `doc#4`、在 v2 是 `doc#5`，就是两条边各记各的；
-  - 含义："过期" = 这段原文在当前文档版本里已经不存在。原文没变、只是位置或 context 变了，不算过期。
-  - 代价：chunk 的 embedding 输入含 context 和标题，账本不能还原"当时被索引的完整文本"，只能还原原文和当时的 context（边上）。这与溯源的用途一致。
-- namespace = kb 物理键（`<namespace>:<kb>`），所以不同 kb 的同名文档互不干扰；`reindex` 到新 kb 是另一套独立的 artifact。
-- **embedding 不单独成为 artifact**：一个 kb 只绑定一个模型（rule 3），向量与 chunk 一一对应，chunk 的 `metadata` 记 `embedding`（`model_id`）、`dim`；contextual / graph 的模型也记在 metadata（若启用）。`upstream(chunk)` 即可回答"这个向量来自哪篇文档的哪个版本"。
-- parent_child 的父块：本期不单独记（父块只用于展示，不参与索引）；chunk metadata 记 `parent_n`。
+- **A chunk's identity is by content, not by position (the implementer's decision, fixed after review).** The position `doc#n` and the offsets move as a whole when earlier paragraphs are added or removed; when contextual is on, each chunk's context is generated from the whole document, so any edit changes it. If these were part of the identity, changing one character would give every later chunk a new version, and "only that paragraph is stale" would not hold. So the identity depends only on the chunk original text:
+  - `k` is the index of this occurrence among identical original texts in the same document (counting from 0), used to tell repeated boilerplate paragraphs apart;
+  - Position information (`chunk_id`, `n`, `start`, `end`, `page`, `parent_n`) and the contextual context of this version are written in the **edge's metadata**: the same chunk is `doc#4` in v1 and `doc#5` in v2, and the two edges each record their own;
+  - Meaning: "stale" = this original text no longer exists in the current document version. If the original text is unchanged and only its position or context changed, it is not stale.
+  - Cost: a chunk's embedding input contains the context and the title, so the ledger cannot restore "the complete text that was indexed at that time"; it can only restore the original text and the context of that time (on the edge). This fits the purpose of lineage.
+- namespace = the kb physical key (`<namespace>:<kb>`), so same-named documents in different kbs do not interfere; a `reindex` into a new kb is a separate, independent set of artifacts.
+- **An embedding is not an artifact by itself**: a kb is bound to one model only (rule 3), and vectors correspond one-to-one to chunks. The chunk's `metadata` records `embedding` (`model_id`) and `dim`; the contextual / graph models are also recorded in metadata (if enabled). `upstream(chunk)` then answers "which version of which document did this vector come from".
+- The parent chunk of parent_child: not recorded separately in this phase (parent chunks are only used for display and do not take part in indexing); the chunk metadata records `parent_n`.
 
-### 6.2 写入路径（都在 store 已有的事务里）
+### 6.2 Write paths (all inside the store's existing transaction)
 
-- **upsert（文档变了）**：`record(document)` → 新版本 v(n+1)，旧版本被 superseded；对新切出的每个 chunk `record(chunk, parents=[新文档版本], edge_metadata=位置与 context)`——原文相同的 chunk 复用旧 artifact 并补一条边，所以**只改了第 5 段时，只有原文变了的 chunk 出新版本**，前后段落的编号和 offset 移动不影响；最后 `retire(旧文档版本)`，按"孤儿即结束"，只有不再被新版本引用的旧 chunk 被 superseded。
-- 注意：一个 chunk 的原文跨越被修改处时（切块边界随修改移动），它也会出新版本。这是真实的内容变化，不是误报。
-- **upsert（文档未变）**：lite-rag 已在进事务前跳过，账本不动。
-- **delete**：`retire(文档 active 版本, status="deleted")`，级联到它的 chunk。
-- **delete_kb**：`retire_namespace(kb 物理键)`。
-- **Chroma 后端**：账本写在 SQLite 那个事务里（`pending` 阶段）；写 Chroma 失败时现有逻辑会删掉这篇文档，账本随之记 `deleted`。原则：账本反映 store 的最终状态。
-- **Store Protocol 不改签名**：store 实现已能取得 kb 信息（chunker、模型），记账所需的 producer / metadata 由 store 在事务内组装。
+- **upsert (document changed)**: `record(document)` → new version v(n+1), the old version is superseded; for each newly cut chunk, `record(chunk, parents=[new document version], edge_metadata=position and context)`. A chunk with the same original text reuses the old artifact and gets one more edge, so **when only paragraph 5 is changed, only the chunks whose original text changed get a new version**, and the shift of numbers and offsets in the paragraphs before and after has no effect. Finally `retire(old document version)`: by "an orphan ends", only the old chunks that the new version no longer references are superseded.
+- Note: when a chunk's original text spans the modified spot (the chunk boundary moves with the edit), it also gets a new version. This is a real content change, not a false alarm.
+- **upsert (document unchanged)**: lite-rag already skips it before entering the transaction; the ledger is untouched.
+- **delete**: `retire(document active version, status="deleted")`, cascading to its chunks.
+- **delete_kb**: `retire_namespace(kb physical key)`.
+- **Chroma backend**: the ledger is written in the SQLite transaction (the `pending` stage); when writing to Chroma fails, the existing logic deletes the document, and the ledger records it as `deleted` accordingly. Principle: the ledger reflects the store's final state.
+- **The Store Protocol signature does not change**: the store implementations can already get the kb information (chunker, model), and the store assembles the producer / metadata needed for recording inside the transaction.
 
-### 6.3 查询 trace
+### 6.3 Query trace
 
 ```sql
 CREATE TABLE rag_query_traces (
   id            TEXT PRIMARY KEY,
-  namespace     TEXT NOT NULL,           -- 引擎的 namespace
-  kbs           JSONB NOT NULL,          -- 本次查询的 kb 名
+  namespace     TEXT NOT NULL,           -- the engine's namespace
+  kbs           JSONB NOT NULL,          -- kb names of this query
   operation     TEXT NOT NULL,           -- 'search' | 'ask'
-  query         TEXT,                    -- 按配置：原文 / sha256 / NULL
-  retrieval     JSONB NOT NULL,          -- mode、top_k、rerank、where、route 选择
-  model_id      TEXT,                    -- 回答模型（ask），来自 lite-model provenance
+  query         TEXT,                    -- by configuration: original text / sha256 / NULL
+  retrieval     JSONB NOT NULL,          -- mode, top_k, rerank, where, route choice
+  model_id      TEXT,                    -- answering model (ask), from lite-model provenance
   usage         JSONB,
   cached        BOOLEAN,
   status        TEXT,                    -- Answer.status
@@ -179,106 +179,106 @@ CREATE TABLE rag_query_traces (
 );
 CREATE TABLE rag_query_sources (
   trace_id     TEXT NOT NULL REFERENCES rag_query_traces (id) ON DELETE CASCADE,
-  artifact_ns  TEXT NOT NULL,            -- kb 物理键
-  artifact_key TEXT NOT NULL,            -- （实现：可为 NULL，见 §12）chunk 的账本 key "{doc_id}/{text_hash}/{k}"
-  chunk_id     TEXT NOT NULL,            -- 检索时的位置，便于阅读
+  artifact_ns  TEXT NOT NULL,            -- kb physical key
+  artifact_key TEXT NOT NULL,            -- (implementation: may be NULL, see §12) the chunk's ledger key "{doc_id}/{text_hash}/{k}"
+  chunk_id     TEXT NOT NULL,            -- position at retrieval time, for readability
   stage        TEXT NOT NULL,            -- retrieved / reranked / in_context / cited
   rank         INT,
   score        DOUBLE PRECISION,
-  PRIMARY KEY (trace_id, artifact_ns, chunk_id, stage)   -- chunk_id 只在 kb 内唯一
+  PRIMARY KEY (trace_id, artifact_ns, chunk_id, stage)   -- chunk_id is unique only within a kb
 );
 ```
 
-- 阶段定义：`retrieved` = 融合后进入候选池的 chunk（`pool` 个）；`reranked` = rerank 后的顺序（仅启用 rerank 时）；`in_context` = 最终返回 / 放进 prompt 的 hits；`cited` = `check_citations` 后保留的引用。parent_child 下记的是**命中的子 chunk**。
-- **在检索那一刻钉住版本（实现者的决定，审阅后定）**：trace 不在写入时去查"当前 active 的 artifact"，而是用检索时读到的 chunk 原文（`StoredChunk.text`）直接算出账本 key。这样 `ask` 在检索和写 trace 之间（模型调用期间）文档被改，trace 记的仍是当时真正读到的那段文字。为此 `chunks` 表加一列 `lineage_key`，upsert 时算好写入（与账本开关无关，key 只由文档 id 和原文决定），检索读 chunk 时一并读出，trace 直接用它，不需要再推算 `k`。
-- 因此 `rag_query_sources` 不对 `lineage_artifacts` 加外键：账本里查不到这个 key（kb 还没回填、或记账关闭时写入的）也能正常写 trace，`trace show` 把它显示为"未记录"。
-- 过期判断（`trace show` 时算）：取该 key 在 `trace.created_at` 时刻有效的 artifact（`as_of`；实现改用 `started_by`，见 §12）。它之后被结束 → "当时有效、之后过期"，并显示它的原文（若未被 gc）；仍 active → "仍然有效"；找不到 → "未记录"。这是标记，不抛错。
-- `Answer` 增加 `trace_id`（未开启时为 None）；HTTP `ask` 响应带上它。
-- **search 的 trace（owner 决定，2026-11-24）**：现有 `search` / `search_kbs` 签名和行为不变，不记 trace。新增：
-  - `search_traced(...)` / `search_kbs_traced(...)`：参数与原方法相同，返回 `Traced(hits: list[Hit], trace_id: str | None)`；记 `retrieved` / `reranked` / `in_context` 三个阶段，`operation='search'`。
-  - `record_cited(trace_id, chunk_ids)`（实现：接收 Hit，见 §12）：自己生成答案的宿主（llm-steward 只调用 `search_kbs`）把最终引用的 chunk 补记为 `cited` 阶段；chunk_id 必须是该 trace `in_context` 里出现过的，否则抛 `InvalidRequest`。
-  - 理由：llm-steward 消费 `list[Hit]`，不能改返回类型；`ask` 内部改为调用 traced 版本。
-  - HTTP 本期不加 traced search 端点，llm-steward 走进程内调用。
-- trace 写入失败时抛错（rule 5）。trace 写在检索读取之后的独立小事务里。
-- 不记 latency：lite-rag 现有代码不测耗时，加上属于另一件事。
+- Stage definitions: `retrieved` = the chunks that enter the candidate pool after fusion (`pool` of them); `reranked` = the order after rerank (only when rerank is enabled); `in_context` = the hits finally returned / put into the prompt; `cited` = the citations kept after `check_citations`. Under parent_child, what is recorded is the **matched child chunk**.
+- **Pin the version at the moment of retrieval (the implementer's decision, fixed after review)**: the trace does not look up "the currently active artifact" at write time. It computes the ledger key directly from the chunk original text read at retrieval time (`StoredChunk.text`). So if the document is changed between retrieval and the trace write (during the model call) in `ask`, the trace still records the text that was actually read at that time. For this, the `chunks` table gets a column `lineage_key`, computed and written at upsert time (independent of the ledger switch, since the key depends only on the document id and the original text); retrieval reads it together with the chunk, and the trace uses it directly, with no need to work out `k` again.
+- Therefore `rag_query_sources` has no foreign key to `lineage_artifacts`: a trace can be written normally even when the key cannot be found in the ledger (the kb has not been backfilled yet, or it was written while recording was off), and `trace show` displays it as "未记录" (not recorded).
+- Stale judgment (computed at `trace show` time): take the artifact that was valid for that key at `trace.created_at` (`as_of`; the implementation uses `started_by` instead, see §12). If it ended after that → "当时有效、之后过期" (valid then, stale since), and show its original text (if not removed by gc); if still active → "仍然有效" (still valid); if not found → "未记录" (not recorded). This is a mark and raises no error.
+- `Answer` gets a `trace_id` (None when tracing is not enabled); the HTTP `ask` response carries it.
+- **Trace of search (owner decision, 2026-11-24)**: the existing `search` / `search_kbs` signatures and behavior do not change and record no trace. New additions:
+  - `search_traced(...)` / `search_kbs_traced(...)`: same parameters as the original methods, returning `Traced(hits: list[Hit], trace_id: str | None)`; they record the three stages `retrieved` / `reranked` / `in_context`, with `operation='search'`.
+  - `record_cited(trace_id, chunk_ids)` (implementation: takes Hits, see §12): a host that generates its own answers (llm-steward only calls `search_kbs`) uses it to add the finally cited chunks as the `cited` stage; the chunk_id must have appeared in that trace's `in_context`, otherwise it raises `InvalidRequest`.
+  - Reason: llm-steward consumes `list[Hit]` and the return type cannot change; `ask` is changed internally to call the traced version.
+  - HTTP gets no traced-search endpoint in this phase; llm-steward uses the in-process call.
+- A failed trace write raises an error (rule 5). The trace is written in a separate small transaction after the retrieval read.
+- Latency is not recorded: lite-rag's existing code does not measure time, and adding it is a separate matter.
 
-### 6.4 配置
+### 6.4 Configuration
 
 ```yaml
 lineage:
-  enabled: true            # 记账；关掉则写入路径不记，查询 API 报错
-  keep_text_days: 90       # gc 清掉已结束 artifact 原文的期限
+  enabled: true            # record in the ledger; when off, write paths do not record and the query API raises an error
+  keep_text_days: 90       # how long gc waits before clearing the original text of ended artifacts
 trace:
-  enabled: false           # 默认关：会存问题原文
+  enabled: false           # off by default: it stores the question text
   query: text              # text / hash / none
-  retention_days: 90       # gc 删除更早的 trace
+  retention_days: 90       # gc deletes older traces
 ```
 
-`literag lineage gc` 一次处理两件事：清原文（`keep_text_days`）、删旧 trace（`retention_days`）。不自动定时运行，由使用方调度。被 trace 引用的 artifact 行永不删除，只清 `payload`。
+`literag lineage gc` handles two things at once: it clears original text (`keep_text_days`) and deletes old traces (`retention_days`). It does not run on a schedule by itself; the user schedules it. An artifact row referenced by a trace is never deleted; only its `payload` is cleared.
 
-### 6.5 已有数据的回填
+### 6.5 Backfill of existing data
 
-现有 kb 的文档在账本里没有记录，而文档不变时 upsert 会跳过，永远不会补记（包括 llm-steward 现有的全部 kb）。未回填不会让任何功能报错：trace 照常写，相关来源显示"未记录"；下一次文档变化时自然开始记账。要补全历史，提供 `literag lineage backfill <kb>`：从 `documents` 和 `chunks` 现有行生成 v1 文档和 chunk artifact（chunk 的 context 已在 `chunks.context` 列，可还原被索引的文本）。对已有账本的文档是 no-op。`documents.text` 为 NULL 的老文档照样能回填（chunk 原文在 `chunks` 表里）。
+The documents of existing kbs have no record in the ledger, and an upsert is skipped when a document is unchanged, so they are never added later (this includes all existing kbs of llm-steward). A missing backfill does not make any feature raise an error: traces are written as usual and the related sources show "未记录" (not recorded); recording starts naturally the next time a document changes. To fill in the history, `literag lineage backfill <kb>` is provided: from the existing rows of `documents` and `chunks` it generates v1 document and chunk artifacts (a chunk's context is already in the `chunks.context` column, so the indexed text can be restored). For documents that already have a ledger, it is a no-op. Old documents with `documents.text` NULL can still be backfilled (the chunk original text is in the `chunks` table).
 
 ### 6.6 CLI / HTTP
 
-- CLI：`literag lineage show <kb> <doc_id>`（各版本及其 chunk）、`literag lineage upstream <artifact_id>`、`literag lineage downstream <artifact_id>`、`literag trace show <trace_id>`（各阶段 chunk、是否已过期、过期版本原文）、`literag lineage backfill <kb>`、`literag lineage gc`。
-- HTTP：本期只在 `ask` 响应中返回 `trace_id`，search 端点不变；查询账本的 HTTP 接口不做（非目标，之后按需要加）。
+- CLI: `literag lineage show <kb> <doc_id>` (the versions and their chunks), `literag lineage upstream <artifact_id>`, `literag lineage downstream <artifact_id>`, `literag trace show <trace_id>` (the chunks of each stage, whether they are stale, the original text of stale versions), `literag lineage backfill <kb>`, `literag lineage gc`.
+- HTTP: in this phase only the `ask` response returns `trace_id`; the search endpoints do not change; an HTTP interface for querying the ledger is not built (non-goal, to be added later as needed).
 
-## 7. 阶段
+## 7. Stages
 
-每个阶段结束都走 close-out，全部现有测试保持绿，`literag eval` 的数字不变（反目标 1）。
+Every stage ends with the close-out, all existing tests stay green, and the numbers of `literag eval` do not change (anti-goal 1).
 
-1. **S25a 通用账本**：`lite_rag/lineage/`、两套迁移、`PgLedger` / `SqliteLedger`、import 边界测试。合约测试对两个实现跑同一套用例。
-2. **S25b 接入写入路径**：PG 与 Chroma store 的 upsert / delete / delete_kb 记账；`literag migrate` 调用账本迁移；backfill 命令。
-3. **S25c 查询 trace**：两张表、`search_traced` / `search_kbs_traced` / `record_cited`、`ask` 埋点、`trace_id`、`trace show`。
-4. **S25d gc 与收尾**：`lineage gc`、`lineage show/upstream/downstream`、README 写明第三方如何单独使用 `lite_rag.lineage`、更新 design §4 / §9 / §12。
+1. **S25a General ledger**: `lite_rag/lineage/`, the two sets of migrations, `PgLedger` / `SqliteLedger`, the import boundary test. Contract tests run the same cases against both implementations.
+2. **S25b Hook into the write paths**: ledger recording for upsert / delete / delete_kb in the PG and Chroma stores; `literag migrate` calls the ledger migrations; the backfill command.
+3. **S25c Query trace**: the two tables, `search_traced` / `search_kbs_traced` / `record_cited`, instrumentation of `ask`, `trace_id`, `trace show`.
+4. **S25d gc and wrap-up**: `lineage gc`, `lineage show/upstream/downstream`, the README says how a third party uses `lite_rag.lineage` on its own, update design §4 / §9 / §12.
 
-## 8. 拆成独立 repo 的条件
+## 8. Conditions for splitting into a separate repo
 
-出现任一即拆：TenderTED / Cairn / AdForge 等要使用账本；lite-mem 或 llm-steward 要记录自己的派生关系。拆分前提已由 5.4 保证，拆分 = 搬目录 + lite-rag 改 import + 发布 wheel + 改 pin。
+Split when any one of these appears: TenderTED / Cairn / AdForge or similar want to use the ledger; lite-mem or llm-steward want to record their own derivation relations. The precondition for splitting is already guaranteed by 5.4, and splitting = move the directory + lite-rag changes its imports + publish a wheel + change the pin.
 
-## 9. 验收（自动化测试覆盖）
+## 9. Acceptance (covered by automated tests)
 
-- 账本合约（PG、SQLite 各跑一遍）：`record` 相同内容复用、不同内容出新版本并 supersede 旧版本；"孤儿即结束"；`as_of` 返回指定时刻有效的版本；`upstream` / `downstream` 正确；`gc` 只清已结束且过期的 payload，行保留。
-- 同一文档改一段（含让后面 chunk 编号和 offset 移动的修改、contextual 开启的情况）：只有原文变了的 chunk 出新版本，其他 chunk 仍是同一个 artifact，有两条父边（v1、v2），两条边上的 `chunk_id` / offset 各是当时的值。
-- 文档里有两段相同原文：是两个 artifact（`k`=0、1），互不覆盖。
-- 删除文档：文档和全部 chunk artifact 为 `deleted`；delete_kb 后该 kb namespace 下无 active artifact。
-- 一致性：对已记账（写入时开启记账，或已回填）的文档，任一 upsert / delete 序列之后，store 里每个 chunk 都恰好对应一条从文档 active 版本出发的边，指向一个 active chunk artifact，且没有多余的 active artifact（PG 与 Chroma 后端都测）。
-- ask 期间文档被修改（在检索之后、写 trace 之前改文档）：trace 记的是检索时读到的旧原文对应的 key，`trace show` 标为"当时有效、之后过期"。
-- 未回填的 kb 开启 trace：`ask` 成功，来源显示"未记录"。
-- `search` / `search_kbs` 在 trace 开启时也不写任何 trace 行，返回值不变；`search_kbs_traced` + `record_cited` 记下四个阶段；`record_cited` 传入不在 `in_context` 里的 chunk_id 时抛错，不写任何行。
-- llm-steward 的方式（直接调 `lite_rag.db.migrate` 后建 store）也会建好账本表。
-- Chroma 写入失败：账本中该文档为 `deleted`，与 store 一致。
-- trace：能区分四个阶段；文档在 ask 之后被修改，`trace show` 标出被引用的 chunk "当时有效、之后过期"，并显示旧原文；`trace.enabled=false` 时不写任何行。
-- 回填：对已有 kb 回填后满足一致性；重复回填 no-op。
-- 边界：`lite_rag.lineage` 不 import lite-rag 其他模块。
-- 行为不变：现有测试全绿；`-m ollama` 不要求，但 eval 配置跑 `FakeEmbedder` 的数字与改动前一致。
+- Ledger contract (run once each on PG and SQLite): `record` reuses on identical content, and gives a new version and supersedes the old one on different content; "an orphan ends"; `as_of` returns the version valid at the given time; `upstream` / `downstream` are correct; `gc` clears only the payload of ended and expired rows, and the rows stay.
+- One paragraph of a document is changed (including a change that shifts the numbers and offsets of later chunks, and the case with contextual on): only the chunks whose original text changed get a new version, and the other chunks are still the same artifact, with two parent edges (v1, v2); the `chunk_id` / offset on the two edges are each the value of that time.
+- A document has two paragraphs with identical original text: they are two artifacts (`k`=0, 1) and do not overwrite each other.
+- Delete a document: the document and all its chunk artifacts are `deleted`; after delete_kb there is no active artifact under that kb namespace.
+- Consistency: for a document that has been recorded (recording was on at write time, or it has been backfilled), after any sequence of upserts / deletes, every chunk in the store corresponds to exactly one edge from the document's active version, pointing to one active chunk artifact, and there is no extra active artifact (tested on both the PG and Chroma backends).
+- The document is modified during ask (changed after retrieval and before the trace write): the trace records the key of the old original text read at retrieval time, and `trace show` marks it "当时有效、之后过期" (valid then, stale since).
+- Trace enabled on a kb that has not been backfilled: `ask` succeeds, and the sources show "未记录" (not recorded).
+- `search` / `search_kbs` write no trace rows even when trace is enabled, and their return values do not change; `search_kbs_traced` + `record_cited` record the four stages; `record_cited` raises an error and writes no rows when given a chunk_id that is not in `in_context`.
+- llm-steward's way (calling `lite_rag.db.migrate` directly and then building a store) also creates the ledger tables.
+- Chroma write failure: the document is `deleted` in the ledger, consistent with the store.
+- Trace: the four stages can be told apart; when a document is modified after ask, `trace show` marks the cited chunk as "当时有效、之后过期" (valid then, stale since) and shows the old original text; with `trace.enabled=false` no rows are written.
+- Backfill: after backfilling an existing kb, the consistency check holds; backfilling again is a no-op.
+- Boundary: `lite_rag.lineage` does not import other lite-rag modules.
+- Behavior unchanged: all existing tests are green; `-m ollama` is not required, but the numbers of the eval config run with `FakeEmbedder` match those before the change.
 
-## 10. 留给实现者决定
+## 10. Left to the implementer
 
-- `PgLedger` / `SqliteLedger` 共享 SQL 的方式（参数风格适配或两份 SQL）。
-- 递归查询的写法与深度保护。
-- CLI 输出格式。
-- 一致性测试是用随机操作序列（property-based）还是固定场景。
-- llm-steward 改用 `search_kbs_traced` + `record_cited` 是 llm-steward 自己的后续工作（pin 升级之后），不在 S25 范围内。
+- How `PgLedger` / `SqliteLedger` share SQL (parameter-style adaptation or two copies of the SQL).
+- How the recursive queries are written, and the depth guard.
+- CLI output format.
+- Whether the consistency test uses random operation sequences (property-based) or fixed scenarios.
+- Switching llm-steward to `search_kbs_traced` + `record_cited` is llm-steward's own follow-up work (after the pin upgrade) and is outside S25.
 
-## 12. 实现中的决定（2026-11-25，S25a–d）
+## 12. Decisions made during implementation (2026-11-25, S25a–d)
 
-实现时改动或补充了上文，以这里为准：
+These changed or added to the text above; this section takes precedence:
 
-- **账本 API**：入口是 `migrate(conn)` / `pending(conn)` / `ledger_for(conn)`，按连接类型选 PG 或 SQLite（不是 `migrate_pg` 等四个函数）。另加 `record_many`（一组 chunk 一次检查父节点）、`count_active`（一致性检查）、`history`（某个 key 的全部版本）、`started_by`（某时刻已开始的最新版本，不论是否已结束）。PG / SQLite 的差异集中在 `lineage.dialect`，账本和 lite-rag 的 trace 表共用。
-- **并发**：调用方必须串行化同一 namespace 的写入（lite-rag：PG 持有 kb 行锁，Chroma 是进程锁）。账本本身不加锁。
-- **账本不记 contextual 上下文**：它是模型根据内容写的文字，存在边上会比删除活得久（终审 #1）。边上只记位置（`chunk_id`、`n`、`start`、`end`、`page`、`parent_n`）。
-- **删除即清原文**：`deleted` 的产物立即清空 `payload` 和 `metadata`（文档的 title / source）（安全审查、终审 #1）；`superseded` 的保留到 `keep_text_days` 后由 gc 清。`trace show` 对已删除文档的 chunk 显示"过期"但没有原文。
-- **文档 artifact 的 metadata** 记 `title`、`source`、`embedding`、`dim`；chunk artifact 的 metadata 为空（同一 kb 的 chunk 都一样，不重复记）。
-- **backfill 修复关账本期间的删除**：账本里仍 active、store 里已没有的文档记为 `deleted`（终审 #2）。关账本期间整个 drop 掉的 kb 修不回来（store 里已无 kb，backfill 报 `KbNotFound`）：它的产物保持原样。
-- **`chunks.lineage_key`**：写入时算好（与账本开关无关），检索时读出；trace 直接用它，不推算 `k`。
-- **trace 存储**：`artifact_key` 可为 NULL（未记录）；`in_context` 不存，读取时取最后一个排序阶段（有 rerank 用 reranked，否则 retrieved）的前 `top_k`。Store 协议只有一个 `traces()`，返回在一个事务里的 `TraceLog`；读 trace 时 SQL 按 namespace 过滤。
-- **trace 时间**：读完 chunk 之后立即取（不是模型回答之后）。`trace_report` 用 `started_by(key, 时间)` 找当时读到的版本：已结束即"过期"，仍有效即"有效"，找不到即"未记录"。
-- **`record_cited(trace_id, cited: Sequence[Hit])`**：接收 Hit 而不是 chunk_id，因为 chunk_id 只在 kb 内唯一，跨 kb 的 trace 需要 kb 名。
-- **gc**：`literag lineage gc` 不分 namespace，作用于整个 store；清原文和删 trace 都按 1000 条一批、每批一个事务（`lineage_artifacts_gc` 部分索引只含还有原文的已结束行）。`lineage.enabled: false` 时只删 trace，不动账本。不剪"稳定 chunk 指向旧文档版本"的边：那是来历本身，增长为每次编辑每个 chunk 一条边。
-- **存储估算**：每条 trace 约 2×`top_k` 行（rerank 关，默认）或 2×`top_n`+`top_k` 行（rerank 开）。每天 1 万次、保留 90 天、rerank 开时，PG 约 5–10 GB。
-- **合并前补充（2026-11-25）**：`record_cited` 每个 trace 只接受一次：它把 trace 的 status 从空（未结束的 search trace）条件更新为 `answered`，并在同一事务里写 cited 行，并发调用只有一个成功；`ask` 的 trace（含无引用、`no_sources`、`failed`）一律拒绝，传入空列表也算用掉这一次。`engine.purge_traces()` / `literag trace purge --yes` 分批删一个 namespace 的全部 trace（只删 trace，kb 用 `drop-kb` 删），索引 `ix_rag_query_traces_namespace (namespace, created_at, id)`（迁移 0009 / sqlite 0004）；`ask` 调用模型失败时也写 trace（`status: failed`，含检索阶段），然后照常抛出模型的错误（写 trace 本身失败时作为附注附在那个错误上，不替换它）；`record()` 也走 `record_many`（只有一条写入路径）：一次查出全部 key 的最新版本、分批结束被取代的、新版本与边各用一次 `executemany`（300 个 chunk 从约 900 次调用降到约 7 次）；内容没变的边不重写。
-- **时钟**：版本时间取自写入方的时钟，trace 时间取自读取方的。共用一个 store 的多台主机需要时钟同步（NTP），否则可能把有效的 chunk 判为过期。不改用数据库时间，因为那样每次记账都要多一次查询。
-- **未处理（不可达）**：文档 hash 不变但切出的 chunk 文本不同时，旧 chunk 不会结束。现在走不到这条路径（kb 的 chunker 固定，hash 覆盖全文）；要处理得给账本加"断开边"的接口。
+- **Ledger API**: the entry points are `migrate(conn)` / `pending(conn)` / `ledger_for(conn)`, which choose PG or SQLite by connection type (not the four functions such as `migrate_pg`). Also added: `record_many` (checks the parents once for a group of chunks), `count_active` (consistency check), `history` (all versions of one key), `started_by` (the latest version that had started at a given time, whether or not it has ended). The PG / SQLite differences are concentrated in `lineage.dialect`, shared by the ledger and lite-rag's trace tables.
+- **Concurrency**: the caller must serialize writes to the same namespace (lite-rag: PG holds the kb row lock, Chroma uses a process lock). The ledger itself takes no lock.
+- **The ledger does not record the contextual context**: it is text the model wrote from the content, and storing it on an edge would outlive its deletion (final review #1). Only positions are recorded on the edge (`chunk_id`, `n`, `start`, `end`, `page`, `parent_n`).
+- **Deleting clears the original text**: a `deleted` artifact has its `payload` and `metadata` (the document's title / source) cleared at once (security review, final review #1); a `superseded` one is kept until `keep_text_days` and then cleared by gc. `trace show` displays the chunks of a deleted document as "过期" (stale) but without original text.
+- **The document artifact's metadata** records `title`, `source`, `embedding`, `dim`; the chunk artifact's metadata is empty (chunks of the same kb are all the same, so it is not repeated).
+- **backfill repairs deletions made while the ledger was off**: a document that is still active in the ledger but no longer in the store is recorded as `deleted` (final review #2). A kb that was dropped entirely while the ledger was off cannot be repaired (the kb is gone from the store, and backfill reports `KbNotFound`): its artifacts stay as they are.
+- **`chunks.lineage_key`**: computed at write time (independent of the ledger switch) and read at retrieval time; the trace uses it directly and does not work out `k`.
+- **Trace storage**: `artifact_key` may be NULL (not recorded); `in_context` is not stored, and at read time it is taken as the first `top_k` of the last ordering stage (reranked if there is a rerank, otherwise retrieved). The Store protocol has only one `traces()`, returning a `TraceLog` inside one transaction; when reading traces, the SQL filters by namespace.
+- **Trace time**: taken right after the chunks are read (not after the model answers). `trace_report` uses `started_by(key, time)` to find the version read at that time: ended means "过期" (stale), still valid means "有效" (valid), not found means "未记录" (not recorded).
+- **`record_cited(trace_id, cited: Sequence[Hit])`**: takes Hits rather than chunk_ids, because chunk_id is unique only within a kb, and a cross-kb trace needs the kb name.
+- **gc**: `literag lineage gc` does not split by namespace and acts on the whole store; clearing original text and deleting traces both work in batches of 1000 rows, one transaction per batch (the partial index `lineage_artifacts_gc` contains only ended rows that still have original text). With `lineage.enabled: false` it only deletes traces and does not touch the ledger. It does not prune the edges "from a stable chunk to an old document version": those are the lineage itself, and the growth is one edge per chunk per edit.
+- **Storage estimate**: each trace is about 2×`top_k` rows (rerank off, the default) or 2×`top_n`+`top_k` rows (rerank on). At 10,000 queries a day, kept for 90 days, with rerank on, PG needs about 5–10 GB.
+- **Additions before merge (2026-11-25)**: `record_cited` accepts each trace only once: it conditionally updates the trace's status from empty (an unfinished search trace) to `answered` and writes the cited rows in the same transaction, so of concurrent calls only one succeeds; the trace of an `ask` (including those with no citations, `no_sources`, `failed`) is always rejected, and passing an empty list also uses up that one time. `engine.purge_traces()` / `literag trace purge --yes` deletes all traces of one namespace in batches (traces only; delete a kb with `drop-kb`), with the index `ix_rag_query_traces_namespace (namespace, created_at, id)` (migration 0009 / sqlite 0004); when the model call fails, `ask` also writes a trace (`status: failed`, including the retrieval stages), then raises the model's error as usual (if writing the trace itself fails, it is attached as a note to that error and does not replace it); `record()` also goes through `record_many` (so there is only one write path): one query fetches the latest versions of all keys, superseded ones are ended in batches, and new versions and edges each use one `executemany` (300 chunks drop from about 900 calls to about 7); edges whose content did not change are not rewritten.
+- **Clock**: the version time comes from the writer's clock and the trace time from the reader's. Hosts that share one store need synchronized clocks (NTP), otherwise a valid chunk may be judged stale. The database time is not used instead, because that would cost one more query per recording.
+- **Not handled (unreachable)**: when the document hash is unchanged but the chunk texts cut from it differ, the old chunks do not end. This path cannot be reached now (the kb's chunker is fixed and the hash covers the full text); handling it would need a "cut the edge" interface in the ledger.
